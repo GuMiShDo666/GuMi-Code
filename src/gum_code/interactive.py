@@ -15,8 +15,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from vibe_harness.agent import run_agent
-from vibe_harness.config import (
+from gum_code.agent import run_agent
+from gum_code.config import (
     Settings,
     default_user_config_path,
     has_complete_legacy_settings,
@@ -25,9 +25,9 @@ from vibe_harness.config import (
     save_user_settings,
     validate_provider_settings,
 )
-from vibe_harness.events import RichEventRenderer, create_console
-from vibe_harness.permissions.terminal import make_interactive_approval
-from vibe_harness.session import (
+from gum_code.events import RichEventRenderer, create_console
+from gum_code.permissions.terminal import make_interactive_approval
+from gum_code.session import (
     LEGACY_SESSION_VERSION,
     MAX_SESSION_TITLE_CHARS,
     SessionData,
@@ -37,9 +37,9 @@ from vibe_harness.session import (
     load_session,
     save_session,
 )
-from vibe_harness.token_counting import load_token_counter
-from vibe_harness.tools.command import load_docker_sandbox
-from vibe_harness.user_state import (
+from gum_code.token_counting import load_token_counter
+from gum_code.tools.command import load_docker_sandbox
+from gum_code.user_state import (
     SessionEntry,
     UserState,
     allocate_session_path,
@@ -748,7 +748,7 @@ class InteractiveRuntime:
         table.add_row("Sandbox", "on" if self.args.allow_run_command else "off")
         table.add_row("Subagent", "on" if self.args.allow_subagent else "off")
         if show_title:
-            self.console.print(Text("Gu-Harness", style="bold cyan"))
+            self.console.print(Text("Gum Code", style="bold cyan"))
         self.console.print(Panel(table, border_style="cyan"))
 
 

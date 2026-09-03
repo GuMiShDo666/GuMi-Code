@@ -11,13 +11,14 @@ try:
 except ImportError:  # pragma: no cover - POSIX is the supported runtime.
     fcntl = None
 
-from vibe_harness.tools.registry import READ_ONLY_TOOL_NAMES
+from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 
 SESSION_VERSION = 2
 LEGACY_SESSION_VERSION = 1
 MAX_SESSION_FILE_BYTES = 5 * 1024 * 1024
 MAX_SESSION_TITLE_CHARS = 30
-IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"
+IN_FLIGHT_MARKER_KEY = "_gum_code_in_flight"
+LEGACY_IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"
 RECOVERABLE_TOOL_NAMES = READ_ONLY_TOOL_NAMES | {"task"}
 TASK_INTERRUPTED_RESULT = json.dumps(
     {
@@ -63,6 +64,13 @@ class PendingToolCall:
 class ToolBatchRecoveryPlan:
     completed_call_ids: tuple[str, ...]
     pending_tool_calls: tuple[PendingToolCall, ...]
+
+
+def _has_in_flight_marker(message: dict[str, object]) -> bool:
+    return (
+        message.get(IN_FLIGHT_MARKER_KEY) is True
+        or message.get(LEGACY_IN_FLIGHT_MARKER_KEY) is True
+    )
 
 
 def save_session(
@@ -335,7 +343,7 @@ def analyze_tool_batch_tail(
         if result_id not in tool_call_id_set:
             raise ValueError(f"未知的 tool result ID：{result_id!r}")
 
-        if message.get(IN_FLIGHT_MARKER_KEY) is True:
+        if _has_in_flight_marker(message):
             if in_flight_call_id is not None:
                 raise ValueError("in-flight 标记重复")
             if result_id in completed:
@@ -456,7 +464,7 @@ def build_tool_batch_recovery_messages(
     result = [
         message
         for message in copy.deepcopy(messages)
-        if message.get(IN_FLIGHT_MARKER_KEY) is not True
+        if not _has_in_flight_marker(message)
     ]
 
     if plan is None:
@@ -506,7 +514,7 @@ def build_interrupted_turn_messages(
     result = [
         message
         for message in copy.deepcopy(messages)
-        if message.get(IN_FLIGHT_MARKER_KEY) is not True
+        if not _has_in_flight_marker(message)
     ]
     completed = set(state.completed_call_ids)
     for call in tool_calls:

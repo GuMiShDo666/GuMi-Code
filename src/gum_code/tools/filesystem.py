@@ -3,7 +3,7 @@ import stat
 import tempfile
 from pathlib import Path
 
-from vibe_harness.tools.common import (
+from gum_code.tools.common import (
     MAX_OUTPUT_CHARS,
     SKIP_NAMES,
     _is_sensitive_name,
@@ -220,4 +220,4 @@ def delete_file(
     target = _resolve_workspace_path(workspace, path)
     target.unlink()
 
-    return f"已删除 {path}"
+    return f"已删除：{path}"

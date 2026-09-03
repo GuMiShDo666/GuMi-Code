@@ -6,9 +6,10 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-from vibe_harness.token_counting import RequestTokenCounter
+from gum_code.token_counting import RequestTokenCounter
 
-DEFAULT_MAX_CONTEXT_TOKENS = 100_000
+MODEL_MAX_CONTEXT_TOKENS = 1_000_000
+DEFAULT_MAX_CONTEXT_TOKENS = 800_000
 
 TOOL_RESULT_BATCH_CHAR_LIMIT = 200_000
 LARGE_RESULT_CHAR_LIMIT = 30_000
@@ -22,7 +23,7 @@ MICRO_COMPACT_MIN_CONTENT_CHARS = 120
 CONTEXT_TARGET_RATIO = 0.8
 FIT_RESULT_PREVIEW_CHARS = 1_000
 
-SUMMARY_INPUT_TOKEN_LIMIT = 80_000
+SUMMARY_INPUT_TOKEN_LIMIT = 640_000
 SUMMARY_MAX_TOKENS = 2_000
 KEEP_RECENT_MESSAGES = 5
 

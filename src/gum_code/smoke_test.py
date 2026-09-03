@@ -1,6 +1,6 @@
 from openai import OpenAI
 
-from vibe_harness.config import load_settings
+from gum_code.config import load_settings
 
 
 def main() -> None:

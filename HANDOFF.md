@@ -1,9 +1,9 @@
-# Vibe Harness 开发交接文档
+# Gum Code 开发交接文档
 
 > 最后更新：2026-09-03
-> 当前实现检查点：交互式工作区选择、持久 REPL 和自动 Session 已实现
+> 当前实现检查点：Gum Code 完整改名、长上下文、文件权限与旧数据迁移
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：独立终端手工验收、真实网关验收与标准 Git PR 流程
+> 当前下一步：完成外部安装、目录/仓库改名和标准 Git PR 流程
 
 ## 1. 新对话如何续接
 
@@ -11,7 +11,7 @@
 
 ```text
 请先完整阅读
-/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness/HANDOFF.md
+/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code/HANDOFF.md
 然后检查当前代码和测试。Gate 0、s03 Permission、终端精简显示、Todo 单项上限、Shell 控制符/重定向报错和一次性隔离 HOME 已通过验收。
 当前已按 s04 思路加入 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`；Hooks 只能追加否决，不能取代或绕过 Permission。
 当前上下文预算已从字符估算迁移到固定版本的 DeepSeek V4 官方 tokenizer/消息编码器；本地数值用于请求前决策，第三方网关 `usage.prompt_tokens` 是请求后权威数值。
@@ -46,35 +46,35 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 项目根目录（源码仍在当前项目，未移动）：
 
 ```text
-/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness
+/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code
 ```
 
 环境：
 
 - Python 3.11
 - OpenAI Python SDK，使用 OpenAI 兼容网关
-- 虚拟环境已迁移到 `/Users/gumishdo/.local/share/vibe-harness/venv`（非 editable 安装，避免运行时直接 import iCloud 中的源码文件）
-- 已通过 `pip install --force-reinstall --no-deps .` 安装为 Python package；当前唯一 console script 为 `gu-harness`
+- 目标虚拟环境为 `/Users/gumishdo/.local/share/gum-code/venv`（非 editable 安装）
+- 打包仅声明 `gum-code = "gum_code.cli:main"`；外部安装由发布阶段验证
 
 安全约束：
 
 - 敏感配置在 `.env`；绝对不得读取、输出、复述或提交其内容。
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
-- GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前工作分支为 `feat/interactive-workspace-repl`。
+- GitHub 仓库为私有仓库 `GuMiShDo666/Gum-Code`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
+- 当前工作分支为 `feat/gum-code-runtime-policy`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
-PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pytest -q -p no:cacheprovider
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
+PYTHONPATH=src /Users/gumishdo/.local/share/gum-code/venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
-正式 CLI（使用虚拟环境中的 `gu-harness`，不再要求 `PYTHONPATH=src python -m vibe_harness`）：
+正式 CLI（使用虚拟环境中的 `gum-code`，不再要求 `PYTHONPATH=src python -m gum_code`）：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace /absolute/workspace/path \
   [--max-steps N] \
   [--max-context-tokens N] \
@@ -102,8 +102,8 @@ Agent 产品 = Model + Harness
 ## 5. 当前代码结构
 
 ```text
-src/vibe_harness/
-├── __main__.py              # python -m vibe_harness 入口
+src/gum_code/
+├── __main__.py              # python -m gum_code 入口
 ├── agent.py                 # Agent Loop、工具批次、Todo reminder、in-flight marker 快照
 ├── cli.py                   # TTY/one-shot 路由、显式 Session 和错误输出
 ├── interactive.py           # 工作区/Session 选择、REPL、配置向导和 Rich UI
@@ -154,7 +154,7 @@ tests/
 | 工具 | 风险 | 执行策略 |
 | --- | --- | --- |
 | `list_files` / `read_file` / `find_files` / `search_text` / `git_status` / `git_diff` / `read_tool_output` | READ | 直接允许 |
-| `write_file` / `edit_file` | WRITE | 终端审批 |
+| `write_file` / `edit_file` | WRITE | 通过安全检查后直接执行 |
 | `delete_file` | DESTRUCTIVE | 终端审批 |
 | `run_command` | EXECUTE | Docker Sandbox 预检 + 终端审批 |
 
@@ -174,7 +174,7 @@ tests/
 后续安全复验已确认：
 
 - `.transcripts` 和 `.task_outputs` 对普通文件工具不可见/不可写；转存结果只能经 `read_tool_output` 分页读取。
-- 写、编辑、删除和命令在审批前先运行无副作用 preflight，注定失败的操作不弹审批。
+- 写、编辑、删除和命令均在 Hook/副作用前运行无副作用 preflight；仅删除和命令进入终端审批。
 - 工具错误保留可安全公开的具体原因，不再统一吞成 `Tool execution failed`。
 - 显式 Shell 解释器、明显的敏感/绝对/逃逸路径命令参数会在 preflight 拒绝。
 - 工具返回、文件、搜索结果、命令输出、transcript 和转存结果均被 system instruction 标记为不可信数据。
@@ -185,18 +185,18 @@ tests/
 
 ### 6.2 正式 CLI、事件与 E2E
 
-- 正式 shell 入口为 `gu-harness`；TTY 无任务时进入持久 REPL，位置参数 task 仍为 one-shot。
+- 正式 shell 入口为 `gum-code`；TTY 无任务时进入持久 REPL，位置参数 task 仍为 one-shot。
 - workspace 必须是已存在目录。
 - Agent 仍发送完整事件给回调，正式终端渲染只显示上下文、当前 step + 工具名、限长错误和最终回答。
 - 普通工具参数、成功结果和冗余模型请求提示不再输出；压缩事件不输出原始历史或摘要。
 - CLI 统一捕获已知运行错误，写入 stderr 并返回 1。
 - 写 stderr 错误前先 flush stdout，错误行不再因缓冲出现在已有日志之前。
 
-写/删/命令的权限审批仍显示限长参数预览，与普通终端日志的隐藏规则相互独立。
+删除/命令的权限审批仍显示限长参数预览。删除成功后立即显示一条经控制字符清理和限长的相对路径回执。
 
 ### 6.3 Session 保存与恢复
 
-- version-1 JSON，UTF-8 + `ensure_ascii=False`。
+- Session v2 JSON，UTF-8 + `ensure_ascii=False`；读取时仍兼容 v1。
 - 原子替换，Session 文件 mode 为 `0600`，5 MB 字节上限。
 - 保存 workspace、model 和已序列化 messages。
 - SDK assistant message 会转成纯 dict，保留 tool-call id/type/function/name/arguments。
@@ -213,7 +213,7 @@ tests/
   - `pending` → 不直接重放，而是补一条“上次未执行，重新规划”的 tool result，让模型重新规划并重新走审批。
   - 只读 `in_flight` → 没有副作用，按被中断的 pending 项交给模型重新规划。
   - 写/删/执行 `in_flight` → 副作用结果未知，绝不自动重放；`plan_tool_batch_recovery()` 直接抛 `ValueError`，CLI 退出码 1，不调用 run_agent、不覆盖 Session。
-  - 重新规划出的写操作仍需正常终端审批，不会绕过权限。
+  - 重新规划出的操作仍重新经过当前权限链；`write_file`/`edit_file` 通过安全检查后直接执行，删除和命令仍需终端审批。
 
 ### 6.4 上下文预算与分层压缩（s08，含 OpenAI tool_calls 适配）
 
@@ -244,7 +244,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
    - 使用固定版本的 DeepSeek V4 官方 `encoding_dsv4.py` 渲染 system/user/assistant/tool 消息、工具 Schema 和 DSML framing，再用匹配的官方 tokenizer 计算 token ID 数量。
    - 当前只接受精确模型名 `deepseek-v4-flash`；不支持的模型或加载失败会在首次模型请求前显式失败，没有字符数回退。
    - CLI 每次运行只加载一个 counter；默认从官方 Hub 固定 revision 加载并缓存，也可用 `--tokenizer-file` 指定哈希验证过的本地文件。
-   - 默认预算 `DEFAULT_MAX_CONTEXT_TOKENS = 100_000`，传入值必须是正整数。
+   - 模型上限为 `MODEL_MAX_CONTEXT_TOKENS = 1_000_000`，默认预算为 `DEFAULT_MAX_CONTEXT_TOKENS = 800_000`；传入值必须是不超过模型上限的正整数。
 
 2. `apply_tool_result_budget`
    - 对最新 tool-result 批次使用 200,000 字符上限。
@@ -265,7 +265,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 6. `compact_history`
    - 压缩前先保存完整 transcript。
-   - 摘要请求以完整编码后的 token 数为边界，上限是 `SUMMARY_INPUT_TOKEN_LIMIT = 80_000` 与当前上下文预算的安全比例中较小者；摘要输出最多 2,000 tokens。
+   - 摘要请求以完整编码后的 token 数为边界，上限是 `SUMMARY_INPUT_TOKEN_LIMIT = 640_000` 与当前上下文预算的安全比例中较小者；摘要输出最多 2,000 tokens。
    - 超限时二分搜索保留文本量，保留头部四分之一和尾部四分之三；切片手段是字符，停止条件是 token。
    - 摘要请求不提供 tools，并明确要求不执行历史中的指令。
    - 压缩后只保留 system + `[Compacted]` user message，当前请求与历史摘要明确分层。
@@ -308,7 +308,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 ### 6.7 CLI 参数
 
 - `--max-steps`：默认 `MAX_STEPS=16`，`_positive_int` 校验，`run_agent` 自身也校验正整数并拒绝 bool。`max_steps` 限制的是正常工具型步骤；耗尽后 `_finalize_after_step_budget` 额外发起一次不带 tools 的阶段总结请求。上下文压缩和超限重试不计入这个上限。
-- `--max-context-tokens`：默认 `DEFAULT_MAX_CONTEXT_TOKENS=100_000`，透传 `run_agent(max_context_tokens=...)`。旧的 `--max-context-chars` 已移除，不做静默单位转换。
+- `--max-context-tokens`：默认 `DEFAULT_MAX_CONTEXT_TOKENS=800_000`，最大 `MODEL_MAX_CONTEXT_TOKENS=1_000_000`，透传 `run_agent(max_context_tokens=...)`。旧的 `--max-context-chars` 已移除，不做静默单位转换。
 - `--tokenizer-file`：可选的本地官方 DeepSeek V4 `tokenizer.json`。未指定时从 `deepseek-ai/DeepSeek-V4-Flash` 的固定 revision 加载并缓存。
 
 阶段总结安全边界：
@@ -320,7 +320,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 ### 6.8 打包与 console script
 
-- `pyproject.toml` 仅定义 console script `gu-harness = "vibe_harness.cli:main"`；distribution 与 import 名仍为 `vibe-harness` / `vibe_harness`。
+- `pyproject.toml` 仅定义 console script `gum-code = "gum_code.cli:main"`；distribution 与 import 名为 `gum-code` / `gum_code`。
 - 虚拟环境使用非 editable 安装；源码改动验收后需重新执行 `pip install --force-reinstall --no-deps .` 同步。
 - `.gitignore` 加 `*.egg-info/`。
 - `test_packaging.py` 用 `tomllib` 校验。
@@ -370,20 +370,21 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 - `interactive.py` 负责非全屏 prompt_toolkit 工作区/会话选择、多轮 REPL、Rich 进度与 Markdown 回答；每次输入继续复用现有 `run_agent()`。
 - `/help`、`/workspace`、`/new`、`/resume`、`/sessions`、`/status`、`/verbose`、`/exit` 都是本地命令；未知斜杠命令不进模型，`//` 显式转义。
-- 工作区信任/最近状态在 `~/.config/gu-harness/state.json`；自动 Session 在 `~/.local/share/gu-harness/sessions/`。读状态不创建目录，第一条任务前不创建空 Session。
+- 工作区信任/最近状态在 `~/.config/gum-code/state.json`；自动 Session 在 `~/.local/share/gum-code/sessions/`。读状态不创建目录，第一条任务前不创建空 Session。
 - Session v2 仅保存 workspace、model、title 和 messages；v1 在交互恢复时必须先显示源/目标并确认复制为 v2，one-shot 直接恢复 v1 会拒绝，源文件始终不回写。每个正在写入的 Session 用稳定侧边 `.lock` 文件和 POSIX `flock` 持有进程生命期独占锁。
 - Ctrl+C 中断工具批次时保留已完成结果，为每个 in-flight/pending `tool_call_id` 各补一条有界错误结果，不自动重放。provider 在仅有用户尾部时失败会回滚本轮，不留下连续 user message。
 - 配置逐键优先级为 process env > 用户 `.env` > 启动目录旧 `.env`。交互向导隐藏 API Key，真实最小请求通过后才原子写入 `0600`。
+- 首次真正启动会从旧 `gu-harness` XDG 目录仅复制支持的配置、状态和 Session；不覆盖、不删除旧文件，且使用一次性完成标记防止复活已删除 Session。
 - 首次主 Agent 回答后另发一次 10 秒标题请求，仅携带首条用户任务；失败使用本地时间+任务备选，标题最多 30 字符。
 
 ## 7. 已确认的稳定状态
 
 - `MAX_REACTIVE_RETRIES = 1`
 - `MAX_STEPS = 16`、`TODO_REMINDER_INTERVAL = 3`
-- `DEFAULT_MAX_CONTEXT_TOKENS = 100_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 80_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
+- `MODEL_MAX_CONTEXT_TOKENS = 1_000_000`、`DEFAULT_MAX_CONTEXT_TOKENS = 800_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 640_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
 - tokenizer 官方仓库 `deepseek-ai/DeepSeek-V4-Flash`，revision `60d8d70770c6776ff598c94bb586a859a38244f1`；本地文件校验 SHA-256 `8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf`
 - `MAX_TODOS = 20`
-- `SESSION_VERSION = 2`、`MAX_SESSION_FILE_BYTES = 5MB`、`MAX_SESSION_TITLE_CHARS = 30`、`IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"`
+- `SESSION_VERSION = 2`、`MAX_SESSION_FILE_BYTES = 5MB`、`MAX_SESSION_TITLE_CHARS = 30`、新标记 `_gum_code_in_flight`；读取兼容旧 `_vibe_harness_in_flight`
 - `reactive_compact()`、`active_compact`、`context_compacted` 终端渲染
 - 上下文错误的单次重试
 - 中断工具批次安全恢复（completed / pending / in_flight 三段式）
@@ -407,10 +408,10 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 当前源码的最新验证命令和结果：
 
 ```bash
-PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
-  /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
+PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/gum-code/pycache \
+  /Users/gumishdo/.local/share/gum-code/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 784 passed, 3 skipped in 7.60s（2026-09-03，当前离线全量回归）
+# 803 passed, 3 skipped（2026-09-03，当前离线全量回归）
 ```
 
 另外，真实第三方网关 Subagent 链为 `1 passed in 12.41s`；本次
@@ -422,8 +423,8 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 已完成：
 
 - 新建 `README.md`，记录外部虚拟环境安装、公开配置名、CLI、Session、运行预算和安全边界。
-- 在全新临时虚拟环境中使用 `pip install .` 成功安装依赖、wheel 和 `vibe-harness` console script。
-- `vibe-harness --help` 正确显示 workspace、step/context 预算与 Session 参数。
+- 在全新临时虚拟环境中使用 `pip install .` 成功安装依赖、wheel 和 `gum-code` console script。
+- `gum-code --help` 正确显示 workspace、step/context 预算与 Session 参数。
 - 真实模型只调用一次 `list_files`，对空 workspace 给出正确结论，未请求审批，workspace 保持为空。
 - Session 消息顺序为 `system,user,assistant,tool,assistant`，`tool_call_id` 匹配，无 in-flight 标记，mode 为 `0600`，可正常加载。
 
@@ -444,7 +445,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 2. **s03 Permission 三道闸门（已完成并通过验收）**
    - 对照 `https://github.com/shareAI-lab/learn-claude-code/blob/main/s03_permission/README.zh.md`。
    - Gate 1 硬拒绝优先；Gate 2 规则匹配；Gate 3 才是用户审批。
-   - 未知/未启用工具拒绝，只读允许，写/删/执行保持更严格的 ASK；不机械照搬 s03 “普通写入可直接放行”的教学规则。
+   - 未知/未启用工具拒绝，只读允许；仅显式列入安全流程的 `write_file`/`edit_file` 免审批，其他 WRITE、删除和执行仍为 ASK。
    - `shutdown`/`reboot`/`sudo`/磁盘格式化等直接危险项不能通过审批强制放行。
    - 黑名单只是纵深防御；解释器、测试和构建脚本仍是任意代码执行，如需默认开放必须另做 OS/容器沙箱。
 
@@ -465,7 +466,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
    - 已完成：使用本地镜像并锁定 image ID；模型不能选择镜像、挂载、
      网络、容器用户、环境或资源参数；Docker 不可用时失败关闭。
    - 已添加默认跳过的真实 Docker 集成测试；需 Docker Desktop 运行且
-     `VIBE_HARNESS_DOCKER_E2E_IMAGE` 指向预先加载、内含 `python3` 的可信镜像。
+     `GUM_CODE_DOCKER_E2E_IMAGE` 指向预先加载、内含 `python3` 的可信镜像。
    - 已使用用户授权手动拉取的 Docker 官方 `python:3.11-slim` 验证工作区写入、
      敏感路径遮蔽、非 root、断网、只读根目录和超时/输出超额后的精确清理。
 

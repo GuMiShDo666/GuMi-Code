@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from vibe_harness.tools.common import _reject_symlinks
+from gum_code.tools.common import _reject_symlinks
 
 EXPECTED_RESULT_PARENT = Path(".task_outputs/tool-results")
 MAX_ARTIFACT_FILE_BYTES = 5 * 1024 * 1024

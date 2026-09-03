@@ -2,7 +2,7 @@ import json
 import tempfile
 from pathlib import Path
 
-from vibe_harness.context import (
+from gum_code.context import (
     CONTEXT_TARGET_RATIO,
     apply_fit_tool_results,
     apply_micro_compact,
@@ -11,10 +11,10 @@ from vibe_harness.context import (
     compact_history,
     reactive_compact,
 )
-from vibe_harness.events import AgentEventCallback
-from vibe_harness.token_counting import RequestTokenCounter
-from vibe_harness.tools.common import _reject_symlinks, _resolve_workspace_path
-from vibe_harness.tools.registry import (
+from gum_code.events import AgentEventCallback
+from gum_code.token_counting import RequestTokenCounter
+from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
+from gum_code.tools.registry import (
     PostToolUseCallback,
     PreToolUseCallback,
     READ_ONLY_TOOL_NAMES,
@@ -429,7 +429,7 @@ def run_read_only_subagent(
 
         try:
             temp_directory = tempfile.TemporaryDirectory(
-                prefix="vibe-harness-subagent-",
+                prefix="gum-code-subagent-",
                 dir=temp_parent,
             )
         except OSError:

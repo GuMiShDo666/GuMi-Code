@@ -28,6 +28,9 @@ class ToolPolicy:
     enabled: bool
 
 
+AUTO_ALLOWED_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+
+
 def decide_permission(
     tool_name: str,
     risk: ToolRisk | None,
@@ -45,6 +48,11 @@ def decide_permission(
         )
 
     if risk is ToolRisk.WRITE:
+        if tool_name in AUTO_ALLOWED_WRITE_TOOLS:
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                reason=f"普通文件写入可以直接执行：{tool_name}",
+            )
         return PermissionResult(
             decision=PermissionDecision.ASK,
             reason=f"修改文件前需要确认：{tool_name}",

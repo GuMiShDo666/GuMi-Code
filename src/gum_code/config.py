@@ -22,7 +22,7 @@ class Settings:
 def default_user_config_path() -> Path:
     base = os.getenv("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".config"
-    return root / "gu-harness" / ".env"
+    return root / "gum-code" / ".env"
 
 
 def _read_values(path: Path) -> dict[str, str]:
@@ -65,7 +65,7 @@ def load_settings(
                 effective[key] = legacy_values[key].strip()
     for key in CONFIG_KEYS:
         if key not in effective:
-            raise RuntimeError(f"{key} 未设置，请配置 Gu-Harness provider")
+            raise RuntimeError(f"{key} 未设置，请配置 Gum Code provider")
 
     settings = Settings(
         api_key=effective["LLM_API_KEY"],

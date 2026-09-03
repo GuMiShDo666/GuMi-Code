@@ -22,6 +22,11 @@ def _safe_multiline(value: object) -> str:
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", str(value))
 
 
+def _bounded_inline(value: object) -> str:
+    text = _safe_inline(value)
+    return text if len(text) <= MAX_PREVIEW else text[:MAX_PREVIEW] + "…"
+
+
 def create_console() -> Console:
     return Console(
         no_color=os.getenv("NO_COLOR") is not None,
@@ -79,6 +84,16 @@ class RichEventRenderer:
                         "工具失败："
                         + _safe_inline(payload.get("tool_name", "未知")),
                         style="red",
+                    )
+                )
+            elif (
+                payload.get("tool_name") == "delete_file"
+                and isinstance(payload.get("deleted_path"), str)
+            ):
+                self.console.print(
+                    Text(
+                        "已删除：" + _bounded_inline(payload["deleted_path"]),
+                        style="green",
                     )
                 )
             return
@@ -258,6 +273,11 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         if result.startswith("Error:"):
             print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──")
             print(_truncate(_safe_multiline(result)))
+        elif (
+            payload.get("tool_name") == "delete_file"
+            and isinstance(payload.get("deleted_path"), str)
+        ):
+            print("已删除：" + _bounded_inline(payload["deleted_path"]))
         return
 
     if event_type == "final_answer":

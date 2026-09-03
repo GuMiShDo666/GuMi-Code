@@ -4,25 +4,29 @@ from pathlib import Path
 
 from openai import OpenAI, OpenAIError
 
-from vibe_harness.agent import MAX_STEPS, run_agent
-from vibe_harness.context import DEFAULT_MAX_CONTEXT_TOKENS
-from vibe_harness.config import load_settings
-from vibe_harness.events import create_console, print_terminal_event
-from vibe_harness.interactive import (
+from gum_code.agent import MAX_STEPS, run_agent
+from gum_code.context import (
+    DEFAULT_MAX_CONTEXT_TOKENS,
+    MODEL_MAX_CONTEXT_TOKENS,
+)
+from gum_code.config import load_settings
+from gum_code.events import create_console, print_terminal_event
+from gum_code.interactive import (
     run_interactive,
     select_workspace,
     trust_workspace,
 )
-from vibe_harness.permissions.terminal import request_terminal_approval
-from vibe_harness.session import (
+from gum_code.permissions.terminal import request_terminal_approval
+from gum_code.session import (
     LEGACY_SESSION_VERSION,
     SessionLease,
     build_tool_batch_recovery_messages,
     load_session,
     save_session,
 )
-from vibe_harness.token_counting import load_token_counter
-from vibe_harness.tools.command import load_docker_sandbox
+from gum_code.token_counting import load_token_counter
+from gum_code.tools.command import load_docker_sandbox
+from gum_code.user_state import migrate_legacy_user_data
 
 
 def _positive_int(value: str) -> int:
@@ -35,6 +39,15 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
+def _context_tokens(value: str) -> int:
+    parsed = _positive_int(value)
+    if parsed > MODEL_MAX_CONTEXT_TOKENS:
+        raise argparse.ArgumentTypeError(
+            f"不能超过模型上限 {MODEL_MAX_CONTEXT_TOKENS}"
+        )
+    return parsed
+
+
 def _is_interactive_terminal() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
@@ -44,14 +57,14 @@ def parse_args(
     *,
     interactive: bool | None = None,
 ) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="gu-harness")
+    parser = argparse.ArgumentParser(prog="gum-code")
     parser.add_argument("--workspace", help="工作区目录路径")
     parser.add_argument(
         "--max-steps", type=_positive_int, default=MAX_STEPS,
         help=f"最多执行的正模型步骤数（默认 {MAX_STEPS}）",
     )
     parser.add_argument(
-        "--max-context-tokens", type=_positive_int,
+        "--max-context-tokens", type=_context_tokens,
         default=DEFAULT_MAX_CONTEXT_TOKENS,
         help="模型请求允许的最大上下文 token 数",
     )
@@ -218,6 +231,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
+        migrate_legacy_user_data()
         if args.task is None:
             return run_interactive(args)
         return _run_one_shot(args)

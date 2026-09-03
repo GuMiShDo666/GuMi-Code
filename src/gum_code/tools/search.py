@@ -3,7 +3,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from vibe_harness.tools.common import (
+from gum_code.tools.common import (
     MAX_OUTPUT_CHARS,
     _is_sensitive_path,
     _resolve_workspace_path,
