@@ -1,9 +1,9 @@
 # Vibe Harness 开发交接文档
 
 > 最后更新：2026-09-03
-> 当前稳定检查点：Docker `run_command` Sandbox 已实现并通过离线与真实容器验收
+> 当前实现检查点：同步、单层、只读 Subagent 已完成实现并通过真实第三方网关 E2E
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：审查并决定是否合并 PR #5
+> 当前下一步：完成最终回归和标准 Git PR 流程
 
 ## 1. 新对话如何续接
 
@@ -16,6 +16,7 @@
 当前已按 s04 思路加入 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`；Hooks 只能追加否决，不能取代或绕过 Permission。
 当前上下文预算已从字符估算迁移到固定版本的 DeepSeek V4 官方 tokenizer/消息编码器；本地数值用于请求前决策，第三方网关 `usage.prompt_tokens` 是请求后权威数值。
 `run_command` 默认隐藏；显式开启时必须提供本地可信镜像，命令只能在断网、受限、敏感路径遮蔽的 Docker 容器中执行，失败不回退宿主。
+当前已新增默认开放的 `task` Subagent：仅做同步、单层、只读调查，父 Session 只保存最终结构化结果；可用 `--no-subagent` 在本轮关闭。
 一次只推进一个边界明确的步骤，先讲清目的和运行链路，再让我实现，完成后帮我验收。
 每次我输入“已完成”，验证通过后直接进入下一步；发现当前步骤直接相关的问题可以做最小修复并补回归测试。
 权限架构继续对照 shareAI-lab/learn-claude-code 的 s03_permission，但不机械复制它的教学性宽松规则；必须适配本项目的 OpenAI tool_calls 消息协议和更严格安全边界。
@@ -61,7 +62,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
 - GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前工作分支为 `feat/docker-command-sandbox`。
+- 当前工作分支为 `feat/read-only-subagents`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -78,6 +79,7 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pyte
   [--max-steps N] \
   [--max-context-tokens N] \
   [--tokenizer-file /absolute/path/tokenizer.json] \
+  [--no-subagent] \
   [--allow-run-command --sandbox-image local-trusted-image] \
   [--session-file /path/session.json | --resume-session /path/session.json] \
   "任务描述"
@@ -112,6 +114,7 @@ src/vibe_harness/
 ├── events.py                # 终端事件渲染
 ├── hooks.py                 # 四事件 HookRegistry（进程内同步回调）
 ├── session.py               # Session 原子保存与工具批次分析/恢复计划
+├── subagent.py              # task 契约、只读子循环、报告校验与请求预算
 ├── todo.py                  # TodoManager（MAX_TODOS=20，全量校验原子替换）
 ├── permissions/
 │   ├── policy.py            # 工具风险和 ALLOW/ASK/DENY
@@ -343,6 +346,24 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 本项目没有照搬参考实现中的 `shell=True`、字符串黑名单权限或原始参数日志。Hooks 是可信扩展点，不是沙箱，也不是 Permission 替代品。
 
+### 6.11 只读 Subagent v1
+
+- 根 Agent 默认获得 `task(description)`；`--no-subagent` 同时从模型 Schema 和运行允许集中移除它。
+- 只启动一层同步子 Agent。新建子上下文只有专用 system message 和 description，不复制父历史。
+- 子工具是从 `READ_ONLY_TOOL_NAMES` 派生的七个读工具，加内部 `compact`/`submit_report`；不提供写、删、命令、Todo 或再委派。
+- 每个根运行最多启动 4 个子 Agent，规范化后重复 description 不会重放；同一父工具批次只有第一个 `task` 可启动。
+- 每个子 Agent 最多 8 次 provider request，摘要/反应压缩也计入；不设独立 wall-clock timeout。
+- `submit_report` 必须是该 assistant message 的唯一 Tool Call。Harness 校验字段、数量、总长度、工作区路径、UTF-8 文件和可选行号，成功后直接将最多 20,000 字符的 JSON 交给父 Agent。该校验不证明 claim 语义真实。
+- 子对话只存于内存；上下文产物写入工作区外的自动清理临时目录。父 Session 只记录 `task` 调用和最终结果。
+- 共享 `git_status`/`git_diff` 使用最小隔离环境，禁用仓库 fsmonitor/Hook、
+  global/system 配置和可选索引锁；READ 调用不继承模型凭据，也不刷新索引。
+- 中断的父 `task` 被恢复为匹配 ID 的 `task_interrupted` 结果，不自动重启旧子 Agent。
+- 终端仅显示子 Agent 开始/结束、步数和工具名，不显示 description、参数、结果、报告或 reasoning。
+
+真实第三方网关 E2E 已通过：隔离临时 workspace 中完成根
+`task` → 子 Agent `read_file`/`git_status` → `submit_report` → 根回答，
+工作区前后清单一致，恶意 `core.fsmonitor` 未执行。
+
 ## 7. 已确认的稳定状态
 
 - `MAX_REACTIVE_RETRIES = 1`
@@ -368,6 +389,8 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
   `no-new-privileges`、1 CPU、512 MiB、128 PID、256 nofile 和 64 MiB `/tmp`
 - 超时、输出超额或中断按随机精确容器名执行强制清理；失败不会回退到宿主机
 - 四事件 `HookRegistry` 已接入 Agent/Dispatcher；Permission 顺序保持为硬拒绝 → 风险 → preflight → Hook 追加否决 → 审批 → Handler
+- Git READ 子进程已隔离宿主环境并覆盖可执行仓库配置；恶意
+  `core.fsmonitor`、凭据继承和可选索引刷新均有回归测试
 
 当前源码的最新验证命令和结果：
 
@@ -443,7 +466,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
    - 定向测试、全量测试、外置非 editable 安装探针和隔离 workspace E2E。
    - 同步 `TEST_REPORT.md`/`README.md`/本 `HANDOFF.md`，明确历史基线、当前验证和剩余边界。
 
-更远的 Hooks 配置/外部适配、Skills、MCP、Subagents、worktree 并行和 Goal Loop 仍是可选路线，应分别立项，不与本次基础 Hooks 混做。
+更远的 Hooks 配置/外部适配、Skills、MCP、并行/递归 Subagent、worktree 并行和 Goal Loop 仍是可选路线，应分别立项。
 
 ## 10. 已知限制和勿抢先处理事项
 
@@ -453,7 +476,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 - `in_flight` 工具副作用未知时不会自动恢复，这是有意的安全边界，不是待修复 Bug。
 - 压缩摘要是可恢复的会话状态，不是跨 Session 的长期 Memory。
 - Hooks 当前只有同步、进程内 Python API；没有配置文件、外部命令 Hook、异步 Hook 或自动发现。
-- 当前没有 Skills、MCP、Subagents 或 Goal Loop。
+- 当前没有 Skills、MCP、Goal Loop、并行/递归 Subagent 或子 Session。
 - 不要读取 `.env`，不要在未经用户审批时运行会更改工作区的真实 Agent 任务。
 - `run_command` 默认不向模型可见；显式开启需 Docker daemon 和本地可信镜像。
   容器可修改所有未遮蔽的 workspace 文件，且只能按现有敏感名/后缀策略识别凭据；
@@ -477,8 +500,9 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 5. 没有读取、打印、提交或写入任何敏感信息。
 6. 状态型或可变更行为的测试使用独立临时 workspace。
 
-交接时的当前源码验证：`692 passed, 1 skipped in 40.58s`（2026-09-03 Docker
-Sandbox 分支，包含真实 Docker 集成测试）；全新临时虚拟环境中正常 `pip install .`、
-Sandbox 模块导入和包内 CLI help 均通过。Docker Desktop Server 29.1.3 与用户授权
-手动拉取的 Docker 官方 `python:3.11-slim` 已用于真实边界测试。实现提交为
-`f6a890f`，PR #5 已推送并等待审查，未自动合并。
+Docker Sandbox 的历史验证为 `692 passed, 1 skipped in 40.58s`（2026-09-03，
+包含真实 Docker 集成测试）；全新临时虚拟环境中正常 `pip install .`、Sandbox
+模块导入和包内 CLI help 均通过。Docker Desktop Server 29.1.3 与用户授权
+手动拉取的 Docker 官方 `python:3.11-slim` 已用于真实边界测试。实现提交
+`f6a890f` 已通过 PR #5 合并到 `main`。当前 Subagent 分支的最新验证见
+`TEST_REPORT.md` 第 10.2 节。

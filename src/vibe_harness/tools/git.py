@@ -1,4 +1,7 @@
+import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from vibe_harness.tools.common import (
@@ -8,21 +11,65 @@ from vibe_harness.tools.common import (
 )
 
 _GIT_TIMEOUT = 10
+_GIT_CONFIG_OVERRIDES = (
+    "core.fsmonitor=false",
+    "core.untrackedCache=false",
+    f"core.hooksPath={os.devnull}",
+)
+
+
+def _isolated_git_env(home: str) -> dict[str, str]:
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": home,
+        "LC_ALL": "C",
+        "PATH": os.defpath,
+        "XDG_CONFIG_HOME": home,
+    }
 
 
 def _run_git(workspace: Path, args: list[str]) -> str:
+    git_path = shutil.which("git")
+    if git_path is None:
+        return "Error: 未找到 git，请先安装"
+
+    workspace_root = workspace.resolve()
+    executable = Path(git_path).resolve()
+    if executable.is_relative_to(workspace_root):
+        return "Error: 拒绝执行工作区内的 git"
+
+    temp_parent = Path(tempfile.gettempdir()).resolve()
+    if temp_parent.is_relative_to(workspace_root):
+        return "Error: 无法为 git 创建安全的临时环境"
+
+    command = [str(executable), "--no-pager"]
+    for override in _GIT_CONFIG_OVERRIDES:
+        command.extend(("-c", override))
+    command.extend(args)
+
     try:
-        result = subprocess.run(
-            ["git", *args],
-            cwd=str(workspace.resolve()),
-            capture_output=True,
-            text=True,
-            timeout=_GIT_TIMEOUT,
-        )
+        with tempfile.TemporaryDirectory(
+            prefix="vibe-harness-git-",
+            dir=temp_parent,
+        ) as isolated_home:
+            result = subprocess.run(
+                command,
+                cwd=str(workspace_root),
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT,
+                env=_isolated_git_env(isolated_home),
+            )
     except FileNotFoundError:
         return "Error: 未找到 git，请先安装"
     except subprocess.TimeoutExpired:
         return "Error: git 命令超时"
+    except OSError:
+        return "Error: git 安全环境创建或执行失败"
 
     if result.returncode != 0:
         return "Error: 不是 Git 仓库或 git 命令失败"

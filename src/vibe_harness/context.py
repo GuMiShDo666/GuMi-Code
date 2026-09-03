@@ -57,6 +57,7 @@ _SUMMARY_EMPTY_PLACEHOLDER = "（历史摘要不可用：摘要模型返回空�
 _SUMMARY_TRUNCATION_NOTE = "\n\n[...中间内容已省略，完整 transcript 已保存...]\n\n"
 
 SummaryUsageCallback = Callable[[object, int], None]
+BeforeSummaryRequestCallback = Callable[[], None]
 
 _ALLOWED_FILENAME_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyz"
@@ -623,6 +624,7 @@ def _request_summary(
     token_counter: RequestTokenCounter,
     max_context_tokens: int,
     usage_callback: SummaryUsageCallback | None = None,
+    before_request: BeforeSummaryRequestCallback | None = None,
 ) -> str:
     summary_input = _build_summary_input(
         history,
@@ -642,6 +644,9 @@ def _request_summary(
             f"无法在上下文预算 {max_context_tokens} tokens "
             "内为摘要输出保留空间"
         )
+
+    if before_request is not None:
+        before_request()
 
     response = client.chat.completions.create(
         model=model,
@@ -670,6 +675,7 @@ def compact_history(
     max_context_tokens: int,
     active_compaction_completed: bool = False,
     usage_callback: SummaryUsageCallback | None = None,
+    before_request: BeforeSummaryRequestCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     transcript_path = _write_transcript(workspace, messages)
 
@@ -680,6 +686,7 @@ def compact_history(
         token_counter,
         max_context_tokens,
         usage_callback,
+        before_request,
     )
 
     compacted = _build_compacted_messages(
@@ -703,6 +710,7 @@ def reactive_compact(
     token_counter: RequestTokenCounter,
     max_context_tokens: int,
     usage_callback: SummaryUsageCallback | None = None,
+    before_request: BeforeSummaryRequestCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     transcript_path = _write_transcript(workspace, messages)
 
@@ -731,6 +739,7 @@ def reactive_compact(
         token_counter,
         max_context_tokens,
         usage_callback,
+        before_request,
     )
 
     head = _build_compacted_messages(

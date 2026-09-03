@@ -17,6 +17,10 @@ build/
 /.gitattributes
 /AGENTS.md
 
+# Local verification artifacts
+/tests/
+/TEST_REPORT.md
+
 # Harness runtime artifacts
 .transcripts/
 .task_outputs/

@@ -10,6 +10,18 @@ from vibe_harness.tools.registry import READ_ONLY_TOOL_NAMES
 SESSION_VERSION = 1
 MAX_SESSION_FILE_BYTES = 5 * 1024 * 1024
 IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"
+RECOVERABLE_TOOL_NAMES = READ_ONLY_TOOL_NAMES | {"task"}
+TASK_INTERRUPTED_RESULT = json.dumps(
+    {
+        "status": "error",
+        "code": "task_interrupted",
+        "message": (
+            "The previous read-only task was interrupted or not run; "
+            "re-plan it from the current workspace state."
+        ),
+    },
+    separators=(",", ":"),
+)
 
 
 @dataclass(frozen=True)
@@ -281,7 +293,7 @@ def plan_tool_batch_recovery(
     in_flight_call_id = state.in_flight_call_id
     if in_flight_call_id is not None:
         name, _ = tool_call_by_id[in_flight_call_id]
-        if name not in READ_ONLY_TOOL_NAMES:
+        if name not in RECOVERABLE_TOOL_NAMES:
             raise ValueError(
                 f"存在 in-flight 工具调用，无法自动恢复："
                 f"{in_flight_call_id}"
@@ -325,7 +337,9 @@ def build_tool_batch_recovery_messages(
         return result
 
     for tool_call in plan.pending_tool_calls:
-        if tool_call.interrupted:
+        if tool_call.name == "task":
+            content = TASK_INTERRUPTED_RESULT
+        elif tool_call.interrupted:
             content = (
                 "该只读工具在上次进程中被中断，未保留可用结果，"
                 "请重新调用或重新规划。"
