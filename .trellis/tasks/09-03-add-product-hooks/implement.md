@@ -54,8 +54,8 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
 - [x] Run the full offline suite (`652 passed in 3.36s`).
 - [x] Review scoped diff and repository status.
 - [x] Scan staged filenames/content for likely secrets without reading `.env`.
-- [ ] Commit with a Conventional Commit message.
-- [ ] Push `feat/product-hooks` and open a pull request into `main`.
+- [x] Commit with Conventional Commit `feat: add lifecycle hooks` (`2ed97d4`).
+- [x] Push `feat/product-hooks` and open pull request `#1` into `main`.
 
 Full validation:
 
