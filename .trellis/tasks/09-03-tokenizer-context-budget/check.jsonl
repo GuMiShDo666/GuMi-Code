@@ -1,5 +1,0 @@
-{"file": ".trellis/tasks/09-03-tokenizer-context-budget/prd.md", "reason": "Acceptance criteria for final verification"}
-{"file": ".trellis/tasks/09-03-tokenizer-context-budget/design.md", "reason": "Architecture and failure-mode review"}
-{"file": ".trellis/spec/backend/context-session-guidelines.md", "reason": "Regression contract for compaction and Session behavior"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Offline tests, dependency, and scope quality gates"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Safe token usage event payload and terminal output"}

@@ -1,6 +1,0 @@
-{"file": ".trellis/spec/backend/index.md", "reason": "Package checklist and cross-boundary quality requirements"}
-{"file": ".trellis/spec/backend/tool-permission-guidelines.md", "reason": "Preserve non-bypassable permission ordering while adding PreToolUse"}
-{"file": ".trellis/spec/backend/context-session-guidelines.md", "reason": "Preserve OpenAI message pairing and Session snapshot invariants"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Keep Hook arguments and results out of ordinary terminal output"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Apply project test and Git workflow"}
-{"file": ".trellis/tasks/09-03-add-product-hooks/research/s04-adaptation.md", "reason": "Retain s04 lifecycle semantics while rejecting unsafe teaching shortcuts"}

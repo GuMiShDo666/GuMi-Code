@@ -7,6 +7,16 @@ __pycache__/
 *.egg-info/
 build/
 
+# Local agent-development workflow files (not part of Gu-Harness)
+/.agents/
+/.claude/
+/.codex/
+/.cursor/
+/.opencode/
+/.trellis/
+/.gitattributes
+/AGENTS.md
+
 # Harness runtime artifacts
 .transcripts/
 .task_outputs/

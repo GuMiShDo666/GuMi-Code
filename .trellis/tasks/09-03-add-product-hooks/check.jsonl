@@ -1,6 +1,0 @@
-{"file": ".trellis/spec/backend/index.md", "reason": "Run the package quality checklist"}
-{"file": ".trellis/spec/backend/tool-permission-guidelines.md", "reason": "Verify Hook vetoes cannot weaken permission gates"}
-{"file": ".trellis/spec/backend/context-session-guidelines.md", "reason": "Verify protocol and Session safety"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Verify no sensitive callback payloads are printed"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Run focused and full regression checks"}
-{"file": ".trellis/tasks/09-03-add-product-hooks/research/s04-adaptation.md", "reason": "Compare implementation against retained and rejected s04 behavior"}
