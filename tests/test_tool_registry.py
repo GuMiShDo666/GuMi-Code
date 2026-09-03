@@ -2,7 +2,15 @@ import json
 from pathlib import Path
 
 from vibe_harness.permissions.policy import ToolRisk
+from vibe_harness.tools import command as command_module
 from vibe_harness.tools import registry
+from vibe_harness.tools.command import DockerSandboxConfig
+
+
+_COMMAND_SANDBOX = DockerSandboxConfig(
+    Path("/usr/local/bin/docker"),
+    "sha256:" + "a" * 64,
+)
 
 
 def test_schema_names_match_registry_keys() -> None:
@@ -104,13 +112,15 @@ def test_delete_file_requires_approval(workspace: Path) -> None:
     assert (workspace / "x.txt").exists()
 
 
-def test_run_command_requires_approval(workspace: Path) -> None:
+def test_run_command_requires_approval(workspace: Path, monkeypatch) -> None:
     marker = workspace / "marker.txt"
+    monkeypatch.setattr(command_module, "_validate_docker_sandbox", lambda value: None)
 
     out = registry.execute_tool(
         workspace,
         "run_command",
         '{"argv": ["touch", "marker.txt"]}',
+        command_sandbox=_COMMAND_SANDBOX,
     )
 
     assert out == "Error: Approval required: run_command"
@@ -154,16 +164,25 @@ def test_delete_file_executes_after_approval(workspace: Path) -> None:
     assert not (workspace / "x.txt").exists()
 
 
-def test_run_command_executes_after_approval(workspace: Path) -> None:
+def test_run_command_executes_after_approval(workspace: Path, monkeypatch) -> None:
     marker = workspace / "marker.txt"
+    monkeypatch.setattr(command_module, "_validate_docker_sandbox", lambda value: None)
 
-    registry.execute_tool(
+    def fake_run_command(**kwargs: object) -> str:
+        marker.touch()
+        return "ok"
+
+    monkeypatch.setitem(registry.ALL_TOOL_HANDLERS, "run_command", fake_run_command)
+
+    out = registry.execute_tool(
         workspace,
         "run_command",
         '{"argv": ["touch", "marker.txt"]}',
         approval_callback=lambda name, args, reason: True,
+        command_sandbox=_COMMAND_SANDBOX,
     )
 
+    assert out == "ok"
     assert marker.exists()
 
 
@@ -578,18 +597,21 @@ def test_run_command_hard_deny_skips_handler(
 
 def test_run_command_safe_command_still_requires_approval(
     workspace: Path,
+    monkeypatch,
 ) -> None:
     calls: list[str] = []
+    monkeypatch.setattr(command_module, "_validate_docker_sandbox", lambda value: None)
 
     def callback(name: str, args: dict[str, object], reason: str) -> bool:
         calls.append(name)
-        return True
+        return False
 
     out = registry.execute_tool(
         workspace,
         "run_command",
         '{"argv": ["echo", "hello"]}',
         approval_callback=callback,
+        command_sandbox=_COMMAND_SANDBOX,
     )
 
     assert calls == ["run_command"]
@@ -739,6 +761,8 @@ def test_post_tool_use_receives_defensive_arguments_copy(
         argv: list[str],
         cwd: str = ".",
         timeout_seconds: int = 120,
+        *,
+        sandbox: DockerSandboxConfig | None = None,
     ) -> str:
         handler_arguments.append(argv)
         return "ok"
@@ -757,6 +781,7 @@ def test_post_tool_use_receives_defensive_arguments_copy(
         "run_command",
         capture_handler,
     )
+    monkeypatch.setattr(command_module, "_validate_docker_sandbox", lambda value: None)
 
     out = registry.execute_tool(
         workspace,
@@ -764,6 +789,7 @@ def test_post_tool_use_receives_defensive_arguments_copy(
         '{"argv": ["echo", "hi"]}',
         approval_callback=lambda name, args, reason: True,
         post_tool_use_callback=mutate_hook,
+        command_sandbox=_COMMAND_SANDBOX,
     )
 
     assert out == "ok"

@@ -78,8 +78,8 @@ Evidence: `context.py`, `agent.py::_is_context_length_error`, and
 - OpenAI-compatible `messages`;
 - `version`.
 
-Do not persist credentials, OpenAI client objects, approval callbacks, or the
-per-run `allow_run_command` switch.
+Do not persist credentials, OpenAI client objects, approval callbacks, the
+per-run `allow_run_command` switch, or the selected Docker sandbox image.
 
 Preserve string `reasoning_content` on assistant messages. DeepSeek thinking
 mode requires every prior assistant reasoning field to be passed back when a

@@ -20,6 +20,7 @@ from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
 from vibe_harness.token_counting import RequestTokenCounter, load_token_counter
+from vibe_harness.tools.command import DockerSandboxConfig
 from vibe_harness.tools import (
     ApprovalCallback,
     ToolExecutionDenied,
@@ -393,6 +394,7 @@ def run_agent(
     allow_run_command: bool = False,
     hook_registry: HookRegistry | None = None,
     token_counter: RequestTokenCounter | None = None,
+    command_sandbox: DockerSandboxConfig | None = None,
 ) -> str:
     if (
         isinstance(max_context_tokens, bool)
@@ -411,6 +413,12 @@ def run_agent(
         raise RuntimeError(
             f"max_steps 必须是正整数，收到：{max_steps!r}"
         )
+
+    if allow_run_command and command_sandbox is None:
+        raise RuntimeError("run_command 已启用，但 Docker Sandbox 未配置")
+
+    if not allow_run_command and command_sandbox is not None:
+        raise RuntimeError("Docker Sandbox 仅能与 allow_run_command 一起启用")
 
     if token_counter is None:
         token_counter = load_token_counter(model)
@@ -797,6 +805,7 @@ def run_agent(
                             approval_callback=approval_callback,
                             pre_tool_use_callback=pre_tool_use_callback,
                             post_tool_use_callback=post_tool_use_callback,
+                            command_sandbox=command_sandbox,
                         )
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)

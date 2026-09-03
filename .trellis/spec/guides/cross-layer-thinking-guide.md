@@ -60,7 +60,10 @@ When adding a CLI flag or setting, decide explicitly:
 - which parse, main-wiring, help, and resume tests need updates.
 
 `allow_run_command` is the reference per-run capability: it changes dynamic
-schemas but is deliberately not persisted in Session.
+schemas but is deliberately not persisted in Session. It is valid only with a
+per-run user-selected local sandbox image. Resolve the image to an immutable
+local ID before the first model request, pass the config explicitly, and never
+let model tool arguments modify it.
 
 ## Durable-State Checklist
 

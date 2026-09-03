@@ -48,6 +48,9 @@ Evidence: `pyproject.toml`, `src/vibe_harness/__main__.py`,
 - Put workspace-facing capabilities under `tools/`. `registry.py` owns the
   schema/risk/handler/preflight tables; capability modules own validation and
   side effects.
+- `tools/command.py` owns the immutable Docker command-sandbox config, local
+  image preflight, fixed container policy, sensitive masks, bounded capture,
+  and exact-container cleanup. CLI and Agent only pass that config explicitly.
 - Put authorization decisions under `permissions/`. Policy must not depend on
   terminal input; terminal approval must not decide risk.
 

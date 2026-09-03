@@ -879,10 +879,94 @@ def test_parse_args_allow_run_command_default(tmp_path: Path) -> None:
 
 def test_parse_args_allow_run_command_enabled(tmp_path: Path) -> None:
     args = cli.parse_args(
-        ["--workspace", str(tmp_path), "--allow-run-command", "任务"]
+        [
+            "--workspace",
+            str(tmp_path),
+            "--allow-run-command",
+            "--sandbox-image",
+            "trusted:local",
+            "任务",
+        ]
     )
 
     assert args.allow_run_command is True
+    assert args.sandbox_image == "trusted:local"
+
+
+def test_parse_args_allow_run_command_requires_sandbox_image(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(
+            ["--workspace", str(tmp_path), "--allow-run-command", "任务"]
+        )
+
+
+def test_parse_args_sandbox_image_requires_command_opt_in(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(
+            [
+                "--workspace",
+                str(tmp_path),
+                "--sandbox-image",
+                "trusted:local",
+                "任务",
+            ]
+        )
+
+
+def test_main_default_mode_does_not_load_docker_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "load_docker_sandbox",
+        lambda image: (_ for _ in ()).throw(AssertionError("must not load Docker")),
+    )
+    monkeypatch.setattr(cli, "OpenAI", lambda api_key, base_url: object())
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: Settings(api_key="k", base_url="http://x", model="deepseek"),
+    )
+    monkeypatch.setattr(cli, "run_agent", lambda **kwargs: "ok")
+
+    assert cli.main(["--workspace", str(tmp_path), "任务"]) == 0
+
+
+def test_main_sandbox_failure_happens_before_settings_and_client(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[str] = []
+
+    def fail_sandbox(image: str) -> object:
+        calls.append("sandbox")
+        raise ValueError("Docker daemon 不可用")
+
+    monkeypatch.setattr(cli, "load_docker_sandbox", fail_sandbox)
+    monkeypatch.setattr(cli, "load_settings", lambda: calls.append("settings"))
+    monkeypatch.setattr(cli, "OpenAI", lambda **kwargs: calls.append("client"))
+
+    code = cli.main(
+        [
+            "--workspace",
+            str(tmp_path),
+            "--allow-run-command",
+            "--sandbox-image",
+            "trusted:local",
+            "任务",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert calls == ["sandbox"]
+    assert "Docker daemon 不可用" in captured.err
 
 
 def test_main_passes_allow_run_command_to_run_agent(
@@ -904,8 +988,10 @@ def test_main_passes_allow_run_command_to_run_agent(
         max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
         token_counter: object = None,
+        command_sandbox: object = None,
     ) -> str:
         captured["allow_run_command"] = allow_run_command
+        captured["command_sandbox"] = command_sandbox
         return "ok"
 
     monkeypatch.setattr(cli, "OpenAI", lambda api_key, base_url: object())
@@ -915,13 +1001,23 @@ def test_main_passes_allow_run_command_to_run_agent(
         lambda: Settings(api_key="k", base_url="http://x", model="deepseek"),
     )
     monkeypatch.setattr(cli, "run_agent", fake_run_agent)
+    sandbox = object()
+    monkeypatch.setattr(cli, "load_docker_sandbox", lambda image: sandbox)
 
     code = cli.main(
-        ["--workspace", str(tmp_path), "--allow-run-command", "任务"]
+        [
+            "--workspace",
+            str(tmp_path),
+            "--allow-run-command",
+            "--sandbox-image",
+            "trusted:local",
+            "任务",
+        ]
     )
 
     assert code == 0
     assert captured["allow_run_command"] is True
+    assert captured["command_sandbox"] is sandbox
 
 
 def test_main_warns_when_allow_run_command_enabled(
@@ -936,9 +1032,17 @@ def test_main_warns_when_allow_run_command_enabled(
         lambda: Settings(api_key="k", base_url="http://x", model="deepseek"),
     )
     monkeypatch.setattr(cli, "run_agent", lambda **kwargs: "ok")
+    monkeypatch.setattr(cli, "load_docker_sandbox", lambda image: object())
 
     code = cli.main(
-        ["--workspace", str(tmp_path), "--allow-run-command", "任务"]
+        [
+            "--workspace",
+            str(tmp_path),
+            "--allow-run-command",
+            "--sandbox-image",
+            "trusted:local",
+            "任务",
+        ]
     )
 
     captured = capsys.readouterr()
@@ -957,6 +1061,7 @@ def test_help_contains_allow_run_command(
 
     assert exc_info.value.code == 0
     assert "--allow-run-command" in captured.out
+    assert "--sandbox-image" in captured.out
 
 
 def test_main_resume_partial_batch_pads_pending(

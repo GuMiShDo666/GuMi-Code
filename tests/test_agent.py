@@ -17,6 +17,7 @@ from vibe_harness.context import DEFAULT_MAX_CONTEXT_TOKENS
 from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS
+from vibe_harness.tools.command import DockerSandboxConfig
 
 
 class _TestTokenCounter:
@@ -35,6 +36,10 @@ class _TestTokenCounter:
 
 
 _TOKEN_COUNTER = _TestTokenCounter()
+_COMMAND_SANDBOX = DockerSandboxConfig(
+    Path("/usr/local/bin/docker"),
+    "sha256:" + "a" * 64,
+)
 
 
 def run_agent(*args: object, **kwargs: object) -> str:
@@ -656,6 +661,7 @@ def test_run_agent_denial_like_tool_output_not_recorded_as_denied(
         workspace=tmp_path,
         user_query="执行命令",
         allow_run_command=True,
+        command_sandbox=_COMMAND_SANDBOX,
     )
 
     assert executions == ["run_command", "run_command"]
@@ -681,6 +687,44 @@ def test_run_agent_default_tools_exclude_run_command(tmp_path: Path) -> None:
         for tool in completions.requests[0]["tools"]
     }
     assert "run_command" not in tool_names
+
+
+def test_run_agent_rejects_enabled_command_without_sandbox(
+    tmp_path: Path,
+) -> None:
+    client, completions = _fake_client(
+        [_assistant_response(_assistant_final_message("不应调用"))]
+    )
+
+    with pytest.raises(RuntimeError, match="Docker Sandbox 未配置"):
+        run_agent(
+            client=client,
+            model="fake-model",
+            workspace=tmp_path,
+            user_query="运行命令",
+            allow_run_command=True,
+        )
+
+    assert completions.requests == []
+
+
+def test_run_agent_rejects_sandbox_without_command_opt_in(
+    tmp_path: Path,
+) -> None:
+    client, completions = _fake_client(
+        [_assistant_response(_assistant_final_message("不应调用"))]
+    )
+
+    with pytest.raises(RuntimeError, match="allow_run_command"):
+        run_agent(
+            client=client,
+            model="fake-model",
+            workspace=tmp_path,
+            user_query="查看项目",
+            command_sandbox=_COMMAND_SANDBOX,
+        )
+
+    assert completions.requests == []
 
 
 def test_run_agent_forged_run_command_rejected_without_execution(
@@ -737,7 +781,12 @@ def test_run_agent_forged_run_command_rejected_without_execution(
 
 def test_run_agent_allow_run_command_includes_schema_and_approves(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "vibe_harness.tools.command._validate_docker_sandbox",
+        lambda value: None,
+    )
     call = _tool_call(
         name="run_command",
         arguments='{"argv": ["touch", "marker.txt"]}',
@@ -757,6 +806,7 @@ def test_run_agent_allow_run_command_includes_schema_and_approves(
         workspace=tmp_path,
         user_query="运行命令",
         allow_run_command=True,
+        command_sandbox=_COMMAND_SANDBOX,
         approval_callback=lambda name, args, reason: approvals.append((name, args)) or False,
     )
 

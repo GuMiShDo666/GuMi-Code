@@ -613,3 +613,45 @@
 2. 8.2/8.6 表明**压缩-恢复链路的可靠性尚未达到"可日常使用"**：空摘要静默失忆 + 预算不可见会在长任务上叠加成"任务莫名失败 + 模型编造原因"。建议把"空摘要视为失败（重试或中止且不覆盖快照）"与"[Compacted] 模板注明预算已重置"作为收口项。
 3. 8.3/8.9 是同一类"输出有上限、输入无上限"缺陷，建议统一做输入侧上限（子进程流式读取+丢弃、read_file 大小预检）。
 4. 其余 MEDIUM/LOW 项（Gate 1 包装绕过、脚本执行、session 健壮性、静默截断、文件名碰撞等）不阻塞日常使用，但与 README/HANDOFF 中既有安全声明存在出入，建议在文档中先如实收敛措辞，再排期修复。
+
+## 9. Docker Command Sandbox 实现检查点（2026-09-03）
+
+### 9.1 已实现边界
+
+- `run_command` 仍默认不可见；启用时必须同时提供
+  `--sandbox-image`。CLI 在任何模型请求前检查 Docker daemon 和本地镜像。
+- 用户的本地镜像引用在启动时解析为不可变 image ID；容器使用
+  `--pull=never`，模型不能控制镜像、Docker 参数、挂载、网络、用户或资源限额。
+- 每次命令运行在断网、只读根文件系统、全 capability 删除、
+  `no-new-privileges`、数字非 root 用户和固定 CPU/内存/PID/nofile/tmpfs 限制的新容器中。
+- workspace 是唯一读写宿主挂载。已存在的敏感文件/目录使用空的只读挂载遮蔽，
+  不跟随符号链接，数量超过 256 时在审批前失败关闭。
+- stdout/stderr 使用带背压的有界读取。超时、输出超额、中断或不确定的
+  Docker 错误只会清理当前随机精确容器名，不会回退到宿主执行。
+
+本节的当前实现取代了 6.1 和 8.3 中的“宿主直接任意代码执行”与
+“命令输出无界内存”状态。历史探针保留作为修复前证据，不代表当前源码。
+
+### 9.2 当前验证
+
+```text
+focused Sandbox/CLI/Agent/registry tests: passed
+full offline suite: 691 passed, 2 skipped in 6.15s
+fresh normal pip install: passed
+installed Sandbox imports and CLI help flags: passed
+Docker Desktop server: 29.1.3 available
+live Docker containment test with python:3.11-slim: passed in 32.75s
+full suite with live Docker test: 692 passed, 1 skipped in 40.58s
+```
+
+默认离线运行仍会跳过官方 tokenizer 集成探针和 Docker 实机探针。此次经用户授权
+手动拉取 Docker 官方 `python:3.11-slim`，并通过环境变量显式启用实机探针；包含
+实机探针的全量运行只跳过 tokenizer 探针。
+
+### 9.3 剩余边界
+
+- 获批命令仍可修改/删除未遮蔽的 workspace 文件，且 bind mount 的宿主磁盘用量
+  无法由当前 Docker CPU/内存/PID 限额约束。
+- 敏感路径遮蔽依赖现有文件名/后缀策略；普通文件名中的密钥和硬链接别名仍是盲区。
+- 本设计信任用户选择的本地镜像、Docker CLI/daemon 和容器 VM/内核隔离，
+  不宣称可防御恶意镜像或容器逃逸。

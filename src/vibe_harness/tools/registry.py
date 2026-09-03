@@ -10,7 +10,11 @@ from vibe_harness.permissions import (
 )
 from vibe_harness.permissions.policy import ToolRisk
 from vibe_harness.tools.artifacts import read_tool_output
-from vibe_harness.tools.command import _validate_run_command, run_command
+from vibe_harness.tools.command import (
+    DockerSandboxConfig,
+    _validate_run_command,
+    run_command,
+)
 from vibe_harness.tools.filesystem import (
     _validate_delete_file,
     _validate_edit_file,
@@ -375,9 +379,10 @@ RUN_COMMAND_SCHEMA = {
     "function": {
         "name": "run_command",
         "description": (
-            "Run a single program inside the workspace without a shell. "
-            "Runs one program per call; shell operators, redirection, and "
-            "pipes are not supported."
+            "Run a single program in the approved workspace through the "
+            "configured no-network Docker sandbox. Available programs and "
+            "dependencies come from its fixed image. Runs one program per "
+            "call; shell operators, redirection, and pipes are not supported."
         ),
         "parameters": {
             "type": "object",
@@ -476,6 +481,7 @@ def execute_tool(
     approval_callback: ApprovalCallback | None = None,
     pre_tool_use_callback: PreToolUseCallback | None = None,
     post_tool_use_callback: PostToolUseCallback | None = None,
+    command_sandbox: DockerSandboxConfig | None = None,
 ) -> str:
     handler = ALL_TOOL_HANDLERS.get(tool_name)
     if handler is None:
@@ -503,7 +509,14 @@ def execute_tool(
         preflight = PREFLIGHTS.get(tool_name)
         if preflight is not None:
             try:
-                preflight(workspace=workspace, **arguments)
+                if tool_name == "run_command":
+                    preflight(
+                        workspace=workspace,
+                        **arguments,
+                        sandbox=command_sandbox,
+                    )
+                else:
+                    preflight(workspace=workspace, **arguments)
             except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
                 return _format_tool_error(exc)
 
@@ -527,7 +540,14 @@ def execute_tool(
             return ToolExecutionDenied(f"{DENIED_BY_USER_PREFIX}{tool_name}")
 
     try:
-        result = handler(workspace=workspace, **arguments)
+        if tool_name == "run_command":
+            result = handler(
+                workspace=workspace,
+                **arguments,
+                sandbox=command_sandbox,
+            )
+        else:
+            result = handler(workspace=workspace, **arguments)
     except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
         result = _format_tool_error(exc)
 

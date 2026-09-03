@@ -6,7 +6,7 @@
 
 ## 功能
 
-- 支持文件读写、搜索、Git 状态检查和可选的受控命令执行。
+- 支持文件读写、搜索、Git 状态检查和可选的 Docker 隔离命令执行。
 - 读操作直接允许；写入和删除需终端审批；命令执行默认不向模型开放。
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
 - 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
@@ -20,6 +20,8 @@
 
 - Python 3.11 或更高版本。
 - 可调用 OpenAI 兼容 Chat Completions 和 Tool Calling 的模型服务。
+- 只读/文件工具不需要 Docker；使用 `run_command` 时需要已启动的
+  Docker Desktop/Engine 和一个已存在于本地的可信镜像。
 
 ### 首次安装
 
@@ -78,16 +80,34 @@ mkdir -p /tmp/vibe-harness-first-run
 当模型请求执行写入、编辑、删除或命令工具时，终端会显示工具名、原因和参数预览。只有输入 `y` 或 `yes`（忽略大小写和首尾空白）才会允许执行，其他输入默认拒绝。
 普通运行日志只显示上下文情况、当前步骤与工具名、工具错误和最终回答；不重复输出普通工具参数和成功结果。权限审批中的限长参数预览不受影响。
 
-`run_command` 默认不会出现在模型可见的工具中。只有当前运行明确需要命令执行时才开启：
+`run_command` 默认不会出现在模型可见的工具中。先自行准备一个本地
+可信镜像（Harness 不会自动 pull 或 build），再在当前运行显式开启：
 
 ```bash
 /Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
   --workspace "/absolute/path/to/workspace" \
   --allow-run-command \
+  --sandbox-image "your-trusted-local-image:tag" \
   "运行项目测试。"
 ```
 
-开启后每次命令仍需终端审批。该选项不提供 OS 或容器级沙箱，不应对不可信项目或任务开启。
+启动时 Harness 会确认 Docker daemon 和镜像已就绪，并将 tag 解析为当前本地
+的不可变 image ID。每次获批命令都在新容器中运行，固定策略为：
+
+- `--network=none`，根文件系统只读，`/tmp` 为 64 MiB 临时可写空间。
+- 仅将 workspace 读写挂载到 `/workspace`；不挂载宿主 HOME、Docker socket、
+  凭据目录、设备或其他用户路径。
+- 已存在的 `.env` 变体、`.git`、`.venv`、`.ssh`、`.aws`、密钥文件和
+  Harness 内部产物会被空的只读挂载遮蔽；`.env.example` 等安全模板仍可见。
+- 删除 Linux capabilities、禁止提权，以当前数字 UID/GID 运行，限制为
+  1 CPU、512 MiB 内存、128 进程和 256 文件描述符。
+- 超时、输出超过采集配额或中断时，Harness 会按随机精确容器名强制清理。
+
+镜像必须自带命令所需的运行时和依赖。由于断网且 `.venv` 被遮蔽，不能依赖
+宿主虚拟环境或在命令中临时下载包。恢复 Session 时也必须重新传入这两个开关。
+
+开启后每次命令仍需终端审批。容器可以修改或删除 workspace 内未遮蔽的普通文件，
+也无法防御恶意镜像、被入侵的 Docker daemon 或容器运行时漏洞，因此这不是绝对隔离。
 明显的直接高危命令（例如 `sudo`、关机/重启、磁盘格式化和 `rm -rf /`）会在审批前硬拒绝，不能通过输入 `y` 强制放行。该规则只是纵深防御，不能识别所有包装器或解释器绕过。
 `run_command` 一次只运行一个程序。`&&`、`||`、管道、分号和重定向会在审批前返回明确错误；Harness 不会通过开启 Shell 来执行它们。
 
@@ -215,4 +235,8 @@ PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
 - 压缩摘要是 Session 内的可恢复状态，不是跨 Session 长期 Memory。
 - Hooks 当前只支持同步、进程内 Python 注册；尚无配置文件、外部命令 Hook、异步 Hook 或自动发现机制。
 - 当前未实现 Skills、MCP、Subagents 或 Goal Loop。
-- `run_command` 默认关闭；显式开启后仍只有 Harness 层审批和参数预检，没有 OS 或网络沙箱。
+- `run_command` 默认关闭；显式开启需本地可信镜像和正常的 Docker daemon。
+- Docker Sandbox 保护 workspace 以外的宿主边界，但获批命令仍可修改未遮蔽的
+  workspace 文件；普通文件名中自行保存的密钥也无法被自动识别。
+- workspace 是宿主读写 bind mount，Docker 的内存/CPU/PID 限额不会限制它占用的
+  宿主磁盘空间；不要批准会无界生成文件的命令。

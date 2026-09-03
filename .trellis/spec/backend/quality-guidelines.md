@@ -49,7 +49,10 @@ Representative tests:
 - `tests/test_tool_registry.py` for schema/risk/handler consistency.
 - `tests/test_filesystem_tools.py` and `tests/test_search_tools.py` for path,
   symlink, sensitive-name, and output boundaries.
-- `tests/test_command_tool.py` for command preflight and isolated environment.
+- `tests/test_command_tool.py` for Docker argv, sandbox preflight, sensitive
+  masks, bounded output, and exact-name cleanup.
+- `tests/test_docker_sandbox_integration.py` for opt-in live containment using
+  only a caller-supplied preloaded image; the offline suite must never pull.
 - `tests/test_session.py` and `tests/test_context.py` for persistence and
   recovery invariants.
 
@@ -66,6 +69,17 @@ PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
 
 Historical test counts are evidence for an old checkpoint, not proof of the
 current tree. Report the command and result from the current run.
+
+Live Docker verification is opt-in:
+
+```bash
+VIBE_HARNESS_DOCKER_E2E_IMAGE=<preloaded-image-with-python3> \
+PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
+  -m pytest -q -p no:cacheprovider tests/test_docker_sandbox_integration.py
+```
+
+Do not place registry credentials in that variable or let the test pull/build
+an image. A skipped live test is not proof that the Docker boundary works.
 
 ## Git Workflow
 
