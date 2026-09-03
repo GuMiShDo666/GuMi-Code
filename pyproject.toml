@@ -11,12 +11,14 @@ requires-python = ">=3.11"
 dependencies = [
     "openai>=1",
     "python-dotenv>=1",
+    "prompt-toolkit>=3.0.52,<4",
+    "rich>=14,<15",
     "tokenizers>=0.22,<0.24",
 ]
 
 
 [project.scripts]
-vibe-harness = "vibe_harness.cli:main"
+gu-harness = "vibe_harness.cli:main"
 
 
 [tool.setuptools.packages.find]

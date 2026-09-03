@@ -11,7 +11,7 @@
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
 - 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
 - 使用固定版本的 DeepSeek V4 官方 tokenizer 和消息编码器计算请求 token，不再用字符数估算上下文。
-- 支持 Session 保存、正常续接和中断工具批次的安全恢复。
+- 支持工作区选择、持久 REPL、自动 Session 保存和中断工具批次的安全恢复。
 - 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop` 四类进程内 Hooks。
 - 默认开放同步、单层、只读 `task` Subagent，用独立上下文返回有界 JSON 调查报告。
 
@@ -54,14 +54,18 @@ cp -n .env.example .env
 | `LLM_BASE_URL` | 当前模型服务的 OpenAI 兼容 API 地址 | 是 |
 | `LLM_MODEL` | 当前服务支持的模型名称 | 是 |
 
-Harness 只从启动命令的当前工作目录加载 `.env`。日常使用时应先进入本项目根目录，再执行 `vibe-harness`。
+Gu-Harness 按键独立合并配置：进程环境变量 >
+`~/.config/gu-harness/.env` > 启动目录的旧 `.env`。TTY 中缺少配置时，
+首次向导会隐藏输入 API Key，用一次最小模型请求验证成功后才会
+原子写入 mode `0600` 的用户配置。旧配置仅会触发一次迁移邀请，
+迁移时必须重新输入 API Key，不会静默复制密钥。
 
 ### 第一个只读任务
 
 ```bash
 cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
 mkdir -p /tmp/vibe-harness-first-run
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace /tmp/vibe-harness-first-run \
   "只读检查工作区的文件结构，不要修改任何内容。"
 ```
@@ -70,10 +74,44 @@ mkdir -p /tmp/vibe-harness-first-run
 
 ## 日常使用
 
+### 交互式工作区与 REPL
+
+TTY 中直接执行 `gu-harness` 会打开工作区选择器；也可直接指定已存在
+的目录。首次访问已存在目录时必须确认信任。选择器只列出最近路径和
+当前浏览目录的直接子目录，不会扫描 Desktop、Git 仓库或其他项目根。
+
+```bash
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+  --workspace "/absolute/path/to/workspace"
+```
+
+REPL 支持 `/help`、`/workspace`、`/new`、`/resume`、`/sessions`、
+`/status`、`/verbose` 和 `/exit`。`//text` 会将 `/text` 作为普通任务发送；
+未知斜杠命令不会进入模型。Enter 提交，Escape 后按 Enter（部分终端为
+Alt/Meta+Enter）插入换行，Up/Down 仅浏览当前进程内的输入历史。
+Command+Enter 没有可移植的终端键码；iTerm2 或 VS Code Terminal 用户可将它
+映射为 Escape+Enter：
+
+- iTerm2：打开 Settings > Profiles > Keys > Key Mappings，新增
+  `Command+Enter`，Action 选 `Send Hex Codes`，值填 `0x1b 0x0d`。
+- VS Code：打开 Keyboard Shortcuts (JSON)，添加
+  `{"key":"cmd+enter","command":"workbench.action.terminal.sendSequence",`
+  `"when":"terminalFocus","args":{"text":"\u001b\r"}}`。
+
+Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
+
+自动 Session 位于 `~/.local/share/gu-harness/sessions/`，在第一条任务提交
+前不创建空文件。同一 Session 由进程生命期独占锁保护；不同 Session 可并行打开。
+`/sessions` 可查看、恢复、重命名、确认后删除，也可显式复制导入旧 JSON；
+撤销工作区信任或从最近列表移除都不会删除真实目录或 Session。
+交互恢复 v1 Session 时也会显示源和目标，确认复制为 v2 后才继续；
+源文件保持不变。one-shot 不能完成这次交互确认，因此会拒绝直接恢复 v1。
+
 ### 执行任务
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   "检查当前项目并完成任务。"
 ```
@@ -85,7 +123,7 @@ mkdir -p /tmp/vibe-harness-first-run
 可信镜像（Harness 不会自动 pull 或 build），再在当前运行显式开启：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   --allow-run-command \
   --sandbox-image "your-trusted-local-image:tag" \
@@ -121,7 +159,7 @@ mkdir -p /tmp/vibe-harness-first-run
 如需在本次运行禁用委派：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   --no-subagent \
   "直接检查这个文件。"
@@ -152,7 +190,7 @@ mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
 启动任务并保存 Session：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   --session-file /Users/gumishdo/.local/share/vibe-harness/sessions/daily.json \
   "只读分析这个项目。"
@@ -161,7 +199,7 @@ mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
 使用相同的 workspace 和模型继续任务：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   --resume-session /Users/gumishdo/.local/share/vibe-harness/sessions/daily.json \
   "继续上一次的分析。"
@@ -177,10 +215,15 @@ Thinking mode 下的 assistant `reasoning_content` 会随消息保存和恢复�
 - 已开始但副作用未知的 in-flight 工具会拒绝自动恢复，不会覆盖原 Session。
 - in-flight/pending `task` 会被补成 `task_interrupted` 结果并交给根 Agent 重新规划；旧子 Agent 不会自动重放。
 
+REPL 内的实时 Ctrl+C 中断会将每个原始 tool call 闭合一次：已完成结果保留，
+in-flight 记为副作用未知，pending 记为未执行，两者都不自动重放。如果进程崩溃后
+Session 只余一条 user 尾部，交互恢复会先显示有界预览并要求明确选择重发或丢弃；
+one-shot 的新任务一律优先，不会静默重发旧输入。
+
 ### 调整运行预算
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace "/absolute/path/to/workspace" \
   --max-steps 16 \
   --max-context-tokens 100000 \
