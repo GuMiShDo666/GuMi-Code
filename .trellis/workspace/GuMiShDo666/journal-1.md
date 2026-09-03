@@ -26,3 +26,41 @@ Replaced character estimates with pinned official DeepSeek V4 token counting; ad
 ### Status
 
 [OK] **Completed**
+
+
+## Session 2: Docker command sandbox
+<!-- trellis-session: v=2 fp=e9b920d55707be6e -->
+
+**Date**: 2026-09-03
+**Task**: Docker command sandbox
+**Branch**: `feat/docker-command-sandbox`
+
+### Summary
+
+Moved opt-in run_command execution into a fail-closed Docker sandbox, completed offline and live containment validation, and opened PR #5.
+
+### Main Changes
+
+- Added explicit trusted-image configuration and immutable image-ID locking across CLI, Agent, registry, and command execution.
+- Enforced no network, read-only root, non-root execution, dropped capabilities, bounded resources, sensitive-path masks, bounded output, and exact cleanup.
+- Updated tests, README, HANDOFF, TEST_REPORT, and Trellis specifications.
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f6a890f` | feat: sandbox command execution with Docker |
+
+### Testing
+
+- [OK] Full offline suite: 691 passed, 2 skipped in 6.15s.
+- [OK] Live Docker test with python:3.11-slim: passed in 32.75s.
+- [OK] Full suite with live Docker test: 692 passed, 1 skipped in 40.58s.
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- Review PR #5; do not merge automatically.

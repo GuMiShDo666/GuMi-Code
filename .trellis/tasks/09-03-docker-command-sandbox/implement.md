@@ -111,7 +111,7 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
       overflow.
 - [x] Review scoped diff/status and scan staged filenames/content for likely
       secrets without opening `.env`.
-- [ ] Commit with a Conventional Commit, push `feat/docker-command-sandbox`, and
+- [x] Commit with a Conventional Commit, push `feat/docker-command-sandbox`, and
       open a pull request into `main`. Do not merge it automatically.
 
 Full offline validation:
