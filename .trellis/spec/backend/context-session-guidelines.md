@@ -76,6 +76,11 @@ transition: initial/current user messages, assistant replies, context changes,
 real Tool Results, and final answers. Before an enabled tool executes, it also
 saves an `_vibe_harness_in_flight` marker for that call.
 
+When a `Stop` Hook requests continuation, append its non-empty string as a new
+user message and snapshot it before the next model request. The existing
+`max_steps` boundary remains authoritative and finalization still sends no
+tools.
+
 Do not remove the pre-execution snapshot. Without it, a crash after a side
 effect but before its Tool Result would look like a never-started call.
 

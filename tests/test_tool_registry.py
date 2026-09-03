@@ -609,3 +609,162 @@ def test_write_file_revalidates_after_approval(workspace: Path) -> None:
 
     assert "文件已存在" in out
     assert (workspace / "x.txt").read_text() == "sneaky"
+
+
+# --- Hooks ---
+
+
+def test_pre_tool_use_hook_blocks_before_approval(workspace: Path) -> None:
+    approvals: list[str] = []
+
+    out = registry.execute_tool(
+        workspace,
+        "write_file",
+        '{"path": "x.txt", "content": "hi"}',
+        approval_callback=lambda name, args, reason: approvals.append(name) or True,
+        pre_tool_use_callback=lambda name, args: "project policy",
+    )
+
+    assert out == "Error: Tool blocked by PreToolUse hook: project policy"
+    assert approvals == []
+    assert not (workspace / "x.txt").exists()
+
+
+def test_pre_tool_use_hook_cannot_bypass_approval(workspace: Path) -> None:
+    out = registry.execute_tool(
+        workspace,
+        "write_file",
+        '{"path": "x.txt", "content": "hi"}',
+        pre_tool_use_callback=lambda name, args: None,
+    )
+
+    assert out == "Error: Approval required: write_file"
+    assert not (workspace / "x.txt").exists()
+
+
+def test_hard_deny_runs_before_pre_tool_use_hook(workspace: Path) -> None:
+    hooks: list[str] = []
+
+    out = registry.execute_tool(
+        workspace,
+        "run_command",
+        '{"argv": ["sudo", "whoami"]}',
+        approval_callback=lambda name, args, reason: True,
+        pre_tool_use_callback=lambda name, args: hooks.append(name),
+    )
+
+    assert out == "Error: Tool denied by policy: run_command"
+    assert hooks == []
+
+
+def test_preflight_runs_before_pre_tool_use_hook(workspace: Path) -> None:
+    hooks: list[str] = []
+
+    out = registry.execute_tool(
+        workspace,
+        "write_file",
+        '{"path": ".env", "content": "placeholder"}',
+        approval_callback=lambda name, args, reason: True,
+        pre_tool_use_callback=lambda name, args: hooks.append(name),
+    )
+
+    assert "禁止访问敏感或内部路径" in out
+    assert hooks == []
+
+
+def test_pre_tool_use_receives_defensive_arguments_copy(
+    workspace: Path,
+) -> None:
+    approved_arguments: list[dict[str, object]] = []
+
+    def mutate_hook(name: str, arguments: dict[str, object]) -> None:
+        arguments["content"] = "changed by hook"
+
+    out = registry.execute_tool(
+        workspace,
+        "write_file",
+        '{"path": "x.txt", "content": "original"}',
+        approval_callback=lambda name, args, reason: (
+            approved_arguments.append(dict(args)) or True
+        ),
+        pre_tool_use_callback=mutate_hook,
+    )
+
+    assert "写入 8 字符" in out
+    assert approved_arguments == [{"path": "x.txt", "content": "original"}]
+    assert (workspace / "x.txt").read_text() == "original"
+
+
+def test_post_tool_use_runs_after_handler_attempt(workspace: Path) -> None:
+    calls: list[tuple[str, dict[str, object], str]] = []
+
+    out = registry.execute_tool(
+        workspace,
+        "read_file",
+        '{"path": "missing.txt"}',
+        post_tool_use_callback=lambda name, args, result: calls.append(
+            (name, args, result)
+        ),
+    )
+
+    assert "路径不存在" in out
+    assert calls == [("read_file", {"path": "missing.txt"}, out)]
+
+
+def test_post_tool_use_skipped_when_tool_does_not_execute(
+    workspace: Path,
+) -> None:
+    calls: list[str] = []
+
+    out = registry.execute_tool(
+        workspace,
+        "write_file",
+        '{"path": "x.txt", "content": "hi"}',
+        approval_callback=lambda name, args, reason: False,
+        post_tool_use_callback=lambda name, args, result: calls.append(name),
+    )
+
+    assert isinstance(out, registry.ToolExecutionDenied)
+    assert calls == []
+
+
+def test_post_tool_use_receives_defensive_arguments_copy(
+    workspace: Path,
+    monkeypatch,
+) -> None:
+    handler_arguments: list[list[str]] = []
+
+    def capture_handler(
+        workspace: Path,
+        argv: list[str],
+        cwd: str = ".",
+        timeout_seconds: int = 120,
+    ) -> str:
+        handler_arguments.append(argv)
+        return "ok"
+
+    def mutate_hook(
+        name: str,
+        arguments: dict[str, object],
+        result: str,
+    ) -> None:
+        argv = arguments["argv"]
+        assert isinstance(argv, list)
+        argv.append("changed-by-hook")
+
+    monkeypatch.setitem(
+        registry.ALL_TOOL_HANDLERS,
+        "run_command",
+        capture_handler,
+    )
+
+    out = registry.execute_tool(
+        workspace,
+        "run_command",
+        '{"argv": ["echo", "hi"]}',
+        approval_callback=lambda name, args, reason: True,
+        post_tool_use_callback=mutate_hook,
+    )
+
+    assert out == "ok"
+    assert handler_arguments == [["echo", "hi"]]

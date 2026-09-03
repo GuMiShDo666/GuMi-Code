@@ -33,6 +33,10 @@ Successful Tool Result bodies and ordinary Tool Call arguments stay hidden.
 They are already available to the model/session and create noisy or sensitive
 terminal output when printed twice.
 
+The Hook framework must not print directly. A custom in-process Hook is trusted
+extension code, but its author must still avoid printing or returning sensitive
+arguments, full results, credentials, or complete message history.
+
 ## Sensitive Data Rules
 
 Never print or persist debug output containing:

@@ -17,6 +17,7 @@ from vibe_harness.context import (
     reactive_compact,
 )
 from vibe_harness.events import AgentEventCallback
+from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
 from vibe_harness.tools import (
@@ -328,6 +329,7 @@ def run_agent(
     initial_messages: list[dict[str, object]] | None = None,
     max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
     allow_run_command: bool = False,
+    hook_registry: HookRegistry | None = None,
 ) -> str:
     if (
         isinstance(max_context_chars, bool)
@@ -346,6 +348,9 @@ def run_agent(
         raise RuntimeError(
             f"max_steps 必须是正整数，收到：{max_steps!r}"
         )
+
+    if hook_registry is not None:
+        hook_registry.trigger_hooks(HookEvent.USER_PROMPT_SUBMIT, user_query)
 
     if initial_messages is None:
         messages = [
@@ -387,6 +392,34 @@ def run_agent(
         schema["function"]["name"]
         for schema in agent_tool_schemas
     }
+
+    pre_tool_use_callback = None
+    post_tool_use_callback = None
+    if hook_registry is not None:
+        def trigger_pre_tool_use(
+            tool_name: str,
+            arguments: dict[str, object],
+        ) -> str | None:
+            return hook_registry.trigger_hooks(
+                HookEvent.PRE_TOOL_USE,
+                tool_name,
+                arguments,
+            )
+
+        def trigger_post_tool_use(
+            tool_name: str,
+            arguments: dict[str, object],
+            result: str,
+        ) -> None:
+            hook_registry.trigger_hooks(
+                HookEvent.POST_TOOL_USE,
+                tool_name,
+                arguments,
+                result,
+            )
+
+        pre_tool_use_callback = trigger_pre_tool_use
+        post_tool_use_callback = trigger_post_tool_use
 
     todo_manager = TodoManager()
     rounds_since_todo = 0
@@ -574,6 +607,22 @@ def run_agent(
         _send_message_snapshot(message_snapshot_callback, messages)
 
         if not message.tool_calls:
+            continuation = None
+            if hook_registry is not None:
+                continuation = hook_registry.trigger_hooks(
+                    HookEvent.STOP,
+                    copy.deepcopy(messages),
+                )
+            if continuation:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": continuation,
+                    }
+                )
+                _send_message_snapshot(message_snapshot_callback, messages)
+                continue
+
             answer = message.content or ""
             if event_callback is not None:
                 event_callback(
@@ -654,6 +703,8 @@ def run_agent(
                             tool_name=tool_name,
                             arguments_json=tool_call.function.arguments,
                             approval_callback=approval_callback,
+                            pre_tool_use_callback=pre_tool_use_callback,
+                            post_tool_use_callback=post_tool_use_callback,
                         )
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)

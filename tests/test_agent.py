@@ -14,6 +14,7 @@ from vibe_harness.agent import (
     run_agent,
 )
 from vibe_harness.context import DEFAULT_MAX_CONTEXT_CHARS
+from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS
 
@@ -2660,3 +2661,250 @@ def test_run_agent_marks_internal_model_tools_in_flight(
         if snapshot[-1].get(IN_FLIGHT_MARKER_KEY) is True
     ]
     assert marked_ids == ["call_todo", "call_compact"]
+
+
+# --- Hooks ---
+
+
+def test_user_prompt_submit_runs_before_model_and_cannot_rewrite_query(
+    tmp_path: Path,
+) -> None:
+    responses = [_assistant_response(_assistant_final_message("完成"))]
+    client, completions = _fake_client(responses)
+    hooks = HookRegistry()
+    observations: list[tuple[str, int]] = []
+
+    def observe(query: str) -> str:
+        observations.append((query, len(completions.requests)))
+        return "ignored replacement"
+
+    hooks.register_hook(HookEvent.USER_PROMPT_SUBMIT, observe)
+
+    answer = run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="original query",
+        hook_registry=hooks,
+    )
+
+    assert answer == "完成"
+    assert observations == [("original query", 0)]
+    assert completions.requests[0]["messages"][1] == {
+        "role": "user",
+        "content": "original query",
+    }
+
+
+def test_run_agent_triggers_pre_and_post_tool_hooks(tmp_path: Path) -> None:
+    (tmp_path / "hello.txt").write_text("hi")
+    call = _tool_call(name="list_files", id="call_hook")
+    responses = [
+        _assistant_response(_assistant_tool_message([call])),
+        _assistant_response(_assistant_final_message("完成")),
+    ]
+    client, completions = _fake_client(responses)
+    hooks = HookRegistry()
+    lifecycle: list[object] = []
+
+    hooks.register_hook(
+        HookEvent.PRE_TOOL_USE,
+        lambda name, args: lifecycle.append(("pre", name, args)),
+    )
+    hooks.register_hook(
+        HookEvent.POST_TOOL_USE,
+        lambda name, args, result: lifecycle.append(
+            ("post", name, args, result)
+        ),
+    )
+
+    run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="看看",
+        hook_registry=hooks,
+    )
+
+    assert lifecycle[0] == ("pre", "list_files", {"path": "."})
+    assert lifecycle[1][:3] == ("post", "list_files", {"path": "."})
+    assert "hello.txt" in lifecycle[1][3]
+    tool_result = completions.requests[1]["messages"][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call_hook"
+
+
+def test_run_agent_pre_tool_hook_veto_closes_tool_call(
+    tmp_path: Path,
+) -> None:
+    call = _tool_call(
+        name="write_file",
+        arguments='{"path": "blocked.txt", "content": "hi"}',
+        id="call_blocked",
+    )
+    responses = [
+        _assistant_response(_assistant_tool_message([call])),
+        _assistant_response(_assistant_final_message("完成")),
+    ]
+    client, completions = _fake_client(responses)
+    hooks = HookRegistry()
+    approvals: list[str] = []
+    hooks.register_hook(
+        HookEvent.PRE_TOOL_USE,
+        lambda name, args: "read-only project policy",
+    )
+
+    run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="写文件",
+        approval_callback=lambda name, args, reason: approvals.append(name) or True,
+        hook_registry=hooks,
+    )
+
+    assert approvals == []
+    assert not (tmp_path / "blocked.txt").exists()
+    tool_result = completions.requests[1]["messages"][-1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call_blocked"
+    assert "blocked by PreToolUse hook" in tool_result["content"]
+
+
+def test_stop_hook_can_request_bounded_continuation(tmp_path: Path) -> None:
+    responses = [
+        _assistant_response(_assistant_final_message("还没完成")),
+        _assistant_response(_assistant_final_message("完成")),
+    ]
+    client, completions = _fake_client(responses)
+    hooks = HookRegistry()
+    stop_calls: list[list[dict[str, object]]] = []
+
+    def continue_once(messages: list[dict[str, object]]) -> str | None:
+        stop_calls.append(messages)
+        messages.clear()
+        if len(stop_calls) == 1:
+            return "继续完成任务"
+        return None
+
+    hooks.register_hook(HookEvent.STOP, continue_once)
+
+    answer = run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="完成任务",
+        hook_registry=hooks,
+    )
+
+    assert answer == "完成"
+    assert len(stop_calls) == 2
+    assert [message["role"] for message in completions.requests[1]["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert completions.requests[1]["messages"][-1]["content"] == "继续完成任务"
+
+
+def test_stop_hook_cannot_exceed_step_budget(tmp_path: Path) -> None:
+    responses = [
+        _assistant_response(_assistant_final_message("还没完成")),
+        _assistant_response(_assistant_final_message("阶段总结")),
+    ]
+    client, completions = _fake_client(responses)
+    hooks = HookRegistry()
+    hooks.register_hook(HookEvent.STOP, lambda messages: "继续")
+
+    answer = run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="完成任务",
+        max_steps=1,
+        hook_registry=hooks,
+    )
+
+    assert answer == "阶段总结"
+    assert len(completions.requests) == 2
+    assert "tools" not in completions.requests[1]
+    assert completions.requests[1]["messages"][-2]["content"] == "继续"
+    assert (
+        completions.requests[1]["messages"][-1]["content"]
+        == STEP_BUDGET_FINALIZATION_PROMPT
+    )
+
+
+def test_agent_control_tools_do_not_trigger_tool_hooks(tmp_path: Path) -> None:
+    todo_call = _todo_write_tool_call(
+        json.dumps(
+            {"todos": [{"content": "检查任务", "status": "in_progress"}]}
+        ),
+        id="call_todo_hook",
+    )
+    responses = [
+        _assistant_response(_assistant_tool_message([todo_call])),
+        _assistant_response(_assistant_final_message("完成")),
+    ]
+    client, _ = _fake_client(responses)
+    hooks = HookRegistry()
+    lifecycle: list[str] = []
+    hooks.register_hook(
+        HookEvent.PRE_TOOL_USE,
+        lambda name, args: lifecycle.append("pre"),
+    )
+    hooks.register_hook(
+        HookEvent.POST_TOOL_USE,
+        lambda name, args, result: lifecycle.append("post"),
+    )
+
+    run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="规划",
+        hook_registry=hooks,
+    )
+
+    assert lifecycle == []
+
+
+def test_post_tool_hook_failure_keeps_in_flight_snapshot(
+    tmp_path: Path,
+) -> None:
+    call = _tool_call(
+        name="write_file",
+        arguments='{"path": "created.txt", "content": "hi"}',
+        id="call_post_failure",
+    )
+    responses = [_assistant_response(_assistant_tool_message([call]))]
+    client, _ = _fake_client(responses)
+    hooks = HookRegistry()
+    snapshots: list[list[dict[str, object]]] = []
+
+    def fail_after_tool(name: str, arguments: dict[str, object], result: str) -> None:
+        raise RuntimeError("post hook failed")
+
+    hooks.register_hook(HookEvent.POST_TOOL_USE, fail_after_tool)
+
+    with pytest.raises(RuntimeError, match="post hook failed"):
+        run_agent(
+            client=client,
+            model="fake-model",
+            workspace=tmp_path,
+            user_query="写文件",
+            approval_callback=lambda name, args, reason: True,
+            hook_registry=hooks,
+            message_snapshot_callback=lambda messages: snapshots.append(
+                json.loads(json.dumps(messages))
+            ),
+        )
+
+    assert (tmp_path / "created.txt").read_text() == "hi"
+    assert snapshots[-1][-1] == {
+        "role": "tool",
+        "tool_call_id": "call_post_failure",
+        "content": "",
+        IN_FLIGHT_MARKER_KEY: True,
+    }
