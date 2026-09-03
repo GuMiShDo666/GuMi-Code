@@ -3,9 +3,12 @@ import json
 import os
 import secrets
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
-DEFAULT_MAX_CONTEXT_CHARS = 100_000
+from vibe_harness.token_counting import RequestTokenCounter
+
+DEFAULT_MAX_CONTEXT_TOKENS = 100_000
 
 TOOL_RESULT_BATCH_CHAR_LIMIT = 200_000
 LARGE_RESULT_CHAR_LIMIT = 30_000
@@ -19,7 +22,7 @@ MICRO_COMPACT_MIN_CONTENT_CHARS = 120
 CONTEXT_TARGET_RATIO = 0.8
 FIT_RESULT_PREVIEW_CHARS = 1_000
 
-SUMMARY_INPUT_CHAR_LIMIT = 80_000
+SUMMARY_INPUT_TOKEN_LIMIT = 80_000
 SUMMARY_MAX_TOKENS = 2_000
 KEEP_RECENT_MESSAGES = 5
 
@@ -53,29 +56,13 @@ _SUMMARY_EMPTY_PLACEHOLDER = "（历史摘要不可用：摘要模型返回空�
 
 _SUMMARY_TRUNCATION_NOTE = "\n\n[...中间内容已省略，完整 transcript 已保存...]\n\n"
 
+SummaryUsageCallback = Callable[[object, int], None]
+
 _ALLOWED_FILENAME_CHARS = frozenset(
     "abcdefghijklmnopqrstuvwxyz"
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
     "0123456789._-"
 )
-
-
-def estimate_request_chars(
-    messages: list[dict[str, object]],
-    tools: list[dict[str, object]],
-) -> int:
-    payload = {
-        "messages": messages,
-        "tools": tools,
-    }
-
-    text = json.dumps(
-        payload,
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-    return len(text)
 
 
 def _safe_tool_call_id(tool_call_id: object) -> str:
@@ -393,7 +380,8 @@ def apply_micro_compact(
     messages: list[dict[str, object]],
     workspace: Path,
     tools: list[dict[str, object]],
-    target_chars: int,
+    token_counter: RequestTokenCounter,
+    target_tokens: int,
 ) -> tuple[list[dict[str, object]], int]:
     result = copy.deepcopy(messages)
 
@@ -421,7 +409,7 @@ def apply_micro_compact(
     shortened = 0
 
     for index in candidates:
-        if estimate_request_chars(result, tools) <= target_chars:
+        if token_counter.count_request(result, tools) <= target_tokens:
             break
 
         content = result[index].get("content")
@@ -461,7 +449,8 @@ def apply_fit_tool_results(
     messages: list[dict[str, object]],
     workspace: Path,
     tools: list[dict[str, object]],
-    target_chars: int,
+    token_counter: RequestTokenCounter,
+    target_tokens: int,
 ) -> tuple[list[dict[str, object]], int]:
     result = copy.deepcopy(messages)
 
@@ -481,7 +470,7 @@ def apply_fit_tool_results(
     fitted = 0
 
     for index in ordered:
-        if estimate_request_chars(result, tools) <= target_chars:
+        if token_counter.count_request(result, tools) <= target_tokens:
             break
 
         content = result[index].get("content")
@@ -529,19 +518,68 @@ def _summary_system_content(messages: list[dict[str, object]]) -> str:
     return "你是一个本地编程助手。需要了解工作区文件时必须使用提供的工具，不要猜测。"
 
 
-def _build_summary_input(messages: list[dict[str, object]]) -> str:
+def _summary_request_messages(text: str) -> list[dict[str, object]]:
+    return [
+        {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
+        {"role": "user", "content": text},
+    ]
+
+
+def _build_summary_input(
+    messages: list[dict[str, object]],
+    token_counter: RequestTokenCounter,
+    max_context_tokens: int,
+) -> str:
     text = json.dumps(messages, ensure_ascii=False)
-    if len(text) <= SUMMARY_INPUT_CHAR_LIMIT:
+    request_limit = min(
+        SUMMARY_INPUT_TOKEN_LIMIT,
+        int(max_context_tokens * CONTEXT_TARGET_RATIO),
+    )
+    if request_limit <= 0:
+        raise RuntimeError(
+            f"摘要请求无法在上下文预算 "
+            f"{max_context_tokens} tokens 内安全生成"
+        )
+
+    def fits(candidate: str) -> bool:
+        request = _summary_request_messages(candidate)
+        return token_counter.count_request(request, []) <= request_limit
+
+    if fits(text):
         return text
 
-    quarter = SUMMARY_INPUT_CHAR_LIMIT // 4
-    three_quarters = SUMMARY_INPUT_CHAR_LIMIT - quarter
-
-    return (
-        text[:quarter]
-        + _SUMMARY_TRUNCATION_NOTE
-        + text[-three_quarters:]
+    minimum_request_tokens = token_counter.count_request(
+        _summary_request_messages(_SUMMARY_TRUNCATION_NOTE),
+        [],
     )
+    if minimum_request_tokens > request_limit:
+        raise RuntimeError(
+            f"摘要请求的基础消息需要 "
+            f"{minimum_request_tokens} tokens，无法在上下文预算 "
+            f"{max_context_tokens} tokens 内安全生成"
+        )
+
+    best = _SUMMARY_TRUNCATION_NOTE
+    low = 0
+    high = len(text)
+
+    while low <= high:
+        retained = (low + high) // 2
+        first = retained // 4
+        last = retained - first
+        candidate = (
+            text[:first]
+            + _SUMMARY_TRUNCATION_NOTE
+            + (text[-last:] if last else "")
+        )
+
+        if fits(candidate):
+            best = candidate
+            low = retained + 1
+        else:
+            high = retained - 1
+
+    return best
 
 
 def _build_compacted_messages(
@@ -582,17 +620,38 @@ def _request_summary(
     client: object,
     model: str,
     history: list[dict[str, object]],
+    token_counter: RequestTokenCounter,
+    max_context_tokens: int,
+    usage_callback: SummaryUsageCallback | None = None,
 ) -> str:
-    summary_input = _build_summary_input(history)
+    summary_input = _build_summary_input(
+        history,
+        token_counter,
+        max_context_tokens,
+    )
+
+    request_messages = _summary_request_messages(summary_input)
+    local_prompt_tokens = token_counter.count_request(request_messages, [])
+    output_token_limit = min(
+        SUMMARY_MAX_TOKENS,
+        max_context_tokens - local_prompt_tokens,
+    )
+    if output_token_limit <= 0:
+        raise RuntimeError(
+            f"摘要请求需要 {local_prompt_tokens} tokens，"
+            f"无法在上下文预算 {max_context_tokens} tokens "
+            "内为摘要输出保留空间"
+        )
 
     response = client.chat.completions.create(
         model=model,
-        messages=[
-            {"role": "system", "content": SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": summary_input},
-        ],
-        max_tokens=SUMMARY_MAX_TOKENS,
+        messages=request_messages,
+        max_tokens=output_token_limit,
+        extra_body={"thinking": {"type": "enabled"}},
     )
+
+    if usage_callback is not None:
+        usage_callback(response, local_prompt_tokens)
 
     content = response.choices[0].message.content
     if isinstance(content, str) and content.strip():
@@ -607,11 +666,21 @@ def compact_history(
     messages: list[dict[str, object]],
     active_request: str,
     *,
+    token_counter: RequestTokenCounter,
+    max_context_tokens: int,
     active_compaction_completed: bool = False,
+    usage_callback: SummaryUsageCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     transcript_path = _write_transcript(workspace, messages)
 
-    summary = _request_summary(client, model, messages)
+    summary = _request_summary(
+        client,
+        model,
+        messages,
+        token_counter,
+        max_context_tokens,
+        usage_callback,
+    )
 
     compacted = _build_compacted_messages(
         messages,
@@ -630,6 +699,10 @@ def reactive_compact(
     workspace: Path,
     messages: list[dict[str, object]],
     active_request: str,
+    *,
+    token_counter: RequestTokenCounter,
+    max_context_tokens: int,
+    usage_callback: SummaryUsageCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     transcript_path = _write_transcript(workspace, messages)
 
@@ -651,7 +724,14 @@ def reactive_compact(
         if message.get("role") != "system"
     ]
 
-    summary = _request_summary(client, model, older)
+    summary = _request_summary(
+        client,
+        model,
+        older,
+        token_counter,
+        max_context_tokens,
+        usage_callback,
+    )
 
     head = _build_compacted_messages(
         messages, active_request, summary, transcript_path

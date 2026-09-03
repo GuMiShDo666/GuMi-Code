@@ -1,0 +1,30 @@
+{
+  "id": "tokenizer-context-budget",
+  "name": "tokenizer-context-budget",
+  "title": "Replace character context budget with tokenizer tokens",
+  "description": "Use a configured model-matched tokenizer to count request tokens, migrate context budgeting and observability from character units, and retain provider usage as the authoritative post-request count.",
+  "status": "in_progress",
+  "dev_type": null,
+  "scope": "tokenizer adapter, context-budget pipeline, CLI/events migration, tests, README/HANDOFF/Trellis specs",
+  "package": null,
+  "priority": "P2",
+  "creator": "GuMiShDo666",
+  "assignee": "GuMiShDo666",
+  "createdAt": "2026-09-03",
+  "completedAt": null,
+  "branch": "feat/tokenizer-context-budget",
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [],
+  "notes": "",
+  "meta": {
+    "target_model": "deepseek-v4-flash",
+    "tokenizer_repo": "deepseek-ai/DeepSeek-V4-Flash",
+    "tokenizer_revision": "60d8d70770c6776ff598c94bb586a859a38244f1"
+  }
+}

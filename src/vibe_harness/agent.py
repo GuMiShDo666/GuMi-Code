@@ -7,19 +7,19 @@ from openai import OpenAI
 
 from vibe_harness.context import (
     CONTEXT_TARGET_RATIO,
-    DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_CONTEXT_TOKENS,
     apply_fit_tool_results,
     apply_micro_compact,
     apply_snip_compact,
     apply_tool_result_budget,
     compact_history,
-    estimate_request_chars,
     reactive_compact,
 )
 from vibe_harness.events import AgentEventCallback
 from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
+from vibe_harness.token_counting import RequestTokenCounter, load_token_counter
 from vibe_harness.tools import (
     ApprovalCallback,
     ToolExecutionDenied,
@@ -146,29 +146,31 @@ def _with_system_instructions(content: str) -> str:
 
 def _assistant_message_to_dict(message: object) -> dict[str, object]:
     content = getattr(message, "content", None)
+    reasoning_content = getattr(message, "reasoning_content", None)
+
+    result: dict[str, object] = {
+        "role": "assistant",
+        "content": content,
+    }
+    if isinstance(reasoning_content, str):
+        result["reasoning_content"] = reasoning_content
 
     tool_calls = getattr(message, "tool_calls", None)
     if not tool_calls:
-        return {
-            "role": "assistant",
-            "content": content,
-        }
+        return result
 
-    return {
-        "role": "assistant",
-        "content": content,
-        "tool_calls": [
-            {
-                "id": tool_call.id,
-                "type": getattr(tool_call, "type", "function"),
-                "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
-                },
-            }
-            for tool_call in tool_calls
-        ],
-    }
+    result["tool_calls"] = [
+        {
+            "id": tool_call.id,
+            "type": getattr(tool_call, "type", "function"),
+            "function": {
+                "name": tool_call.function.name,
+                "arguments": tool_call.function.arguments,
+            },
+        }
+        for tool_call in tool_calls
+    ]
+    return result
 
 
 def _execute_todo_write(
@@ -201,13 +203,55 @@ def _normalize_tool_arguments(arguments: str) -> str:
     return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
 
 
+def _emit_provider_usage(
+    response: object,
+    step: int,
+    local_prompt_tokens: int,
+    event_callback: AgentEventCallback | None,
+) -> None:
+    if event_callback is None:
+        return
+
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+
+    payload: dict[str, object] = {
+        "step": step,
+        "local_prompt_tokens": local_prompt_tokens,
+    }
+    for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = getattr(usage, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            payload[name] = value
+
+    if len(payload) > 2:
+        event_callback("provider_usage", payload)
+
+
+def _summary_usage_callback(
+    step: int,
+    event_callback: AgentEventCallback | None,
+) -> Callable[[object, int], None]:
+    def emit(response: object, local_prompt_tokens: int) -> None:
+        _emit_provider_usage(
+            response,
+            step,
+            local_prompt_tokens,
+            event_callback,
+        )
+
+    return emit
+
+
 def _finalize_after_step_budget(
     client: OpenAI,
     model: str,
     workspace: Path,
     messages: list[dict[str, object]],
     user_query: str,
-    max_context_chars: int,
+    token_counter: RequestTokenCounter,
+    max_context_tokens: int,
     final_step: int,
     event_callback: AgentEventCallback | None,
     message_snapshot_callback: MessageSnapshotCallback | None,
@@ -215,18 +259,25 @@ def _finalize_after_step_budget(
     prompt = {"role": "user", "content": STEP_BUDGET_FINALIZATION_PROMPT}
 
     final_messages = [*messages, prompt]
-    used_chars = estimate_request_chars(final_messages, [])
+    used_tokens = token_counter.count_request(final_messages, [])
 
-    if used_chars > max_context_chars:
+    if used_tokens > max_context_tokens:
         if event_callback is not None:
             event_callback("context_summary", {"step": final_step})
 
-        before_chars = used_chars
+        before_tokens = used_tokens
         messages, summary_transcript = compact_history(
-            client, model, workspace, messages, user_query
+            client,
+            model,
+            workspace,
+            messages,
+            user_query,
+            token_counter=token_counter,
+            max_context_tokens=max_context_tokens,
+            usage_callback=_summary_usage_callback(final_step, event_callback),
         )
         final_messages = [*messages, prompt]
-        used_chars = estimate_request_chars(final_messages, [])
+        used_tokens = token_counter.count_request(final_messages, [])
 
         if event_callback is not None:
             event_callback(
@@ -235,14 +286,15 @@ def _finalize_after_step_budget(
                     "step": final_step,
                     "stage": "compact_history",
                     "transcript": summary_transcript,
-                    "before_chars": before_chars,
-                    "after_chars": used_chars,
+                    "before_tokens": before_tokens,
+                    "after_tokens": used_tokens,
                 },
             )
 
-        if used_chars > max_context_chars:
+        if used_tokens > max_context_tokens:
             raise RuntimeError(
-                f"上下文超过预算：{used_chars} 字符 > 预算上限 {max_context_chars} 字符"
+                f"上下文超过预算：{used_tokens} tokens > "
+                f"预算上限 {max_context_tokens} tokens"
             )
 
     reactive_retries = 0
@@ -253,8 +305,8 @@ def _finalize_after_step_budget(
                 "context_usage",
                 {
                     "step": final_step,
-                    "used_chars": used_chars,
-                    "max_chars": max_context_chars,
+                    "used_tokens": used_tokens,
+                    "max_tokens": max_context_tokens,
                 },
             )
 
@@ -265,6 +317,7 @@ def _finalize_after_step_budget(
             response = client.chat.completions.create(
                 model=model,
                 messages=final_messages,
+                extra_body={"thinking": {"type": "enabled"}},
             )
             break
         except Exception as error:
@@ -275,15 +328,22 @@ def _finalize_after_step_budget(
 
             reactive_retries += 1
 
-            before_chars = used_chars
+            before_tokens = used_tokens
             if event_callback is not None:
                 event_callback("context_summary", {"step": final_step})
 
             messages, reactive_transcript = reactive_compact(
-                client, model, workspace, messages, user_query
+                client,
+                model,
+                workspace,
+                messages,
+                user_query,
+                token_counter=token_counter,
+                max_context_tokens=max_context_tokens,
+                usage_callback=_summary_usage_callback(final_step, event_callback),
             )
             final_messages = [*messages, prompt]
-            used_chars = estimate_request_chars(final_messages, [])
+            used_tokens = token_counter.count_request(final_messages, [])
 
             if event_callback is not None:
                 event_callback(
@@ -293,16 +353,18 @@ def _finalize_after_step_budget(
                         "stage": "reactive_compact",
                         "retry": reactive_retries,
                         "transcript": reactive_transcript,
-                        "before_chars": before_chars,
-                        "after_chars": used_chars,
+                        "before_tokens": before_tokens,
+                        "after_tokens": used_tokens,
                     },
                 )
 
-            if used_chars > max_context_chars:
+            if used_tokens > max_context_tokens:
                 raise RuntimeError(
-                    f"上下文超过预算：{used_chars} 字符 > 预算上限 {max_context_chars} 字符"
+                    f"上下文超过预算：{used_tokens} tokens > "
+                    f"预算上限 {max_context_tokens} tokens"
                 )
 
+    _emit_provider_usage(response, final_step, used_tokens, event_callback)
     message = response.choices[0].message
     answer = message.content or ""
     if not answer.strip():
@@ -327,17 +389,18 @@ def run_agent(
     event_callback: AgentEventCallback | None = None,
     message_snapshot_callback: MessageSnapshotCallback | None = None,
     initial_messages: list[dict[str, object]] | None = None,
-    max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+    max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
     allow_run_command: bool = False,
     hook_registry: HookRegistry | None = None,
+    token_counter: RequestTokenCounter | None = None,
 ) -> str:
     if (
-        isinstance(max_context_chars, bool)
-        or not isinstance(max_context_chars, int)
-        or max_context_chars <= 0
+        isinstance(max_context_tokens, bool)
+        or not isinstance(max_context_tokens, int)
+        or max_context_tokens <= 0
     ):
         raise RuntimeError(
-            f"max_context_chars 必须是正整数，收到：{max_context_chars!r}"
+            f"max_context_tokens 必须是正整数，收到：{max_context_tokens!r}"
         )
 
     if (
@@ -348,6 +411,9 @@ def run_agent(
         raise RuntimeError(
             f"max_steps 必须是正整数，收到：{max_steps!r}"
         )
+
+    if token_counter is None:
+        token_counter = load_token_counter(model)
 
     if hook_registry is not None:
         hook_registry.trigger_hooks(HookEvent.USER_PROMPT_SUBMIT, user_query)
@@ -426,12 +492,12 @@ def run_agent(
     denied_tool_calls: set[tuple[str, str]] = set()
 
     for step in range(1, max_steps + 1):
-        used_chars = estimate_request_chars(messages, agent_tool_schemas)
+        used_tokens = token_counter.count_request(messages, agent_tool_schemas)
 
         messages, persisted = apply_tool_result_budget(messages, workspace)
 
         if persisted > 0:
-            after_chars = estimate_request_chars(messages, agent_tool_schemas)
+            after_tokens = token_counter.count_request(messages, agent_tool_schemas)
             _send_message_snapshot(message_snapshot_callback, messages)
             if event_callback is not None:
                 event_callback(
@@ -440,16 +506,16 @@ def run_agent(
                         "step": step,
                         "stage": "tool_result_budget",
                         "persisted_results": persisted,
-                        "before_chars": used_chars,
-                        "after_chars": after_chars,
+                        "before_tokens": used_tokens,
+                        "after_tokens": after_tokens,
                     },
                 )
-            used_chars = after_chars
+            used_tokens = after_tokens
 
         messages, archived, transcript = apply_snip_compact(messages, workspace)
 
         if archived > 0:
-            after_chars = estimate_request_chars(messages, agent_tool_schemas)
+            after_tokens = token_counter.count_request(messages, agent_tool_schemas)
             _send_message_snapshot(message_snapshot_callback, messages)
             if event_callback is not None:
                 event_callback(
@@ -459,23 +525,27 @@ def run_agent(
                         "stage": "snip_compact",
                         "archived_messages": archived,
                         "transcript": transcript,
-                        "before_chars": used_chars,
-                        "after_chars": after_chars,
+                        "before_tokens": used_tokens,
+                        "after_tokens": after_tokens,
                     },
                 )
-            used_chars = after_chars
+            used_tokens = after_tokens
 
-        used_chars = estimate_request_chars(messages, agent_tool_schemas)
+        used_tokens = token_counter.count_request(messages, agent_tool_schemas)
 
-        if used_chars > max_context_chars:
-            target_chars = int(max_context_chars * CONTEXT_TARGET_RATIO)
+        if used_tokens > max_context_tokens:
+            target_tokens = int(max_context_tokens * CONTEXT_TARGET_RATIO)
 
             messages, shortened = apply_micro_compact(
-                messages, workspace, agent_tool_schemas, target_chars
+                messages,
+                workspace,
+                agent_tool_schemas,
+                token_counter,
+                target_tokens,
             )
 
             if shortened > 0:
-                after_chars = estimate_request_chars(messages, agent_tool_schemas)
+                after_tokens = token_counter.count_request(messages, agent_tool_schemas)
                 _send_message_snapshot(message_snapshot_callback, messages)
                 if event_callback is not None:
                     event_callback(
@@ -484,19 +554,23 @@ def run_agent(
                             "step": step,
                             "stage": "micro_compact",
                             "shortened_results": shortened,
-                            "before_chars": used_chars,
-                            "after_chars": after_chars,
+                            "before_tokens": used_tokens,
+                            "after_tokens": after_tokens,
                         },
                     )
-                used_chars = after_chars
+                used_tokens = after_tokens
 
-            if used_chars > max_context_chars:
+            if used_tokens > max_context_tokens:
                 messages, fitted = apply_fit_tool_results(
-                    messages, workspace, agent_tool_schemas, target_chars
+                    messages,
+                    workspace,
+                    agent_tool_schemas,
+                    token_counter,
+                    target_tokens,
                 )
 
                 if fitted > 0:
-                    after_chars = estimate_request_chars(messages, agent_tool_schemas)
+                    after_tokens = token_counter.count_request(messages, agent_tool_schemas)
                     _send_message_snapshot(message_snapshot_callback, messages)
                     if event_callback is not None:
                         event_callback(
@@ -505,21 +579,28 @@ def run_agent(
                                 "step": step,
                                 "stage": "fit_tool_results",
                                 "fitted_results": fitted,
-                                "before_chars": used_chars,
-                                "after_chars": after_chars,
+                                "before_tokens": used_tokens,
+                                "after_tokens": after_tokens,
                             },
                         )
-                    used_chars = after_chars
+                    used_tokens = after_tokens
 
-        if used_chars > max_context_chars:
+        if used_tokens > max_context_tokens:
             if event_callback is not None:
                 event_callback("context_summary", {"step": step})
 
-            before_chars = used_chars
+            before_tokens = used_tokens
             messages, summary_transcript = compact_history(
-                client, model, workspace, messages, user_query
+                client,
+                model,
+                workspace,
+                messages,
+                user_query,
+                token_counter=token_counter,
+                max_context_tokens=max_context_tokens,
+                usage_callback=_summary_usage_callback(step, event_callback),
             )
-            after_chars = estimate_request_chars(messages, agent_tool_schemas)
+            after_tokens = token_counter.count_request(messages, agent_tool_schemas)
             _send_message_snapshot(message_snapshot_callback, messages)
             if event_callback is not None:
                 event_callback(
@@ -528,17 +609,18 @@ def run_agent(
                         "step": step,
                         "stage": "compact_history",
                         "transcript": summary_transcript,
-                        "before_chars": before_chars,
-                        "after_chars": after_chars,
+                        "before_tokens": before_tokens,
+                        "after_tokens": after_tokens,
                     },
                 )
-            used_chars = after_chars
+            used_tokens = after_tokens
 
-        used_chars = estimate_request_chars(messages, agent_tool_schemas)
+        used_tokens = token_counter.count_request(messages, agent_tool_schemas)
 
-        if used_chars > max_context_chars:
+        if used_tokens > max_context_tokens:
             raise RuntimeError(
-                f"上下文超过预算：{used_chars} 字符 > 预算上限 {max_context_chars} 字符"
+                f"上下文超过预算：{used_tokens} tokens > "
+                f"预算上限 {max_context_tokens} tokens"
             )
 
         reactive_retries = 0
@@ -549,8 +631,8 @@ def run_agent(
                     "context_usage",
                     {
                         "step": step,
-                        "used_chars": used_chars,
-                        "max_chars": max_context_chars,
+                        "used_tokens": used_tokens,
+                        "max_tokens": max_context_tokens,
                     },
                 )
 
@@ -563,6 +645,7 @@ def run_agent(
                     messages=messages,
                     tools=agent_tool_schemas,
                     tool_choice="auto",
+                    extra_body={"thinking": {"type": "enabled"}},
                 )
                 break
             except Exception as error:
@@ -573,14 +656,21 @@ def run_agent(
 
                 reactive_retries += 1
 
-                before_chars = used_chars
+                before_tokens = used_tokens
                 if event_callback is not None:
                     event_callback("context_summary", {"step": step})
 
                 messages, reactive_transcript = reactive_compact(
-                    client, model, workspace, messages, user_query
+                    client,
+                    model,
+                    workspace,
+                    messages,
+                    user_query,
+                    token_counter=token_counter,
+                    max_context_tokens=max_context_tokens,
+                    usage_callback=_summary_usage_callback(step, event_callback),
                 )
-                after_chars = estimate_request_chars(messages, agent_tool_schemas)
+                after_tokens = token_counter.count_request(messages, agent_tool_schemas)
                 _send_message_snapshot(message_snapshot_callback, messages)
 
                 if event_callback is not None:
@@ -591,17 +681,19 @@ def run_agent(
                             "stage": "reactive_compact",
                             "retry": reactive_retries,
                             "transcript": reactive_transcript,
-                            "before_chars": before_chars,
-                            "after_chars": after_chars,
+                            "before_tokens": before_tokens,
+                            "after_tokens": after_tokens,
                         },
                     )
-                used_chars = after_chars
+                used_tokens = after_tokens
 
-                if used_chars > max_context_chars:
+                if used_tokens > max_context_tokens:
                     raise RuntimeError(
-                        f"上下文超过预算：{used_chars} 字符 > 预算上限 {max_context_chars} 字符"
+                        f"上下文超过预算：{used_tokens} tokens > "
+                        f"预算上限 {max_context_tokens} tokens"
                     )
 
+        _emit_provider_usage(response, step, used_tokens, event_callback)
         message = response.choices[0].message
         messages.append(_assistant_message_to_dict(message))
         _send_message_snapshot(message_snapshot_callback, messages)
@@ -735,16 +827,19 @@ def run_agent(
             if event_callback is not None:
                 event_callback("context_summary", {"step": step})
 
-            before_chars = estimate_request_chars(messages, agent_tool_schemas)
+            before_tokens = token_counter.count_request(messages, agent_tool_schemas)
             messages, summary_transcript = compact_history(
                 client,
                 model,
                 workspace,
                 messages,
                 user_query,
+                token_counter=token_counter,
+                max_context_tokens=max_context_tokens,
                 active_compaction_completed=True,
+                usage_callback=_summary_usage_callback(step, event_callback),
             )
-            after_chars = estimate_request_chars(messages, agent_tool_schemas)
+            after_tokens = token_counter.count_request(messages, agent_tool_schemas)
             _send_message_snapshot(message_snapshot_callback, messages)
 
             if event_callback is not None:
@@ -754,8 +849,8 @@ def run_agent(
                         "step": step,
                         "stage": "active_compact",
                         "transcript": summary_transcript,
-                        "before_chars": before_chars,
-                        "after_chars": after_chars,
+                        "before_tokens": before_tokens,
+                        "after_tokens": after_tokens,
                     },
                 )
 
@@ -765,7 +860,8 @@ def run_agent(
         workspace=workspace,
         messages=messages,
         user_query=user_query,
-        max_context_chars=max_context_chars,
+        token_counter=token_counter,
+        max_context_tokens=max_context_tokens,
         final_step=max_steps + 1,
         event_callback=event_callback,
         message_snapshot_callback=message_snapshot_callback,

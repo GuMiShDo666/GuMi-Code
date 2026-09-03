@@ -8,8 +8,13 @@ import pytest
 from vibe_harness import cli
 from vibe_harness.agent import MAX_STEPS
 from vibe_harness.config import Settings
-from vibe_harness.context import DEFAULT_MAX_CONTEXT_CHARS
+from vibe_harness.context import DEFAULT_MAX_CONTEXT_TOKENS
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY, save_session
+
+
+@pytest.fixture(autouse=True)
+def _stub_token_counter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "load_token_counter", lambda model, path=None: object())
 
 
 def _tool_call_dict(
@@ -82,8 +87,9 @@ def test_main_passes_args_and_returns_zero(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["client"] = client
         captured["model"] = model
@@ -277,8 +283,9 @@ def test_main_writes_session_file(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["message_snapshot_callback"] = message_snapshot_callback
         if message_snapshot_callback is not None:
@@ -328,8 +335,9 @@ def test_main_does_not_create_session_file_when_not_specified(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["message_snapshot_callback"] = message_snapshot_callback
         return "ok"
@@ -366,8 +374,9 @@ def test_main_returns_one_when_session_save_fails(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         message_snapshot_callback([{"role": "user", "content": "x"}])
         return "ok"
@@ -460,8 +469,9 @@ def test_main_resumes_and_writes_back(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["initial_messages"] = initial_messages
         captured["message_snapshot_callback"] = message_snapshot_callback
@@ -621,12 +631,13 @@ def test_main_passes_max_steps_three_to_run_agent(
         workspace: Path,
         user_query: str,
         max_steps: int,
-        max_context_chars: int,
+        max_context_tokens: int,
         approval_callback: object,
         event_callback: object,
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["max_steps"] = max_steps
         return "ok"
@@ -659,12 +670,13 @@ def test_main_passes_max_steps_to_run_agent(
         workspace: Path,
         user_query: str,
         max_steps: int,
-        max_context_chars: int,
+        max_context_tokens: int,
         approval_callback: object,
         event_callback: object,
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["max_steps"] = max_steps
         return "ok"
@@ -702,32 +714,125 @@ def test_main_step_budget_finalization_returns_zero(
     assert code == 0
 
 
-def test_parse_args_max_context_chars_default(tmp_path: Path) -> None:
+def test_parse_args_max_context_tokens_default(tmp_path: Path) -> None:
     args = cli.parse_args(["--workspace", str(tmp_path), "任务"])
 
-    assert args.max_context_chars == DEFAULT_MAX_CONTEXT_CHARS
+    assert args.max_context_tokens == DEFAULT_MAX_CONTEXT_TOKENS
 
 
-def test_parse_args_max_context_chars_custom(tmp_path: Path) -> None:
+def test_parse_args_max_context_tokens_custom(tmp_path: Path) -> None:
     args = cli.parse_args(
-        ["--workspace", str(tmp_path), "--max-context-chars", "12000", "任务"]
+        ["--workspace", str(tmp_path), "--max-context-tokens", "12000", "任务"]
     )
 
-    assert args.max_context_chars == 12000
+    assert args.max_context_tokens == 12000
+
+
+def test_parse_args_rejects_removed_max_context_chars(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        cli.parse_args(
+            ["--workspace", str(tmp_path), "--max-context-chars", "12000", "任务"]
+        )
+
+
+def test_parse_args_tokenizer_file(tmp_path: Path) -> None:
+    tokenizer_file = tmp_path / "tokenizer.json"
+
+    args = cli.parse_args(
+        ["--workspace", str(tmp_path), "--tokenizer-file", str(tokenizer_file), "任务"]
+    )
+
+    assert args.tokenizer_file == tokenizer_file
+
+
+def test_main_loads_and_passes_token_counter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokenizer_file = tmp_path / "tokenizer.json"
+    counter = object()
+    captured: dict[str, object] = {}
+
+    def fake_load_token_counter(model: str, path: Path | None) -> object:
+        captured["model"] = model
+        captured["path"] = path
+        return counter
+
+    def fake_run_agent(**kwargs: object) -> str:
+        captured["counter"] = kwargs["token_counter"]
+        return "ok"
+
+    monkeypatch.setattr(cli, "OpenAI", lambda api_key, base_url: object())
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: Settings(
+            api_key="k",
+            base_url="http://x",
+            model="deepseek-v4-flash",
+        ),
+    )
+    monkeypatch.setattr(cli, "load_token_counter", fake_load_token_counter)
+    monkeypatch.setattr(cli, "run_agent", fake_run_agent)
+
+    code = cli.main(
+        ["--workspace", str(tmp_path), "--tokenizer-file", str(tokenizer_file), "任务"]
+    )
+
+    assert code == 0
+    assert captured == {
+        "model": "deepseek-v4-flash",
+        "path": tokenizer_file,
+        "counter": counter,
+    }
+
+
+def test_main_tokenizer_failure_happens_before_client_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    client_created = False
+
+    def fake_openai(api_key: str, base_url: str) -> object:
+        nonlocal client_created
+        client_created = True
+        return object()
+
+    def fail_tokenizer(model: str, path: Path | None) -> object:
+        raise RuntimeError("无法加载 tokenizer")
+
+    monkeypatch.setattr(cli, "OpenAI", fake_openai)
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda: Settings(
+            api_key="k",
+            base_url="http://x",
+            model="deepseek-v4-flash",
+        ),
+    )
+    monkeypatch.setattr(cli, "load_token_counter", fail_tokenizer)
+
+    code = cli.main(["--workspace", str(tmp_path), "任务"])
+
+    assert code == 1
+    assert client_created is False
+    assert "无法加载 tokenizer" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("value", ["0", "-3", "abc", "20.5"])
-def test_parse_args_rejects_invalid_max_context_chars(
+def test_parse_args_rejects_invalid_max_context_tokens(
     tmp_path: Path,
     value: str,
 ) -> None:
     with pytest.raises(SystemExit):
         cli.parse_args(
-            ["--workspace", str(tmp_path), "--max-context-chars", value, "任务"]
+            ["--workspace", str(tmp_path), "--max-context-tokens", value, "任务"]
         )
 
 
-def test_main_passes_max_context_chars_to_run_agent(
+def test_main_passes_max_context_tokens_to_run_agent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -739,14 +844,15 @@ def test_main_passes_max_context_chars_to_run_agent(
         workspace: Path,
         user_query: str,
         max_steps: int,
-        max_context_chars: int,
+        max_context_tokens: int,
         approval_callback: object,
         event_callback: object,
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
-        captured["max_context_chars"] = max_context_chars
+        captured["max_context_tokens"] = max_context_tokens
         return "ok"
 
     monkeypatch.setattr(cli, "OpenAI", lambda api_key, base_url: object())
@@ -758,11 +864,11 @@ def test_main_passes_max_context_chars_to_run_agent(
     monkeypatch.setattr(cli, "run_agent", fake_run_agent)
 
     code = cli.main(
-        ["--workspace", str(tmp_path), "--max-context-chars", "12000", "任务"]
+        ["--workspace", str(tmp_path), "--max-context-tokens", "12000", "任务"]
     )
 
     assert code == 0
-    assert captured["max_context_chars"] == 12000
+    assert captured["max_context_tokens"] == 12000
 
 
 def test_parse_args_allow_run_command_default(tmp_path: Path) -> None:
@@ -795,8 +901,9 @@ def test_main_passes_allow_run_command_to_run_agent(
         message_snapshot_callback: object = None,
         initial_messages: object = None,
         max_steps: int = MAX_STEPS,
-        max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens: int = DEFAULT_MAX_CONTEXT_TOKENS,
         allow_run_command: bool = False,
+        token_counter: object = None,
     ) -> str:
         captured["allow_run_command"] = allow_run_command
         return "ok"

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from vibe_harness.context import (
-    DEFAULT_MAX_CONTEXT_CHARS,
+    DEFAULT_MAX_CONTEXT_TOKENS,
     DEFAULT_MAX_MESSAGES,
     FIT_RESULT_PREVIEW_CHARS,
     KEEP_RECENT_MESSAGES,
@@ -15,15 +15,14 @@ from vibe_harness.context import (
     LARGE_RESULT_CHAR_LIMIT,
     MICRO_COMPACT_MIN_CONTENT_CHARS,
     PERSISTED_RESULT_PREVIEW_CHARS,
-    SUMMARY_INPUT_CHAR_LIMIT,
+    SUMMARY_INPUT_TOKEN_LIMIT,
     SUMMARY_MAX_TOKENS,
-    apply_fit_tool_results,
-    apply_micro_compact,
+    apply_fit_tool_results as _apply_fit_tool_results,
+    apply_micro_compact as _apply_micro_compact,
     apply_snip_compact,
     apply_tool_result_budget,
-    compact_history,
-    estimate_request_chars,
-    reactive_compact,
+    compact_history as _compact_history,
+    reactive_compact as _reactive_compact,
 )
 
 
@@ -54,62 +53,94 @@ def _tools() -> list[dict[str, object]]:
     ]
 
 
-def test_estimate_request_chars_is_stable() -> None:
-    messages = _messages()
-    tools = _tools()
-
-    first = estimate_request_chars(messages, tools)
-    second = estimate_request_chars(messages, tools)
-
-    assert first == second
-
-    expected = len(
-        json.dumps(
-            {"messages": messages, "tools": tools},
-            ensure_ascii=False,
-            separators=(",", ":"),
+class _TestTokenCounter:
+    def count_request(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> int:
+        return len(
+            json.dumps(
+                {"messages": messages, "tools": tools},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         )
+
+
+_TOKEN_COUNTER = _TestTokenCounter()
+
+
+def apply_micro_compact(
+    messages: list[dict[str, object]],
+    workspace: Path,
+    tools: list[dict[str, object]],
+    target_tokens: int,
+) -> tuple[list[dict[str, object]], int]:
+    return _apply_micro_compact(
+        messages,
+        workspace,
+        tools,
+        _TOKEN_COUNTER,
+        target_tokens,
     )
-    assert first == expected
 
 
-def test_estimate_request_chars_does_not_inflate_chinese() -> None:
-    chinese = estimate_request_chars(
-        [{"role": "user", "content": "你好"}],
-        [],
+def apply_fit_tool_results(
+    messages: list[dict[str, object]],
+    workspace: Path,
+    tools: list[dict[str, object]],
+    target_tokens: int,
+) -> tuple[list[dict[str, object]], int]:
+    return _apply_fit_tool_results(
+        messages,
+        workspace,
+        tools,
+        _TOKEN_COUNTER,
+        target_tokens,
     )
-    ascii_two = estimate_request_chars(
-        [{"role": "user", "content": "ab"}],
-        [],
+
+
+def compact_history(
+    client: object,
+    model: str,
+    workspace: Path,
+    messages: list[dict[str, object]],
+    active_request: str,
+    **kwargs: object,
+) -> tuple[list[dict[str, object]], str]:
+    return _compact_history(
+        client,
+        model,
+        workspace,
+        messages,
+        active_request,
+        token_counter=_TOKEN_COUNTER,
+        max_context_tokens=DEFAULT_MAX_CONTEXT_TOKENS,
+        **kwargs,
     )
 
-    assert chinese == ascii_two
+
+def reactive_compact(
+    client: object,
+    model: str,
+    workspace: Path,
+    messages: list[dict[str, object]],
+    active_request: str,
+) -> tuple[list[dict[str, object]], str]:
+    return _reactive_compact(
+        client,
+        model,
+        workspace,
+        messages,
+        active_request,
+        token_counter=_TOKEN_COUNTER,
+        max_context_tokens=DEFAULT_MAX_CONTEXT_TOKENS,
+    )
 
 
-def test_estimate_request_chars_counts_messages_and_tools() -> None:
-    messages = [{"role": "user", "content": "hi"}]
-    tools = _tools()
-
-    base = estimate_request_chars([], [])
-    messages_only = estimate_request_chars(messages, [])
-    tools_only = estimate_request_chars([], tools)
-    both = estimate_request_chars(messages, tools)
-
-    assert messages_only > base
-    assert tools_only > base
-    assert both > messages_only
-    assert both > tools_only
-
-
-def test_estimate_request_chars_returns_positive_int() -> None:
-    result = estimate_request_chars(_messages(), _tools())
-
-    assert isinstance(result, int)
-    assert result > 0
-
-
-def test_default_max_context_chars_is_positive() -> None:
-    assert DEFAULT_MAX_CONTEXT_CHARS > 0
+def test_default_max_context_tokens_is_positive() -> None:
+    assert DEFAULT_MAX_CONTEXT_TOKENS > 0
 
 
 def _assistant_tool_call_message() -> dict[str, object]:
@@ -593,7 +624,7 @@ def _micro_history(
 
 def test_micro_compact_no_op_within_target(tmp_path: Path) -> None:
     messages = _micro_history([5000, 5000, 5000, 5000, 5000], [5000])
-    current = estimate_request_chars(messages, _tools())
+    current = _TOKEN_COUNTER.count_request(messages, _tools())
 
     new_messages, shortened = apply_micro_compact(
         messages, tmp_path, _tools(), current + 1000
@@ -791,7 +822,7 @@ def test_micro_compact_stops_at_target(tmp_path: Path) -> None:
     after_one[3]["content"] = (
         "[Earlier tool result saved at .task_outputs/tool-results/c0.txt]"
     )
-    target = estimate_request_chars(after_one, _tools())
+    target = _TOKEN_COUNTER.count_request(after_one, _tools())
 
     new_messages, shortened = apply_micro_compact(messages, tmp_path, _tools(), target)
 
@@ -987,6 +1018,50 @@ def test_compact_history_summary_request_has_no_tools(tmp_path: Path) -> None:
     assert "tool_choice" not in request
     assert request["model"] == "m"
     assert request["max_tokens"] == SUMMARY_MAX_TOKENS
+    assert request["extra_body"] == {"thinking": {"type": "enabled"}}
+
+
+def test_compact_history_reports_summary_request_token_count(
+    tmp_path: Path,
+) -> None:
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    client, completions = _summary_client("摘要内容")
+    observed: list[tuple[object, int]] = []
+
+    compact_history(
+        client,
+        "m",
+        tmp_path,
+        messages,
+        "req",
+        usage_callback=lambda response, count: observed.append((response, count)),
+    )
+
+    request_messages = completions.requests[0]["messages"]
+    assert observed[0][1] == _TOKEN_COUNTER.count_request(request_messages, [])
+
+
+def test_compact_history_reserves_budget_for_summary_output(
+    tmp_path: Path,
+) -> None:
+    messages = [{"role": "user", "content": "X" * 10_000}]
+    client, completions = _summary_client("摘要内容")
+    max_context_tokens = 1_000
+
+    _compact_history(
+        client,
+        "m",
+        tmp_path,
+        messages,
+        "req",
+        token_counter=_TOKEN_COUNTER,
+        max_context_tokens=max_context_tokens,
+    )
+
+    request = completions.requests[0]
+    prompt_tokens = _TOKEN_COUNTER.count_request(request["messages"], [])
+    assert request["max_tokens"] < SUMMARY_MAX_TOKENS
+    assert prompt_tokens + request["max_tokens"] <= max_context_tokens
 
 
 def test_compact_history_summary_prompt_has_anti_injection(
@@ -1004,7 +1079,7 @@ def test_compact_history_summary_prompt_has_anti_injection(
 
 
 def test_compact_history_truncates_long_input(tmp_path: Path) -> None:
-    messages = [{"role": "user", "content": "x" * (SUMMARY_INPUT_CHAR_LIMIT + 1000)}]
+    messages = [{"role": "user", "content": "x" * (SUMMARY_INPUT_TOKEN_LIMIT + 1000)}]
     client, completions = _summary_client("摘要内容")
 
     compact_history(client, "m", tmp_path, messages, "req")
