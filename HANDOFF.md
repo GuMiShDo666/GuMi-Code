@@ -3,7 +3,7 @@
 > 最后更新：2026-09-03
 > 当前稳定检查点：DeepSeek V4 真实 tokenizer 已接入全部上下文预算和压缩链路
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：审阅并合并 tokenizer context budget PR
+> 当前下一步：审阅并合并 tokenizer context budget PR #2
 
 ## 1. 新对话如何续接
 

@@ -79,7 +79,7 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
       provider E2E without reading or printing `.env` values.
 - [x] Review scoped diff/status and scan staged content for likely secrets
       without reading `.env`.
-- [ ] Commit with a Conventional Commit, push the feature branch, and open a
+- [x] Commit with a Conventional Commit, push the feature branch, and open a
       pull request into `main`.
 
 Full offline validation:
