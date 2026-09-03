@@ -15,6 +15,7 @@ from vibe_harness.session import (
     save_session,
 )
 from vibe_harness.token_counting import load_token_counter
+from vibe_harness.tools.command import load_docker_sandbox
 
 
 def _positive_int(value: str) -> int:
@@ -62,8 +63,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--allow-run-command",
         action="store_true",
         help=(
-            "允许模型请求执行本机命令；"
-            "每次命令仍需终端审批，且不提供 OS 沙箱"
+            "允许模型请求在 Docker Sandbox 中执行命令；"
+            "每次命令仍需终端审批"
+        ),
+    )
+    parser.add_argument(
+        "--sandbox-image",
+        default=None,
+        help=(
+            "run_command 使用的本地可信 Docker 镜像；"
+            "Harness 不会自动拉取"
         ),
     )
     session_group = parser.add_mutually_exclusive_group()
@@ -90,6 +99,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"workspace 不存在或不是目录：{workspace}")
 
     args.workspace = workspace
+
+    if args.allow_run_command and args.sandbox_image is None:
+        parser.error("--allow-run-command 必须同时指定 --sandbox-image")
+
+    if not args.allow_run_command and args.sandbox_image is not None:
+        parser.error("--sandbox-image 只能与 --allow-run-command 一起使用")
 
     if args.session_file is not None:
         requested_session_file = Path(args.session_file).expanduser()
@@ -122,13 +137,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    if args.allow_run_command:
-        print(
-            "警告：run_command 已启用；"
-            "命令仍需审批，但当前不是 OS 沙箱。"
-        )
-
     try:
+        command_sandbox = None
+        if args.allow_run_command:
+            command_sandbox = load_docker_sandbox(args.sandbox_image)
+            print(
+                "警告：run_command 已启用；"
+                "命令将在断网 Docker Sandbox 中运行，"
+                "但仍可修改未遮蔽的 workspace 文件且每次需审批。"
+            )
+
         settings = load_settings()
         token_counter = load_token_counter(
             settings.model,
@@ -189,6 +207,12 @@ def main(argv: list[str] | None = None) -> int:
             ) -> None:
                 save_session(session_file, workspace, model, messages)
 
+        sandbox_kwargs = (
+            {"command_sandbox": command_sandbox}
+            if command_sandbox is not None
+            else {}
+        )
+
         run_agent(
             client=client,
             model=settings.model,
@@ -202,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
             token_counter=token_counter,
+            **sandbox_kwargs,
         )
     except (RuntimeError, OpenAIError, OSError, ValueError) as exc:
         sys.stdout.flush()

@@ -50,8 +50,9 @@ Only the current invocation's `--allow-run-command` flag exposes it. Agent code
 also checks its per-run allow-set, so a forged disabled call is rejected before
 approval/execution and still receives a matching Tool Result.
 
-Do not persist command enablement in Session state. A resumed invocation must
-opt in again.
+Command enablement requires both `--allow-run-command` and a user-selected
+local `--sandbox-image`. Do not persist either value in Session state. A
+resumed invocation must opt in and select the trusted image again.
 
 ## Workspace and Sensitive-File Boundary
 
@@ -81,19 +82,29 @@ their output, not rely only on the model to ignore them.
 
 `tools/command.py` implements defense in depth:
 
+- every approved command runs in a fresh Docker container; no host fallback;
+- user-selected local image resolved to an image ID and `--pull=never`;
+- no network, read-only root, dropped capabilities, no-new-privileges, numeric
+  non-root user, tmpfs, and fixed CPU/memory/PID/nofile limits;
+- one read-write workspace mount, with current sensitive paths overlaid by
+  empty read-only masks and no host HOME, Docker socket, devices, or extra
+  user-controlled mounts; the mask count is capped and overflow fails closed;
 - one argv-based program per call, no shell;
 - reject shell executables, common shell-launch wrappers, control operators,
   and redirection syntax;
 - structured hard deny for directly catastrophic programs/arguments;
 - workspace-relative cwd and path arguments;
-- 1-300 second timeout and 50,000-character output cap;
-- allowlisted environment plus one-shot temporary HOME/XDG directories.
+- 1-300 second timeout, bounded streaming capture, and exact-name cleanup on
+  timeout, output overflow, interruption, or uncertain Docker failure;
+- fixed container HOME/XDG paths under its bounded `/tmp`; host environment is
+  not forwarded into the container.
 
-This is not an OS/container sandbox. Interpreters, project scripts, build/test
-runners, wrappers, and network-capable programs can still perform arbitrary
-effects after opt-in and approval. Never describe the command blacklist or
-argument validation as complete isolation. Default execution for untrusted
-projects would require an OS/container filesystem and network boundary.
+Docker is a containment boundary, not an absolute security guarantee. An
+approved command can modify every ordinary unmasked workspace file. Sensitive
+masking recognizes the canonical name/suffix policy, not secrets stored under
+arbitrary source filenames. The trusted image, Docker daemon, VM/runtime, and
+kernel remain outside the Harness guarantee. Never describe argv filtering or
+Docker itself as complete isolation.
 
 ## Anti-Patterns
 
@@ -103,4 +114,8 @@ projects would require an OS/container filesystem and network boundary.
 - Letting user approval override a hard deny.
 - Passing raw command strings to a shell.
 - Expanding the blacklist and claiming arbitrary code execution is solved.
+- Letting the model choose the image, Docker flags, mounts, network, user,
+  environment, or resource limits.
+- Mounting the Docker socket or host HOME into the command container.
+- Pulling/building an image implicitly or falling back to host execution.
 - Returning a Tool Call failure without its original `tool_call_id`.

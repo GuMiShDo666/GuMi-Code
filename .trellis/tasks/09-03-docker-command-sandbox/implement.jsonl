@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/09-03-docker-command-sandbox/research.md", "reason": "Threat model, Docker controls, sensitive-path finding, and local daemon evidence"}
+{"file": ".trellis/tasks/09-03-docker-command-sandbox/design.md", "reason": "Proposed runtime, configuration, mount, cleanup, and compatibility design"}
+{"file": ".trellis/spec/backend/tool-permission-guidelines.md", "reason": "run_command visibility, approval ordering, workspace safety, and current boundary"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "Fail-closed preflight, subprocess, and sanitized error contracts"}
+{"file": ".trellis/spec/backend/directory-structure.md", "reason": "CLI, Agent, registry, and capability module ownership"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "End-to-end capability and per-run configuration wiring checklist"}

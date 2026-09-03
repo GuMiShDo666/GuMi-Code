@@ -54,6 +54,12 @@ failures. Never abort a tool batch in a way that leaves the protocol open.
 - Apply a timeout and catch `TimeoutExpired`.
 - Return stable messages for missing executables and OS launch errors.
 - Do not include inherited environment values or raw exception reprs in errors.
+- Docker startup/preflight errors must not return raw daemon stderr, image
+  registry details, Docker configuration, or host paths to the model.
+- Timeout, output overflow, interruption, and uncertain Docker-client failure
+  require best-effort removal of the exact random Harness container name. If
+  cleanup cannot be confirmed, return a bounded manual-inspection warning;
+  never broaden cleanup by prefix/filter and never fall back to the host.
 
 Reference implementations: `tools/search.py::search_text`,
 `tools/git.py::_run_git`, and `tools/command.py::run_command`.

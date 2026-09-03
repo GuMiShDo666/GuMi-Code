@@ -1,8 +1,15 @@
 import os
+import queue
 import re
+import secrets
+import shutil
 import subprocess
 import tempfile
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
+from typing import BinaryIO
 
 from vibe_harness.tools.common import (
     _is_sensitive_path,
@@ -12,6 +19,31 @@ from vibe_harness.tools.common import (
 )
 
 MAX_COMMAND_OUTPUT_CHARS = 50_000
+MAX_COMMAND_CAPTURE_BYTES = 64_000
+MAX_SANDBOX_MASKS = 256
+
+SANDBOX_MEMORY = "512m"
+SANDBOX_CPUS = "1"
+SANDBOX_PIDS_LIMIT = 128
+SANDBOX_NOFILE_LIMIT = 256
+SANDBOX_TMPFS_SIZE = "64m"
+
+_CONTAINER_WORKSPACE = "/workspace"
+_DOCKER_CONTROL_TIMEOUT_SECONDS = 5
+_DOCKER_CLEANUP_TIMEOUT_SECONDS = 5
+_READ_CHUNK_BYTES = 8192
+_DOCKER_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class DockerSandboxConfig:
+    docker_path: Path
+    image_id: str
+
+
+class _OutputLimitExceeded(Exception):
+    pass
+
 
 _CONTROL_OPERATORS = frozenset({";", "&&", "||", "|"})
 
@@ -57,36 +89,6 @@ SHELL_EXECUTABLE_NAMES = {
     "pwsh",
     "pwsh.exe",
 }
-
-_SAFE_ENV_KEYS = {
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LOGNAME",
-    "PATH",
-    "SHELL",
-    "SYSTEMROOT",
-    "TEMP",
-    "TERM",
-    "TMP",
-    "TMPDIR",
-    "USER",
-    "VIRTUAL_ENV",
-}
-
-
-def _sanitized_env(home: Path) -> dict[str, str]:
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in _SAFE_ENV_KEYS
-    }
-    env["HOME"] = str(home)
-    env["XDG_CONFIG_HOME"] = str(home / ".config")
-    env["XDG_CACHE_HOME"] = str(home / ".cache")
-    env["XDG_DATA_HOME"] = str(home / ".local" / "share")
-    return env
-
 
 def _is_shell_name(token: str) -> bool:
     return Path(token).name.lower() in SHELL_EXECUTABLE_NAMES
@@ -172,6 +174,8 @@ def _validate_run_command(
     argv: list[str],
     cwd: str = ".",
     timeout_seconds: int = 120,
+    *,
+    sandbox: DockerSandboxConfig | None = None,
 ) -> None:
     if not argv:
         raise ValueError("argv 不能为空")
@@ -193,7 +197,11 @@ def _validate_run_command(
             "或改用其他工具（如 write_file、search_text、list_files 等）完成。"
         )
 
-    if not 1 <= timeout_seconds <= 300:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or not 1 <= timeout_seconds <= 300
+    ):
         raise ValueError("timeout_seconds 必须在 1 到 300 之间")
 
     cwd_path = _resolve_workspace_path(workspace, cwd)
@@ -206,39 +214,484 @@ def _validate_run_command(
 
     _validate_argument_paths(workspace, cwd_path, argv)
 
+    _validate_sandbox_workspace(workspace)
+    _validate_docker_sandbox(sandbox)
+
+
+def _validate_image_reference(image: str) -> None:
+    if not isinstance(image, str) or not image or not image.strip():
+        raise ValueError("sandbox-image 不能为空")
+
+    if image != image.strip() or image.startswith("-"):
+        raise ValueError("sandbox-image 格式无效")
+
+    if any(character.isspace() or character == "\x00" for character in image):
+        raise ValueError("sandbox-image 格式无效")
+
+
+def _run_docker_control(
+    docker_path: Path,
+    arguments: list[str],
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [str(docker_path), *arguments],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=_DOCKER_CONTROL_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("Docker daemon 响应超时")
+    except OSError:
+        raise ValueError("无法连接 Docker，请确认 Docker Desktop 已启动")
+
+
+def _inspect_local_image(docker_path: Path, image: str) -> str:
+    result = _run_docker_control(
+        docker_path,
+        ["image", "inspect", "--format", "{{.Id}}", image],
+    )
+
+    if result.returncode != 0:
+        raise ValueError("Sandbox 镜像不存在于本地 Docker，且 Harness 不会自动拉取")
+
+    image_id = result.stdout.decode("utf-8", errors="replace").strip()
+    if not _DOCKER_IMAGE_ID_RE.fullmatch(image_id):
+        raise ValueError("Docker 未返回有效的本地镜像 ID")
+
+    return image_id
+
+
+def load_docker_sandbox(image: str) -> DockerSandboxConfig:
+    _validate_image_reference(image)
+
+    docker = shutil.which("docker")
+    if docker is None:
+        raise ValueError("未找到 Docker CLI，请先安装 Docker Desktop")
+
+    docker_path = Path(docker).resolve()
+    version = _run_docker_control(
+        docker_path,
+        ["version", "--format", "{{.Server.Version}}"],
+    )
+    if version.returncode != 0 or not version.stdout.strip():
+        raise ValueError("Docker daemon 不可用，请启动 Docker Desktop")
+
+    image_id = _inspect_local_image(docker_path, image)
+    return DockerSandboxConfig(docker_path=docker_path, image_id=image_id)
+
+
+def _validate_docker_sandbox(sandbox: DockerSandboxConfig | None) -> None:
+    if sandbox is None:
+        raise ValueError("run_command 需要已配置的 Docker Sandbox")
+
+    if not isinstance(sandbox, DockerSandboxConfig):
+        raise ValueError("Docker Sandbox 配置无效")
+
+    if not sandbox.docker_path.is_absolute():
+        raise ValueError("Docker CLI 路径必须是绝对路径")
+
+    if not _DOCKER_IMAGE_ID_RE.fullmatch(sandbox.image_id):
+        raise ValueError("Sandbox 本地镜像 ID 无效")
+
+    version = _run_docker_control(
+        sandbox.docker_path,
+        ["version", "--format", "{{.Server.Version}}"],
+    )
+    if version.returncode != 0 or not version.stdout.strip():
+        raise ValueError("Docker daemon 不可用，请启动 Docker Desktop")
+
+    inspected_id = _inspect_local_image(sandbox.docker_path, sandbox.image_id)
+    if inspected_id != sandbox.image_id:
+        raise ValueError("Sandbox 本地镜像已变更，请重新启动 Harness")
+
+
+def _validate_mount_component(value: str) -> None:
+    if any(character in value for character in (",", "\n", "\r", "\x00")):
+        raise ValueError("Workspace 路径包含 Docker mount 不支持的字符")
+
+
+def _find_sensitive_paths(workspace: Path) -> list[tuple[Path, bool]]:
+    root = workspace.resolve()
+    sensitive: list[tuple[Path, bool]] = []
+
+    for directory, directory_names, file_names in os.walk(
+        root,
+        topdown=True,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        relative_directory = directory_path.relative_to(root)
+        kept_directories: list[str] = []
+
+        for name in directory_names:
+            relative = relative_directory / name
+            candidate = directory_path / name
+            if _is_sensitive_path(relative):
+                if candidate.is_symlink():
+                    raise ValueError("敏感路径不允许是符号链接")
+                sensitive.append((relative, True))
+                if len(sensitive) > MAX_SANDBOX_MASKS:
+                    raise ValueError("Workspace 敏感路径过多，无法安全创建 Sandbox")
+            else:
+                kept_directories.append(name)
+
+        directory_names[:] = kept_directories
+
+        for name in file_names:
+            relative = relative_directory / name
+            if not _is_sensitive_path(relative):
+                continue
+
+            candidate = directory_path / name
+            if candidate.is_symlink():
+                raise ValueError("敏感路径不允许是符号链接")
+            sensitive.append((relative, False))
+            if len(sensitive) > MAX_SANDBOX_MASKS:
+                raise ValueError("Workspace 敏感路径过多，无法安全创建 Sandbox")
+
+    sensitive.sort(key=lambda item: item[0].as_posix())
+    return sensitive
+
+
+def _validate_sandbox_workspace(workspace: Path) -> None:
+    root = workspace.resolve()
+    _validate_mount_component(str(root))
+    for relative, _ in _find_sensitive_paths(root):
+        _validate_mount_component(
+            f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
+        )
+
+
+def _prepare_sensitive_masks(
+    workspace: Path,
+    mask_root: Path,
+) -> list[tuple[Path, str]]:
+    masks: list[tuple[Path, str]] = []
+
+    for index, (relative, is_directory) in enumerate(
+        _find_sensitive_paths(workspace)
+    ):
+        destination = f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
+        _validate_mount_component(destination)
+
+        mask = mask_root / f"mask-{index}"
+        if is_directory:
+            mask.mkdir()
+        else:
+            mask.write_bytes(b"")
+
+        _validate_mount_component(str(mask))
+        masks.append((mask, destination))
+
+    return masks
+
+
+def _container_workdir(workspace: Path, cwd: str) -> str:
+    cwd_path = _resolve_workspace_path(workspace, cwd)
+    relative = cwd_path.relative_to(workspace.resolve())
+    if relative == Path("."):
+        return _CONTAINER_WORKSPACE
+    return f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
+
+
+def _numeric_user() -> str:
+    getuid = getattr(os, "getuid", None)
+    getgid = getattr(os, "getgid", None)
+    if getuid is None or getgid is None:
+        return "65534:65534"
+    uid = getuid()
+    gid = getgid()
+    if uid == 0 or gid == 0:
+        return "65534:65534"
+    return f"{uid}:{gid}"
+
+
+def _build_docker_argv(
+    sandbox: DockerSandboxConfig,
+    workspace: Path,
+    argv: list[str],
+    cwd: str,
+    container_name: str,
+    masks: list[tuple[Path, str]],
+) -> list[str]:
+    root = workspace.resolve()
+    _validate_mount_component(str(root))
+
+    command = [
+        str(sandbox.docker_path),
+        "run",
+        "--rm",
+        "--name",
+        container_name,
+        "--pull=never",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges=true",
+        "--pids-limit",
+        str(SANDBOX_PIDS_LIMIT),
+        "--memory",
+        SANDBOX_MEMORY,
+        "--memory-swap",
+        SANDBOX_MEMORY,
+        "--cpus",
+        SANDBOX_CPUS,
+        "--ulimit",
+        f"nofile={SANDBOX_NOFILE_LIMIT}:{SANDBOX_NOFILE_LIMIT}",
+        "--ipc=none",
+        "--init",
+        "--user",
+        _numeric_user(),
+        "--tmpfs",
+        f"/tmp:rw,noexec,nosuid,nodev,size={SANDBOX_TMPFS_SIZE}",
+        "--mount",
+        f"type=bind,source={root},target={_CONTAINER_WORKSPACE}",
+    ]
+
+    for source, destination in masks:
+        command.extend(
+            [
+                "--mount",
+                f"type=bind,source={source},target={destination},readonly",
+            ]
+        )
+
+    command.extend(
+        [
+            "--workdir",
+            _container_workdir(workspace, cwd),
+            "--env",
+            "HOME=/tmp",
+            "--env",
+            "XDG_CONFIG_HOME=/tmp/.config",
+            "--env",
+            "XDG_CACHE_HOME=/tmp/.cache",
+            "--env",
+            "XDG_DATA_HOME=/tmp/.local/share",
+            "--entrypoint",
+            argv[0],
+            sandbox.image_id,
+            *argv[1:],
+        ]
+    )
+    return command
+
+
+def _read_pipe(
+    name: str,
+    stream: BinaryIO,
+    events: queue.Queue[tuple[str, bytes | None]],
+    stop: threading.Event,
+) -> None:
+    try:
+        while not stop.is_set():
+            try:
+                chunk = stream.read(_READ_CHUNK_BYTES)
+            except (OSError, ValueError):
+                break
+            if not chunk:
+                break
+            while not stop.is_set():
+                try:
+                    events.put((name, chunk), timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+    finally:
+        while not stop.is_set():
+            try:
+                events.put((name, None), timeout=0.1)
+                break
+            except queue.Full:
+                continue
+
+
+def _communicate_bounded(
+    process: subprocess.Popen[bytes],
+    timeout_seconds: int,
+) -> tuple[bytes, bytes]:
+    if process.stdout is None or process.stderr is None:
+        raise OSError("Docker output pipes are unavailable")
+
+    events: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=8)
+    stop = threading.Event()
+    threads = [
+        threading.Thread(
+            target=_read_pipe,
+            args=(name, stream, events, stop),
+            daemon=True,
+        )
+        for name, stream in (
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        )
+    ]
+    for thread in threads:
+        thread.start()
+
+    captured = {"stdout": bytearray(), "stderr": bytearray()}
+    total_bytes = 0
+    finished: set[str] = set()
+    deadline = time.monotonic() + timeout_seconds
+
+    try:
+        while len(finished) < 2:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+
+            try:
+                name, chunk = events.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                continue
+
+            if chunk is None:
+                finished.add(name)
+                continue
+
+            total_bytes += len(chunk)
+            if total_bytes > MAX_COMMAND_CAPTURE_BYTES:
+                raise _OutputLimitExceeded
+            captured[name].extend(chunk)
+
+        process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        return bytes(captured["stdout"]), bytes(captured["stderr"])
+    finally:
+        stop.set()
+        for stream in (process.stdout, process.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        for thread in threads:
+            thread.join(timeout=0.2)
+
+
+def _remove_container(
+    sandbox: DockerSandboxConfig,
+    container_name: str,
+) -> bool:
+    try:
+        result = subprocess.run(
+            [str(sandbox.docker_path), "rm", "--force", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_DOCKER_CLEANUP_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+
+
+def _abort_container(
+    process: subprocess.Popen[bytes],
+    sandbox: DockerSandboxConfig,
+    container_name: str,
+) -> bool:
+    removed = _remove_container(sandbox, container_name)
+    _stop_process(process)
+    return removed
+
 
 def run_command(
     workspace: Path,
     argv: list[str],
     cwd: str = ".",
     timeout_seconds: int = 120,
+    *,
+    sandbox: DockerSandboxConfig | None = None,
 ) -> str:
-    _validate_run_command(workspace, argv, cwd, timeout_seconds)
+    _validate_run_command(
+        workspace,
+        argv,
+        cwd,
+        timeout_seconds,
+        sandbox=sandbox,
+    )
+    assert sandbox is not None
 
-    cwd_path = _resolve_workspace_path(workspace, cwd)
+    container_name = f"vibe-harness-{secrets.token_hex(8)}"
 
-    with tempfile.TemporaryDirectory(prefix="vibe-harness-home-") as tmpdir:
-        env = _sanitized_env(Path(tmpdir))
+    with tempfile.TemporaryDirectory(prefix="vibe-harness-masks-") as tmpdir:
+        masks = _prepare_sensitive_masks(workspace, Path(tmpdir))
+        docker_argv = _build_docker_argv(
+            sandbox,
+            workspace,
+            argv,
+            cwd,
+            container_name,
+            masks,
+        )
+
         try:
-            result = subprocess.run(
-                argv,
-                cwd=str(cwd_path),
-                capture_output=True,
-                text=True,
-                timeout=timeout_seconds,
-                env=env,
+            process = subprocess.Popen(
+                docker_argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError:
+            return "Error: 无法启动 Docker Sandbox"
+
+        try:
+            stdout_bytes, stderr_bytes = _communicate_bounded(
+                process,
+                timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            return "Error: 命令超时"
-        except FileNotFoundError:
-            return "Error: 命令不存在"
+            cleaned = _abort_container(process, sandbox, container_name)
+            suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
+            return f"Error: 命令超时{suffix}"
+        except _OutputLimitExceeded:
+            cleaned = _abort_container(process, sandbox, container_name)
+            suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
+            return f"Error: 命令输出超过限制{suffix}"
+        except KeyboardInterrupt:
+            _abort_container(process, sandbox, container_name)
+            raise
         except OSError:
-            return "Error: 无法执行命令"
+            cleaned = _abort_container(process, sandbox, container_name)
+            suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
+            return f"Error: Docker Sandbox 执行失败{suffix}"
+
+        if process.returncode == 125:
+            cleaned = _remove_container(sandbox, container_name)
+            suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
+            return f"Error: Docker Sandbox 启动失败{suffix}"
+
+        if process.returncode is None or process.returncode < 0:
+            cleaned = _abort_container(process, sandbox, container_name)
+            suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
+            return f"Error: Docker Sandbox 执行失败{suffix}"
+
+    if process.returncode in (126, 127):
+        return "Error: Sandbox 内命令不存在或无法执行"
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace")
+    stderr = stderr_bytes.decode("utf-8", errors="replace")
 
     output = (
-        f"exit_code: {result.returncode}\n"
-        f"stdout:\n{result.stdout}\n"
-        f"stderr:\n{result.stderr}"
+        f"exit_code: {process.returncode}\n"
+        f"stdout:\n{stdout}\n"
+        f"stderr:\n{stderr}"
     )
 
     return _truncate_output(output, MAX_COMMAND_OUTPUT_CHARS)

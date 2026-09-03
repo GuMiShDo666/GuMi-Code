@@ -1,9 +1,9 @@
 # Vibe Harness 开发交接文档
 
 > 最后更新：2026-09-03
-> 当前稳定检查点：DeepSeek V4 真实 tokenizer 已接入全部上下文预算和压缩链路
+> 当前稳定检查点：Docker `run_command` Sandbox 已实现并通过离线与真实容器验收
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：审阅并合并 tokenizer context budget PR #2
+> 当前下一步：审查并决定是否合并 PR #5
 
 ## 1. 新对话如何续接
 
@@ -15,6 +15,7 @@
 然后检查当前代码和测试。Gate 0、s03 Permission、终端精简显示、Todo 单项上限、Shell 控制符/重定向报错和一次性隔离 HOME 已通过验收。
 当前已按 s04 思路加入 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`；Hooks 只能追加否决，不能取代或绕过 Permission。
 当前上下文预算已从字符估算迁移到固定版本的 DeepSeek V4 官方 tokenizer/消息编码器；本地数值用于请求前决策，第三方网关 `usage.prompt_tokens` 是请求后权威数值。
+`run_command` 默认隐藏；显式开启时必须提供本地可信镜像，命令只能在断网、受限、敏感路径遮蔽的 Docker 容器中执行，失败不回退宿主。
 一次只推进一个边界明确的步骤，先讲清目的和运行链路，再让我实现，完成后帮我验收。
 每次我输入“已完成”，验证通过后直接进入下一步；发现当前步骤直接相关的问题可以做最小修复并补回归测试。
 权限架构继续对照 shareAI-lab/learn-claude-code 的 s03_permission，但不机械复制它的教学性宽松规则；必须适配本项目的 OpenAI tool_calls 消息协议和更严格安全边界。
@@ -60,7 +61,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
 - GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前工作分支为 `feat/tokenizer-context-budget`。
+- 当前工作分支为 `feat/docker-command-sandbox`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -77,6 +78,7 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pyte
   [--max-steps N] \
   [--max-context-tokens N] \
   [--tokenizer-file /absolute/path/tokenizer.json] \
+  [--allow-run-command --sandbox-image local-trusted-image] \
   [--session-file /path/session.json | --resume-session /path/session.json] \
   "任务描述"
 ```
@@ -119,7 +121,7 @@ src/vibe_harness/
     ├── filesystem.py         # list/read/write/edit/delete
     ├── search.py             # find_files/search_text
     ├── git.py                # git_status/git_diff
-    ├── command.py            # run_command
+    ├── command.py            # Docker Sandbox 配置、遮蔽、有界执行与 run_command
     └── registry.py           # Schema、Handler、Risk、调度和审批
 
 tests/
@@ -149,15 +151,20 @@ tests/
 | `list_files` / `read_file` / `find_files` / `search_text` / `git_status` / `git_diff` / `read_tool_output` | READ | 直接允许 |
 | `write_file` / `edit_file` | WRITE | 终端审批 |
 | `delete_file` | DESTRUCTIVE | 终端审批 |
-| `run_command` | EXECUTE | 终端审批 |
+| `run_command` | EXECUTE | Docker Sandbox 预检 + 终端审批 |
 
 - `ALL_TOOL_RISKS` 是风险唯一数据源，Schema、Handler 和 Risk 的 key 一致性有测试保护。
-- `MODEL_VISIBLE_TOOL_NAMES` 默认排除 `EXECUTION_TOOL_NAMES`；`--allow-run-command` 只为当前运行动态加入 `run_command` Schema。
+- `MODEL_VISIBLE_TOOL_NAMES` 默认排除 `EXECUTION_TOOL_NAMES`；`--allow-run-command`
+  必须与 `--sandbox-image` 同时提供，且只为当前运行动态加入
+  `run_command` Schema。镜像必须已存在本地，启动时被锁定为 image ID，
+  Harness 使用 `--pull=never`。
 - 审批函数只有在去除空白、忽略大小写后等于 `y`/`yes` 才返回 True。
 - 空输入、其他输入、EOF 和 `KeyboardInterrupt` 默认拒绝。
 - 审批参数预览限长，不会无限刷屏。
 
-已有工具边界：workspace 相对路径、越界/符号链接/敏感路径拒绝、安全 glob、`rg --json` 结果二次过滤、`shell=False`、子进程环境允许列表、超时和输出上限、原子写入。
+已有工具边界：workspace 相对路径、越界/符号链接/敏感路径拒绝、安全 glob、
+`rg --json` 结果二次过滤、原子写入。`run_command` 额外使用断网 Docker
+容器、只读根文件系统、敏感路径空挂载、固定资源限制、有界流式输出和精确容器清理。
 
 后续安全复验已确认：
 
@@ -355,7 +362,11 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 - 终端精简显示：隐藏普通参数/成功结果，保留上下文、step + 工具名、限长错误、最终回答和审批预览
 - Todo 单项 `content` 最多 500 字符，Schema 与运行时双层校验，超限更新原子失败
 - `run_command` 在 preflight 拒绝 Shell 控制符和明确重定向；不弹审批、不执行 Handler，且保留 `find -exec ... ;` 与原生模式参数
-- `run_command` 使用一次性临时 HOME/XDG 环境，不读取真实用户 HOME 配置
+- `run_command` 容器 HOME/XDG 固定在受限 `/tmp`，不挂载宿主 HOME、
+  Docker socket 或宿主凭据，也不向容器传入宿主环境变量
+- Sandbox 固定为无网络、只读根目录、全 capability 删除、
+  `no-new-privileges`、1 CPU、512 MiB、128 PID、256 nofile 和 64 MiB `/tmp`
+- 超时、输出超额或中断按随机精确容器名执行强制清理；失败不会回退到宿主机
 - 四事件 `HookRegistry` 已接入 Agent/Dispatcher；Permission 顺序保持为硬拒绝 → 风险 → preflight → Hook 追加否决 → 审批 → Handler
 
 当前源码的最新验证命令和结果：
@@ -364,10 +375,12 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
   /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 672 passed, 1 skipped in 3.71s（2026-09-03）
+# 692 passed, 1 skipped in 40.58s（2026-09-03，包含 Docker 实机测试）
 ```
 
-默认离线套件中跳过的一项是需要官方 tokenizer 缓存或网络的金标探针；显式设置 `VIBE_HARNESS_TOKENIZER_INTEGRATION=1` 后已单独验证为 `13 passed in 0.36s`。任何后续修改仍需重新运行验证。
+本次通过 `VIBE_HARNESS_DOCKER_E2E_IMAGE=python:3.11-slim` 显式启用 Docker
+实机探针；唯一跳过项是需要官方 tokenizer 缓存或网络的金标探针。tokenizer
+探针的历史结果为 `13 passed in 0.36s`。
 
 ## 8. 个人日常使用版发布验收（已完成）
 
@@ -409,11 +422,17 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
    - 为单项 `content` 增加统一硬上限（建议 500 字符）。
    - Schema `maxLength` 和 `TodoManager.update()` 双重校验，超限更新原子失败。
 
-5. **显式命令模式的可用性与隔离**
+5. **显式命令模式的可用性与隔离（已实现并通过真实 Docker 验收）**
    - 已完成：对 `&&`/`||`/`|`/`;` 和明确重定向语法返回可操作错误，不恢复 shell。
    - 不得笼统拒绝所有含 `*`/`?`/`[]` 的 argv：它们也可能是 `rg`/`find`/解释器的原生模式参数；未展开 glob 需后续做命令感知处理或只增强 Schema 指引。
-   - 已完成：使用 Harness 一次性隔离 HOME/XDG，不向命令暴露真实用户 HOME 和全局配置。
-   - 补包装器/解释器绕过测试，评估 Docker 或 OS 沙箱，但不在小步骤中假装已解决架构性问题。
+   - 已完成：使用每命令新建 Docker 容器，断网、只读根文件系统、
+     敏感 workspace 路径遮蔽、固定资源限制、有界输出和异常清理。
+   - 已完成：使用本地镜像并锁定 image ID；模型不能选择镜像、挂载、
+     网络、容器用户、环境或资源参数；Docker 不可用时失败关闭。
+   - 已添加默认跳过的真实 Docker 集成测试；需 Docker Desktop 运行且
+     `VIBE_HARNESS_DOCKER_E2E_IMAGE` 指向预先加载、内含 `python3` 的可信镜像。
+   - 已使用用户授权手动拉取的 Docker 官方 `python:3.11-slim` 验证工作区写入、
+     敏感路径遮蔽、非 root、断网、只读根目录和超时/输出超额后的精确清理。
 
 6. **低风险体验/兼容收口**
    - 空 workspace 得到明确空结果后不重复换 glob 探索。
@@ -436,9 +455,14 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 - Hooks 当前只有同步、进程内 Python API；没有配置文件、外部命令 Hook、异步 Hook 或自动发现。
 - 当前没有 Skills、MCP、Subagents 或 Goal Loop。
 - 不要读取 `.env`，不要在未经用户审批时运行会更改工作区的真实 Agent 任务。
-- `run_command` 已由 Gate 0 改为默认不向模型可见，但显式开启后仍没有 OS 级文件系统/网络沙箱；它可被 `python -c`、脚本、测试运行器或包装器间接绕过 argv 路径检查。
+- `run_command` 默认不向模型可见；显式开启需 Docker daemon 和本地可信镜像。
+  容器可修改所有未遮蔽的 workspace 文件，且只能按现有敏感名/后缀策略识别凭据；
+  普通文件名中的密钥、恶意镜像、Docker daemon/VM/内核漏洞不在 Harness 保证范围内。
+- workspace 读写 bind mount 的宿主磁盘占用没有被 Docker 资源限额约束；对无界生成
+  文件的命令仍应在 Permission 层拒绝。
 - `shell=False` 不支持 Shell 运算符、重定向或 glob 展开；模型使用这些形式时可能得到误导结果。
-- 子进程环境不含真实 `HOME`，依赖用户全局配置的 git/npm/pip 行为可能不同；不得为了便利直接恢复真实 HOME。
+- 容器断网，且 `.git`/`.venv` 会被遮蔽；镜像必须自带要执行的命令和依赖，
+  命令不能使用宿主全局配置或在运行时下载包。
 - `read_tool_output` 返回 JSON 分页对象；Todo reminder 仍追加到最后一个 tool result。
 - 当前机器 `ripgrep 15.2.0` 可用；`--json` 的真实最低引入版本是 `0.10.0`。
 
@@ -453,4 +477,8 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 5. 没有读取、打印、提交或写入任何敏感信息。
 6. 状态型或可变更行为的测试使用独立临时 workspace。
 
-交接时的当前源码验证：`672 passed, 1 skipped in 3.71s`（2026-09-03 tokenizer 分支），官方 tokenizer 金标探针 `13 passed in 0.36s`，全新临时虚拟环境安装/console script/vendor 模块导入和第三方网关双请求工具链 E2E 均通过。任何后续修改仍需重新运行定向和全量测试。
+交接时的当前源码验证：`692 passed, 1 skipped in 40.58s`（2026-09-03 Docker
+Sandbox 分支，包含真实 Docker 集成测试）；全新临时虚拟环境中正常 `pip install .`、
+Sandbox 模块导入和包内 CLI help 均通过。Docker Desktop Server 29.1.3 与用户授权
+手动拉取的 Docker 官方 `python:3.11-slim` 已用于真实边界测试。实现提交为
+`f6a890f`，PR #5 已推送并等待审查，未自动合并。
