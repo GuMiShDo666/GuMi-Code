@@ -43,6 +43,8 @@ PostToolUseCallback = Callable[
     object,
 ]
 
+BeforeExecuteCallback = Callable[[], None]
+
 DENIED_BY_USER_PREFIX = "Error: Tool execution denied by user: "
 
 
@@ -490,6 +492,7 @@ def execute_tool(
     pre_tool_use_callback: PreToolUseCallback | None = None,
     post_tool_use_callback: PostToolUseCallback | None = None,
     command_sandbox: DockerSandboxConfig | None = None,
+    before_execute_callback: BeforeExecuteCallback | None = None,
 ) -> str:
     handler = ALL_TOOL_HANDLERS.get(tool_name)
     if handler is None:
@@ -545,6 +548,9 @@ def execute_tool(
 
         if not approved:
             return ToolExecutionDenied(f"{DENIED_BY_USER_PREFIX}{tool_name}")
+
+    if before_execute_callback is not None:
+        before_execute_callback()
 
     try:
         if tool_name == "run_command":

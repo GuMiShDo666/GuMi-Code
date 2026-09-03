@@ -5,8 +5,10 @@ from collections.abc import Callable
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.text import Text
+from rich.theme import Theme
 
 MAX_PREVIEW = 1000
+_ANSWER_THEME = Theme({"markdown.code": "bold"}, inherit=False)
 
 AgentEventCallback = Callable[
     [str, dict[str, object]],
@@ -15,11 +17,11 @@ AgentEventCallback = Callable[
 
 
 def _safe_inline(value: object) -> str:
-    return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value))
 
 
 def _safe_multiline(value: object) -> str:
-    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "?", str(value))
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]", "?", str(value))
 
 
 def _bounded_inline(value: object) -> str:
@@ -28,10 +30,7 @@ def _bounded_inline(value: object) -> str:
 
 
 def create_console() -> Console:
-    return Console(
-        no_color=os.getenv("NO_COLOR") is not None,
-        force_terminal=False,
-    )
+    return Console(no_color=os.getenv("NO_COLOR") is not None)
 
 
 class RichEventRenderer:
@@ -53,28 +52,35 @@ class RichEventRenderer:
 
     def _start_status(self, message: str) -> None:
         self._stop_status()
-        self._status = self.console.status(message)
+        self._status = self.console.status(message, spinner="dots")
         self._status.start()  # type: ignore[attr-defined]
 
     def close(self) -> None:
         self._stop_status()
 
     def __call__(self, event_type: str, payload: dict[str, object]) -> None:
-        if event_type in {"model_call", "subagent_step", "context_summary"}:
-            message = (
-                "正在整理上下文…"
-                if event_type == "context_summary"
-                else "Model 正在思考…"
-            )
-            self._start_status(message)
+        if event_type in {"request_prepare", "subagent_prepare"}:
+            self._start_status("准备中...")
+            return
+        if event_type in {"model_call", "subagent_step"}:
+            self._start_status("思考中...")
+            return
+        if event_type == "context_summary":
+            self._start_status("整理上下文中...")
+            return
+
+        if event_type == "tool_execution":
+            self._stop_status()
+            name = _bounded_inline(payload.get("tool_name", "未知"))
+            self.console.print(Text(f"执行中：正在调用{name}"))
+            return
+
+        if event_type in {"tool_call", "subagent_tool"}:
+            self._stop_status()
             return
 
         self._stop_status()
         if event_type == "final_answer":
-            return
-        if event_type == "tool_call":
-            name = _safe_inline(payload.get("tool_name", "未知"))
-            self.console.print(Text(f"工具：{name}"))
             return
         if event_type == "tool_result":
             result = str(payload.get("result", ""))
@@ -99,16 +105,6 @@ class RichEventRenderer:
             return
         if event_type == "subagent_start":
             self.console.print(Text("Subagent 开始"))
-            self._start_status("Subagent 正在处理…")
-            return
-        if event_type == "subagent_tool":
-            self.console.print(
-                Text(
-                    "Subagent 工具："
-                    + _safe_inline(payload.get("tool_name", "未知"))
-                )
-            )
-            self._start_status("Subagent 正在处理…")
             return
         if event_type == "subagent_end":
             status = _safe_inline(payload.get("status", "结束"))
@@ -137,7 +133,8 @@ class RichEventRenderer:
 
     def render_answer(self, answer: str) -> None:
         self._stop_status()
-        self.console.print(Markdown(_safe_multiline(answer)))
+        with self.console.use_theme(_ANSWER_THEME):
+            self.console.print(Markdown(_safe_multiline(answer)))
 
 
 def _truncate(text: str) -> str:
@@ -147,23 +144,39 @@ def _truncate(text: str) -> str:
 
 
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
-    if event_type == "subagent_start":
+    progress_text = {
+        "request_prepare": "准备中...",
+        "subagent_prepare": "准备中...",
+        "model_call": "思考中...",
+        "subagent_step": "思考中...",
+        "context_summary": "整理上下文中...",
+    }.get(event_type)
+    if progress_text is not None:
         print(
-            "  └─ Subagent 开始"
-            f"（最多 {payload.get('max_calls')} 次模型请求）"
+            f"── 第 {_safe_inline(payload.get('step', '?'))} 步："
+            f"{progress_text} ──",
+            flush=True,
         )
         return
 
-    if event_type == "subagent_step":
+    if event_type == "tool_execution":
+        name = _bounded_inline(payload.get("tool_name", "未知"))
         print(
-            "     第 "
-            f"{payload.get('step')} 步"
-            f"（{payload.get('calls_used')} / {payload.get('max_calls')} 次请求）"
+            f"── 第 {_safe_inline(payload.get('step', '?'))} 步："
+            f"执行中：正在调用{name} ──",
+            flush=True,
+        )
+        return
+
+    if event_type == "subagent_start":
+        print(
+            "  └─ Subagent 开始"
+            f"（最多 {payload.get('max_calls')} 次模型请求）",
+            flush=True,
         )
         return
 
     if event_type == "subagent_tool":
-        print(f"     工具：{_safe_inline(payload.get('tool_name'))}")
         return
 
     if event_type == "subagent_end":
@@ -224,10 +237,6 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
             )
         return
 
-    if event_type == "context_summary":
-        print("── 正在生成历史摘要 ──")
-        return
-
     if event_type == "tool_batch_recovery":
         print(
             "── 恢复中断工具批次：保留 "
@@ -262,10 +271,6 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         return
 
     if event_type == "tool_call":
-        print(
-            f"── 第 {payload['step']} 步："
-            f"{_safe_inline(payload['tool_name'])} ──"
-        )
         return
 
     if event_type == "tool_result":
