@@ -1,0 +1,19 @@
+.venv/
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
+*.egg-info/
+build/
+
+# Harness runtime artifacts
+.transcripts/
+.task_outputs/
+
+# Local Session checkpoints
+sessions/
+*.session.json
+
+# Local manual-run scratchpad
+/test.txt

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "vibe-harness"
+version = "0.1.0"
+description = "A local CLI coding agent harness."
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1",
+    "python-dotenv>=1",
+]
+
+
+[project.scripts]
+vibe-harness = "vibe_harness.cli:main"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
