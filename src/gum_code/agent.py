@@ -5,9 +5,10 @@ from pathlib import Path
 
 from openai import OpenAI
 
-from vibe_harness.context import (
+from gum_code.context import (
     CONTEXT_TARGET_RATIO,
     DEFAULT_MAX_CONTEXT_TOKENS,
+    MODEL_MAX_CONTEXT_TOKENS,
     apply_fit_tool_results,
     apply_micro_compact,
     apply_snip_compact,
@@ -15,10 +16,10 @@ from vibe_harness.context import (
     compact_history,
     reactive_compact,
 )
-from vibe_harness.events import AgentEventCallback
-from vibe_harness.hooks import HookEvent, HookRegistry
-from vibe_harness.session import IN_FLIGHT_MARKER_KEY
-from vibe_harness.subagent import (
+from gum_code.events import AgentEventCallback
+from gum_code.hooks import HookEvent, HookRegistry
+from gum_code.session import IN_FLIGHT_MARKER_KEY
+from gum_code.subagent import (
     MAX_DELEGATIONS_PER_RUN,
     TASK_TOOL_SCHEMA,
     error_result,
@@ -26,10 +27,10 @@ from vibe_harness.subagent import (
     parse_task_description,
     run_read_only_subagent,
 )
-from vibe_harness.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
-from vibe_harness.token_counting import RequestTokenCounter, load_token_counter
-from vibe_harness.tools.command import DockerSandboxConfig
-from vibe_harness.tools import (
+from gum_code.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
+from gum_code.token_counting import RequestTokenCounter, load_token_counter
+from gum_code.tools.command import DockerSandboxConfig
+from gum_code.tools import (
     ApprovalCallback,
     ToolExecutionDenied,
     execute_tool,
@@ -412,6 +413,11 @@ def run_agent(
     ):
         raise RuntimeError(
             f"max_context_tokens 必须是正整数，收到：{max_context_tokens!r}"
+        )
+    if max_context_tokens > MODEL_MAX_CONTEXT_TOKENS:
+        raise RuntimeError(
+            "max_context_tokens 不能超过模型上限 "
+            f"{MODEL_MAX_CONTEXT_TOKENS}，收到：{max_context_tokens}"
         )
 
     if (
@@ -929,6 +935,21 @@ def run_agent(
                 }
                 if tool_name != "task":
                     payload["result"] = result
+                if (
+                    tool_name == "delete_file"
+                    and isinstance(result, str)
+                    and result.startswith("已删除：")
+                ):
+                    try:
+                        delete_arguments = json.loads(
+                            tool_call.function.arguments
+                        )
+                    except json.JSONDecodeError:
+                        delete_arguments = None
+                    if isinstance(delete_arguments, dict) and isinstance(
+                        delete_arguments.get("path"), str
+                    ):
+                        payload["deleted_path"] = delete_arguments["path"]
                 event_callback(
                     "tool_result",
                     payload,

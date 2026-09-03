@@ -5,7 +5,7 @@ from typing import Protocol
 
 from tokenizers import Tokenizer
 
-from vibe_harness._vendor.encoding_dsv4 import encode_messages
+from gum_code._vendor.encoding_dsv4 import encode_messages
 
 SUPPORTED_MODEL = "deepseek-v4-flash"
 TOKENIZER_REPOSITORY = "deepseek-ai/DeepSeek-V4-Flash"

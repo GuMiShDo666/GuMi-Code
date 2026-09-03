@@ -1,4 +1,4 @@
-# Vibe Harness
+# Gum Code
 
 一个面向个人日常使用和 Agent 运行机制学习的本地 CLI 编程 Agent Harness。
 
@@ -7,7 +7,7 @@
 ## 功能
 
 - 支持文件读写、搜索、Git 状态检查和可选的 Docker 隔离命令执行。
-- 读操作直接允许；写入和删除需终端审批；命令执行默认不向模型开放。
+- 读取、`write_file` 和 `edit_file` 直接允许；删除仍需审批；命令执行默认不向模型开放。
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
 - 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
 - 使用固定版本的 DeepSeek V4 官方 tokenizer 和消息编码器计算请求 token，不再用字符数估算上下文。
@@ -29,9 +29,9 @@
 源码保留在当前项目，虚拟环境放在非 iCloud 目录：
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
-python3.11 -m venv /Users/gumishdo/.local/share/vibe-harness/venv
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pip install .
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
+python3.11 -m venv /Users/gumishdo/.local/share/gum-code/venv
+/Users/gumishdo/.local/share/gum-code/venv/bin/python -m pip install .
 ```
 
 首次运行会从 `deepseek-ai/DeepSeek-V4-Flash` 的固定 revision 下载
@@ -42,7 +42,7 @@ Python 代码。无网络环境可以预先获取官方 `tokenizer.json`，然�
 ### 配置
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
 cp -n .env.example .env
 ```
 
@@ -54,19 +54,25 @@ cp -n .env.example .env
 | `LLM_BASE_URL` | 当前模型服务的 OpenAI 兼容 API 地址 | 是 |
 | `LLM_MODEL` | 当前服务支持的模型名称 | 是 |
 
-Gu-Harness 按键独立合并配置：进程环境变量 >
-`~/.config/gu-harness/.env` > 启动目录的旧 `.env`。TTY 中缺少配置时，
+Gum Code 按键独立合并配置：进程环境变量 >
+`~/.config/gum-code/.env` > 启动目录的旧 `.env`。TTY 中缺少配置时，
 首次向导会隐藏输入 API Key，用一次最小模型请求验证成功后才会
-原子写入 mode `0600` 的用户配置。旧配置仅会触发一次迁移邀请，
-迁移时必须重新输入 API Key，不会静默复制密钥。
+原子写入 mode `0600` 的用户配置。
+
+首次真正启动时，Gum Code 会将旧的
+`~/.config/gu-harness/` 和 `~/.local/share/gu-harness/` 中受支持的
+配置、状态和 Session 复制到新目录。迁移不覆盖新文件，不删除旧数据，
+且不跟随符号链接；完成标记防止用户之后删除的 Session 被再次复制。
+仅当旧工作区路径不存在且同级 `Gum-Code` 新路径存在时，才会改写
+从 `vibe-harness` 到 `Gum-Code` 的那一个路径分量。
 
 ### 第一个只读任务
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
-mkdir -p /tmp/vibe-harness-first-run
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
-  --workspace /tmp/vibe-harness-first-run \
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
+mkdir -p /tmp/gum-code-first-run
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
+  --workspace /tmp/gum-code-first-run \
   "只读检查工作区的文件结构，不要修改任何内容。"
 ```
 
@@ -76,13 +82,13 @@ mkdir -p /tmp/vibe-harness-first-run
 
 ### 交互式工作区与 REPL
 
-TTY 中直接执行 `gu-harness` 会打开工作区选择器；也可直接指定已存在
+TTY 中直接执行 `gum-code` 会打开工作区选择器；也可直接指定已存在
 的目录。首次访问已存在目录时必须确认信任。选择器只列出最近路径和
 当前浏览目录的直接子目录，不会扫描 Desktop、Git 仓库或其他项目根。
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace"
 ```
 
@@ -101,7 +107,7 @@ Command+Enter 没有可移植的终端键码；iTerm2 或 VS Code Terminal 用�
 
 Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
 
-自动 Session 位于 `~/.local/share/gu-harness/sessions/`，在第一条任务提交
+自动 Session 位于 `~/.local/share/gum-code/sessions/`，在第一条任务提交
 前不创建空文件。同一 Session 由进程生命期独占锁保护；不同 Session 可并行打开。
 `/sessions` 可查看、恢复、重命名、确认后删除，也可显式复制导入旧 JSON；
 撤销工作区信任或从最近列表移除都不会删除真实目录或 Session。
@@ -111,19 +117,21 @@ Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
 ### 执行任务
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
   "检查当前项目并完成任务。"
 ```
 
-当模型请求执行写入、编辑、删除或命令工具时，终端会显示工具名、原因和参数预览。只有输入 `y` 或 `yes`（忽略大小写和首尾空白）才会允许执行，其他输入默认拒绝。
-普通运行日志只显示上下文情况、当前步骤与工具名、工具错误和最终回答；不重复输出普通工具参数和成功结果。权限审批中的限长参数预览不受影响。
+`write_file` 和 `edit_file` 会在路径、符号链接、敏感文件、大小和 Hook
+检查通过后直接执行。`delete_file` 和已显式开启的 `run_command`
+仍会显示工具名、原因和限长参数预览；只有输入 `y` 或 `yes`
+（忽略大小写和首尾空白）才允许。删除成功后立即显示一条仅包含相对路径的回执。
 
 `run_command` 默认不会出现在模型可见的工具中。先自行准备一个本地
 可信镜像（Harness 不会自动 pull 或 build），再在当前运行显式开启：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
   --allow-run-command \
   --sandbox-image "your-trusted-local-image:tag" \
@@ -159,7 +167,7 @@ Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
 如需在本次运行禁用委派：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
   --no-subagent \
   "直接检查这个文件。"
@@ -171,11 +179,11 @@ Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
 自行注册的可产生副作用的 Python Hook。
 
 真实网关验收用例位于 `tests/test_subagent_gateway_integration.py`，仅在调用方
-显式设置 `VIBE_HARNESS_SUBAGENT_E2E=1` 时运行，并通过项目现有的
+显式设置 `GUM_CODE_SUBAGENT_E2E=1` 时运行，并通过项目现有的
 `load_settings()` 加载 `.env` 中的三个 `LLM_*` 配置，不会输出凭据。
 
 ```bash
-VIBE_HARNESS_SUBAGENT_E2E=1 PYTHONPATH=src python -m pytest -q \
+GUM_CODE_SUBAGENT_E2E=1 PYTHONPATH=src python -m pytest -q \
   tests/test_subagent_gateway_integration.py
 ```
 
@@ -184,24 +192,24 @@ VIBE_HARNESS_SUBAGENT_E2E=1 PYTHONPATH=src python -m pytest -q \
 先准备一个非工作区的 Session 目录：
 
 ```bash
-mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
+mkdir -p /Users/gumishdo/.local/share/gum-code/sessions
 ```
 
 启动任务并保存 Session：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
-  --session-file /Users/gumishdo/.local/share/vibe-harness/sessions/daily.json \
+  --session-file /Users/gumishdo/.local/share/gum-code/sessions/daily.json \
   "只读分析这个项目。"
 ```
 
 使用相同的 workspace 和模型继续任务：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
-  --resume-session /Users/gumishdo/.local/share/vibe-harness/sessions/daily.json \
+  --resume-session /Users/gumishdo/.local/share/gum-code/sessions/daily.json \
   "继续上一次的分析。"
 ```
 
@@ -211,7 +219,7 @@ Thinking mode 下的 assistant `reasoning_content` 会随消息保存和恢复�
 工具批次在进程中断后按下列规则处理：
 
 - 已完成的工具保留真实结果。
-- 尚未开始的 pending 工具不会被直接重放；Harness 会让模型根据当前状态重新规划，新的可变更操作仍需审批。
+- 尚未开始的 pending 工具不会被直接重放；Harness 会让模型根据当前状态重新规划，新调用会重新经过当前权限策略和安全检查。
 - 已开始但副作用未知的 in-flight 工具会拒绝自动恢复，不会覆盖原 Session。
 - in-flight/pending `task` 会被补成 `task_interrupted` 结果并交给根 Agent 重新规划；旧子 Agent 不会自动重放。
 
@@ -223,28 +231,32 @@ one-shot 的新任务一律优先，不会静默重发旧输入。
 ### 调整运行预算
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
+/Users/gumishdo/.local/share/gum-code/venv/bin/gum-code \
   --workspace "/absolute/path/to/workspace" \
   --max-steps 16 \
-  --max-context-tokens 100000 \
+  --max-context-tokens 800000 \
   "分析这个复杂任务，先维护 Todo，再逐步执行。"
 ```
 
 - `--max-steps` 限制一次运行允许的正常工具型模型步数，默认为 `16`。步数耗尽后，Harness 会额外发起一次「禁止调用工具」的阶段总结请求；上下文压缩和超限重试的模型请求不计入这个上限。
-- `--max-context-tokens` 限制每次模型请求的本地预检 token 数，默认为 `100000`。计数包含实际启用的工具 Schema；超限时 Harness 会按从低损到高损的顺序压缩上下文。
+- `--max-context-tokens` 默认为 `800000`，且不能超过
+  DeepSeek-V4-Flash 的 `1000000` token 模型上限。历史摘要输入最多使用
+  `640000` tokens；计数仍包含实际启用的工具 Schema。
 - 旧参数 `--max-context-chars` 已移除，不会把旧值静默解释成 token。迁移时请显式改用 `--max-context-tokens` 并重新确认预算值；同样的数字并不代表同样的容量。
 - 无网络或需要完全可复现时，加上 `--tokenizer-file /absolute/path/tokenizer.json`。
 - Subagent 的 4 次委派与 8 次子请求为固定安全/成本上限，当前不提供 CLI 调节。
 
-终端会在网关返回 `usage` 时显示服务端 prompt token 与本地预检值。服务端值是请求后的权威结果；第三方网关可能增加隐藏消息或更换同名模型，所以本地与服务端计数不承诺完全相等。
+终端会在网关返回 `usage` 时显示服务端 prompt token 与本地预检值。
+`1M` 是官方模型能力，不证明第三方网关接受同样的上限；网关拒绝会直接显示为错误，
+Gum Code 不会改用字符估算或静默降低预算。
 
 ### 程序化 Hooks
 
 Hooks 通过 Python API 注册，本版本没有 Hook 配置文件或外部命令加载器：
 
 ```python
-from vibe_harness.agent import run_agent
-from vibe_harness.hooks import HookEvent, HookRegistry
+from gum_code.agent import run_agent
+from gum_code.hooks import HookEvent, HookRegistry
 
 hooks = HookRegistry()
 
@@ -281,25 +293,25 @@ answer = run_agent(
 
 同一事件的回调按注册顺序执行，第一个非 `None` 返回值会停止该事件的后续回调。传给 Hook 的可变参数是防御性副本，不能靠修改它们改变实际执行或历史。
 
-`PreToolUse` 只是一道额外否决：硬拒绝、风险策略、无副作用 preflight 和终端审批仍由 Harness 强制执行，Hook 不能放宽或绕过它们。`Stop` 也不能突破 `max_steps`。Hook 是可信的进程内扩展代码，不是沙箱；回调不应打印或返回密钥、Token、Cookie、完整工具输出等敏感信息。
+`PreToolUse` 只是一道额外否决：硬拒绝、风险策略、无副作用 preflight 和策略要求时的终端审批仍由 Harness 强制执行，Hook 不能放宽或绕过它们。`Stop` 也不能突破 `max_steps`。Hook 是可信的进程内扩展代码，不是沙箱；回调不应打印或返回密钥、Token、Cookie、完整工具输出等敏感信息。
 
 ## 源码更新与测试
 
 源码修改验收后，需将新版本重新安装到外部虚拟环境：
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
+/Users/gumishdo/.local/share/gum-code/venv/bin/python \
   -m pip install --force-reinstall --no-deps .
 ```
 
 从当前源码运行完整测试：
 
 ```bash
-cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
+cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/Gum-Code"
 PYTHONPATH=src \
-PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pytest -q -p no:cacheprovider
+PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/gum-code/pycache \
+/Users/gumishdo/.local/share/gum-code/venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
 ## 已知边界

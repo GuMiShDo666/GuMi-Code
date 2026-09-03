@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from vibe_harness.tools.common import (
+from gum_code.tools.common import (
     MAX_OUTPUT_CHARS,
     _is_sensitive_path,
     _truncate_output,
@@ -53,7 +53,7 @@ def _run_git(workspace: Path, args: list[str]) -> str:
 
     try:
         with tempfile.TemporaryDirectory(
-            prefix="vibe-harness-git-",
+            prefix="gum-code-git-",
             dir=temp_parent,
         ) as isolated_home:
             result = subprocess.run(

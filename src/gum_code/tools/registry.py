@@ -3,19 +3,19 @@ import json
 from collections.abc import Callable
 from pathlib import Path
 
-from vibe_harness.permissions import (
+from gum_code.permissions import (
     PermissionDecision,
     check_hard_deny,
     decide_permission,
 )
-from vibe_harness.permissions.policy import ToolRisk
-from vibe_harness.tools.artifacts import read_tool_output
-from vibe_harness.tools.command import (
+from gum_code.permissions.policy import ToolRisk
+from gum_code.tools.artifacts import read_tool_output
+from gum_code.tools.command import (
     DockerSandboxConfig,
     _validate_run_command,
     run_command,
 )
-from vibe_harness.tools.filesystem import (
+from gum_code.tools.filesystem import (
     _validate_delete_file,
     _validate_edit_file,
     _validate_write_file,
@@ -25,8 +25,8 @@ from vibe_harness.tools.filesystem import (
     read_file,
     write_file,
 )
-from vibe_harness.tools.git import git_diff, git_status
-from vibe_harness.tools.search import find_files, search_text
+from gum_code.tools.git import git_diff, git_status
+from gum_code.tools.search import find_files, search_text
 
 ApprovalCallback = Callable[
     [str, dict[str, object], str],
@@ -513,20 +513,19 @@ def execute_tool(
     if permission.decision is PermissionDecision.DENY:
         return f"Error: Tool denied by policy: {tool_name}"
 
-    if permission.decision is PermissionDecision.ASK:
-        preflight = PREFLIGHTS.get(tool_name)
-        if preflight is not None:
-            try:
-                if tool_name == "run_command":
-                    preflight(
-                        workspace=workspace,
-                        **arguments,
-                        sandbox=command_sandbox,
-                    )
-                else:
-                    preflight(workspace=workspace, **arguments)
-            except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
-                return _format_tool_error(exc)
+    preflight = PREFLIGHTS.get(tool_name)
+    if preflight is not None:
+        try:
+            if tool_name == "run_command":
+                preflight(
+                    workspace=workspace,
+                    **arguments,
+                    sandbox=command_sandbox,
+                )
+            else:
+                preflight(workspace=workspace, **arguments)
+        except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
+            return _format_tool_error(exc)
 
     if pre_tool_use_callback is not None:
         blocked = pre_tool_use_callback(tool_name, copy.deepcopy(arguments))

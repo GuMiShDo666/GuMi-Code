@@ -2,7 +2,7 @@
 
 ## DeepSeek V4 tokenizer data
 
-At runtime, Vibe Harness can download `tokenizer.json` from
+At runtime, Gum Code can download `tokenizer.json` from
 `deepseek-ai/DeepSeek-V4-Flash` at revision
 `60d8d70770c6776ff598c94bb586a859a38244f1`. The tokenizer data is cached by
 the `tokenizers` library and is not redistributed in this repository.
@@ -19,7 +19,7 @@ upstream terms.
 
 ## DeepSeek V4 message encoder
 
-`src/vibe_harness/_vendor/encoding_dsv4.py` is derived from
+`src/gum_code/_vendor/encoding_dsv4.py` is derived from
 `deepseek-ai/DeepSeek-V4-Flash` at revision
 `60d8d70770c6776ff598c94bb586a859a38244f1`.
 

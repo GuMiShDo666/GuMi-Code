@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO
 
-from vibe_harness.tools.common import (
+from gum_code.tools.common import (
     _is_sensitive_path,
     _reject_symlinks,
     _resolve_workspace_path,
@@ -628,9 +628,9 @@ def run_command(
     )
     assert sandbox is not None
 
-    container_name = f"vibe-harness-{secrets.token_hex(8)}"
+    container_name = f"gum-code-{secrets.token_hex(8)}"
 
-    with tempfile.TemporaryDirectory(prefix="vibe-harness-masks-") as tmpdir:
+    with tempfile.TemporaryDirectory(prefix="gum-code-masks-") as tmpdir:
         masks = _prepare_sensitive_masks(workspace, Path(tmpdir))
         docker_argv = _build_docker_argv(
             sandbox,

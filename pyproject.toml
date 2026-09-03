@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 
 [project]
-name = "vibe-harness"
+name = "gum-code"
 version = "0.1.0"
 description = "A local CLI coding agent harness."
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ dependencies = [
 
 
 [project.scripts]
-gu-harness = "vibe_harness.cli:main"
+gum-code = "gum_code.cli:main"
 
 
 [tool.setuptools.packages.find]

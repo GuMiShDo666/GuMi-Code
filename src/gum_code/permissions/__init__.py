@@ -1,4 +1,4 @@
-from vibe_harness.permissions.policy import (
+from gum_code.permissions.policy import (
     PermissionDecision,
     PermissionResult,
     ToolPolicy,

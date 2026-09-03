@@ -1,4 +1,4 @@
-from vibe_harness.tools.registry import (
+from gum_code.tools.registry import (
     DENIED_BY_USER_PREFIX,
     ApprovalCallback,
     TOOL_SCHEMAS,
