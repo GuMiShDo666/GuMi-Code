@@ -15,6 +15,8 @@ src/vibe_harness/
 ├── config.py            # environment-backed model settings
 ├── agent.py             # model/tool loop and orchestration
 ├── context.py           # context budgets, persistence, compaction
+├── token_counting.py    # DeepSeek V4 request encoding and token counts
+├── _vendor/             # pinned third-party encoder snapshot
 ├── session.py           # durable JSON checkpoints and recovery plans
 ├── events.py            # terminal rendering of structured agent events
 ├── todo.py              # in-memory todo validation and rendering
@@ -35,6 +37,9 @@ Evidence: `pyproject.toml`, `src/vibe_harness/__main__.py`,
   limits, control tools, tool-result closure, and context-stage ordering.
 - Put context sizing and compaction algorithms in `context.py`; do not embed
   them in CLI rendering or tool handlers.
+- Put model-specific request rendering, tokenizer loading, revision pins, and
+  token counting in `token_counting.py`. Keep vendored encoder code isolated in
+  `_vendor/` and record its source/license in `THIRD_PARTY_NOTICES.md`.
 - Put durable checkpoint validation and interrupted-batch recovery in
   `session.py`. Session files store model-visible state, not client objects or
   permission flags.

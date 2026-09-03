@@ -5,7 +5,7 @@ from pathlib import Path
 from openai import OpenAI, OpenAIError
 
 from vibe_harness.agent import MAX_STEPS, run_agent
-from vibe_harness.context import DEFAULT_MAX_CONTEXT_CHARS
+from vibe_harness.context import DEFAULT_MAX_CONTEXT_TOKENS
 from vibe_harness.config import load_settings
 from vibe_harness.events import print_terminal_event
 from vibe_harness.permissions.terminal import request_terminal_approval
@@ -14,6 +14,7 @@ from vibe_harness.session import (
     load_session,
     save_session,
 )
+from vibe_harness.token_counting import load_token_counter
 
 
 def _positive_int(value: str) -> int:
@@ -43,10 +44,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"最多执行的正模型步骤数（默认 {MAX_STEPS}）",
     )
     parser.add_argument(
-        "--max-context-chars",
+        "--max-context-tokens",
         type=_positive_int,
-        default=DEFAULT_MAX_CONTEXT_CHARS,
-        help="模型请求允许的最大上下文字符数",
+        default=DEFAULT_MAX_CONTEXT_TOKENS,
+        help="模型请求允许的最大上下文 token 数",
+    )
+    parser.add_argument(
+        "--tokenizer-file",
+        type=Path,
+        default=None,
+        help=(
+            "本地 DeepSeek V4 tokenizer.json；"
+            "未指定时从固定版本的官方仓库加载并缓存"
+        ),
     )
     parser.add_argument(
         "--allow-run-command",
@@ -120,6 +130,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         settings = load_settings()
+        token_counter = load_token_counter(
+            settings.model,
+            args.tokenizer_file,
+        )
 
         client = OpenAI(
             api_key=settings.api_key,
@@ -181,12 +195,13 @@ def main(argv: list[str] | None = None) -> int:
             workspace=args.workspace,
             user_query=args.task,
             max_steps=args.max_steps,
-            max_context_chars=args.max_context_chars,
+            max_context_tokens=args.max_context_tokens,
             allow_run_command=args.allow_run_command,
             approval_callback=request_terminal_approval,
             event_callback=print_terminal_event,
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
+            token_counter=token_counter,
         )
     except (RuntimeError, OpenAIError, OSError, ValueError) as exc:
         sys.stdout.flush()

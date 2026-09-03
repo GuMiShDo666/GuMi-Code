@@ -10,6 +10,7 @@
 - 读操作直接允许；写入和删除需终端审批；命令执行默认不向模型开放。
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
 - 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
+- 使用固定版本的 DeepSeek V4 官方 tokenizer 和消息编码器计算请求 token，不再用字符数估算上下文。
 - 支持 Session 保存、正常续接和中断工具批次的安全恢复。
 - 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop` 四类进程内 Hooks。
 
@@ -29,6 +30,11 @@ cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
 python3.11 -m venv /Users/gumishdo/.local/share/vibe-harness/venv
 /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pip install .
 ```
+
+首次运行会从 `deepseek-ai/DeepSeek-V4-Flash` 的固定 revision 下载
+`tokenizer.json` 并交由 Hugging Face `tokenizers` 缓存。运行时不会执行远程
+Python 代码。无网络环境可以预先获取官方 `tokenizer.json`，然后通过
+`--tokenizer-file` 显式指定；文件哈希不匹配时 Harness 会在首次模型请求前拒绝启动。
 
 ### 配置
 
@@ -112,6 +118,7 @@ mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
 ```
 
 `--session-file` 和 `--resume-session` 不能同时使用。恢复时，Session 中的 workspace 和模型必须与当前运行一致。
+Thinking mode 下的 assistant `reasoning_content` 会随消息保存和恢复，以满足 DeepSeek 在携带 tools 的后续请求中完整回传该字段的协议要求；它不会在普通终端日志中输出。
 
 工具批次在进程中断后按下列规则处理：
 
@@ -125,12 +132,16 @@ mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
 /Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
   --workspace "/absolute/path/to/workspace" \
   --max-steps 16 \
-  --max-context-chars 100000 \
+  --max-context-tokens 100000 \
   "分析这个复杂任务，先维护 Todo，再逐步执行。"
 ```
 
 - `--max-steps` 限制一次运行允许的正常工具型模型步数，默认为 `16`。步数耗尽后，Harness 会额外发起一次「禁止调用工具」的阶段总结请求；上下文压缩和超限重试的模型请求不计入这个上限。
-- `--max-context-chars` 限制模型请求的估算字符数，默认为 `100000`。它是 token 的近似预算；超限时 Harness 会尝试分层压缩上下文。
+- `--max-context-tokens` 限制每次模型请求的本地预检 token 数，默认为 `100000`。计数包含实际启用的工具 Schema；超限时 Harness 会按从低损到高损的顺序压缩上下文。
+- 旧参数 `--max-context-chars` 已移除，不会把旧值静默解释成 token。迁移时请显式改用 `--max-context-tokens` 并重新确认预算值；同样的数字并不代表同样的容量。
+- 无网络或需要完全可复现时，加上 `--tokenizer-file /absolute/path/tokenizer.json`。
+
+终端会在网关返回 `usage` 时显示服务端 prompt token 与本地预检值。服务端值是请求后的权威结果；第三方网关可能增加隐藏消息或更换同名模型，所以本地与服务端计数不承诺完全相等。
 
 ### 程序化 Hooks
 
@@ -198,7 +209,8 @@ PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
 
 ## 已知边界
 
-- 上下文预算使用字符数估算，不是精确 tokenizer。
+- 当前 tokenizer 路径只支持精确模型名 `deepseek-v4-flash`；其他模型或网关别名会明确失败，不会回退到字符估算。
+- 本地计数基于固定的 DeepSeek V4 官方 tokenizer/编码器；第三方网关最终处理的 token 以响应 `usage` 为准。
 - in-flight 工具的副作用未知时必须由使用者核对，Harness 不会自动重放。
 - 压缩摘要是 Session 内的可恢复状态，不是跨 Session 长期 Memory。
 - Hooks 当前只支持同步、进程内 Python 注册；尚无配置文件、外部命令 Hook、异步 Hook 或自动发现机制。

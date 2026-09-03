@@ -30,3 +30,9 @@ def test_pyproject_python_requires() -> None:
     data = _load_pyproject()
 
     assert data["project"]["requires-python"] == ">=3.11"
+
+
+def test_pyproject_pins_compatible_tokenizers_range() -> None:
+    data = _load_pyproject()
+
+    assert "tokenizers>=0.22,<0.24" in data["project"]["dependencies"]

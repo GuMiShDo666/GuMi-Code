@@ -11,12 +11,35 @@ from vibe_harness.agent import (
     STEP_BUDGET_FINALIZATION_PROMPT,
     TODO_SYSTEM_INSTRUCTION,
     UNTRUSTED_TOOL_CONTENT_INSTRUCTION,
-    run_agent,
+    run_agent as _run_agent,
 )
-from vibe_harness.context import DEFAULT_MAX_CONTEXT_CHARS
+from vibe_harness.context import DEFAULT_MAX_CONTEXT_TOKENS
 from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS
+
+
+class _TestTokenCounter:
+    def count_request(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> int:
+        return len(
+            json.dumps(
+                {"messages": messages, "tools": tools},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+
+
+_TOKEN_COUNTER = _TestTokenCounter()
+
+
+def run_agent(*args: object, **kwargs: object) -> str:
+    kwargs.setdefault("token_counter", _TOKEN_COUNTER)
+    return _run_agent(*args, **kwargs)  # type: ignore[arg-type]
 
 class FakeCompletions:
     def __init__(self, responses):
@@ -359,7 +382,7 @@ def test_step_budget_compaction_failure_keeps_last_safe_snapshot(
             workspace=tmp_path,
             user_query="看看有什么",
             max_steps=1,
-            max_context_chars=10_000,
+            max_context_tokens=10_000,
             message_snapshot_callback=lambda messages: snapshots.append(
                 json.loads(json.dumps(messages))
             ),
@@ -815,11 +838,72 @@ def test_run_agent_emits_events_without_tools(tmp_path: Path) -> None:
         "final_answer",
     ]
     assert events[0][1]["step"] == 1
-    assert events[0][1]["used_chars"] > 0
-    assert events[0][1]["max_chars"] == DEFAULT_MAX_CONTEXT_CHARS
+    assert events[0][1]["used_tokens"] > 0
+    assert events[0][1]["max_tokens"] == DEFAULT_MAX_CONTEXT_TOKENS
     assert events[1][1] == {"step": 1}
     assert events[2][1]["step"] == 1
     assert events[2][1]["answer"] == "完成"
+
+
+def test_run_agent_emits_provider_usage_when_available(tmp_path: Path) -> None:
+    response = _assistant_response(_assistant_final_message("完成"))
+    response.usage = SimpleNamespace(
+        prompt_tokens=123,
+        completion_tokens=8,
+        total_tokens=131,
+    )
+    client, _ = _fake_client([response])
+    events: list[tuple[str, dict[str, object]]] = []
+
+    run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="hi",
+        event_callback=lambda event_type, payload: events.append(
+            (event_type, payload)
+        ),
+    )
+
+    usage = next(payload for name, payload in events if name == "provider_usage")
+    assert usage["prompt_tokens"] == 123
+    assert usage["completion_tokens"] == 8
+    assert usage["total_tokens"] == 131
+    assert isinstance(usage["local_prompt_tokens"], int)
+
+
+def test_run_agent_emits_provider_usage_for_summary_and_main_request(
+    tmp_path: Path,
+) -> None:
+    summary_response = _assistant_response(_assistant_final_message("摘要"))
+    summary_response.usage = SimpleNamespace(prompt_tokens=101)
+    main_response = _assistant_response(_assistant_final_message("完成"))
+    main_response.usage = SimpleNamespace(prompt_tokens=202)
+    client, _ = _fake_client([summary_response, main_response])
+    events: list[tuple[str, dict[str, object]]] = []
+
+    answer = run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="继续",
+        initial_messages=[
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "X" * 50_000},
+        ],
+        max_context_tokens=20_000,
+        event_callback=lambda event_type, payload: events.append(
+            (event_type, payload)
+        ),
+    )
+
+    assert answer == "完成"
+    usage_events = [payload for name, payload in events if name == "provider_usage"]
+    assert [payload["prompt_tokens"] for payload in usage_events] == [101, 202]
+    assert all(
+        isinstance(payload["local_prompt_tokens"], int)
+        for payload in usage_events
+    )
 
 
 def test_run_agent_emits_events_with_tools(tmp_path: Path) -> None:
@@ -886,8 +970,10 @@ def test_assistant_message_stored_as_plain_dict(tmp_path: Path) -> None:
         arguments='{"path": "x.py"}',
         id="call_001",
     )
+    first_message = _assistant_tool_message([tool_call])
+    first_message.reasoning_content = "需要先读取文件"
     responses = [
-        _assistant_response(_assistant_tool_message([tool_call])),
+        _assistant_response(first_message),
         _assistant_response(_assistant_final_message("done")),
     ]
     client, completions = _fake_client(responses)
@@ -905,6 +991,7 @@ def test_assistant_message_stored_as_plain_dict(tmp_path: Path) -> None:
     assert isinstance(assistant_message, dict)
     assert assistant_message["role"] == "assistant"
     assert assistant_message["content"] is None
+    assert assistant_message["reasoning_content"] == "需要先读取文件"
     assert assistant_message["tool_calls"] == [
         {
             "id": "call_001",
@@ -915,6 +1002,42 @@ def test_assistant_message_stored_as_plain_dict(tmp_path: Path) -> None:
             },
         }
     ]
+
+
+def test_stop_continuation_preserves_final_reasoning_content(
+    tmp_path: Path,
+) -> None:
+    first_message = _assistant_final_message("需要确认")
+    first_message.reasoning_content = "内部推理"
+    client, completions = _fake_client(
+        [
+            _assistant_response(first_message),
+            _assistant_response(_assistant_final_message("完成")),
+        ]
+    )
+    hooks = HookRegistry()
+    calls = 0
+
+    def continue_once(messages: list[dict[str, object]]) -> str | None:
+        nonlocal calls
+        calls += 1
+        return "继续" if calls == 1 else None
+
+    hooks.register_hook(HookEvent.STOP, continue_once)
+
+    run_agent(
+        client=client,
+        model="fake-model",
+        workspace=tmp_path,
+        user_query="任务",
+        hook_registry=hooks,
+    )
+
+    assert completions.requests[1]["messages"][-2] == {
+        "role": "assistant",
+        "content": "需要确认",
+        "reasoning_content": "内部推理",
+    }
 
 
 def test_second_request_messages_are_json_serializable(tmp_path: Path) -> None:
@@ -1231,11 +1354,14 @@ def test_run_agent_calls_model_within_budget(tmp_path: Path) -> None:
         model="fake-model",
         workspace=tmp_path,
         user_query="hi",
-        max_context_chars=DEFAULT_MAX_CONTEXT_CHARS,
+        max_context_tokens=DEFAULT_MAX_CONTEXT_TOKENS,
     )
 
     assert answer == "完成"
     assert len(completions.requests) == 1
+    assert completions.requests[0]["extra_body"] == {
+        "thinking": {"type": "enabled"}
+    }
 
 
 def test_run_agent_raises_when_over_budget_and_never_calls_main_model(
@@ -1252,7 +1378,7 @@ def test_run_agent_raises_when_over_budget_and_never_calls_main_model(
             model="fake-model",
             workspace=tmp_path,
             user_query="hi",
-            max_context_chars=10,
+            max_context_tokens=10,
         )
 
     assert all("tools" not in request for request in completions.requests)
@@ -1273,7 +1399,7 @@ def test_run_agent_over_budget_error_includes_used_and_limit(
             model="fake-model",
             workspace=tmp_path,
             user_query="检查独特项目结构",
-            max_context_chars=budget,
+            max_context_tokens=budget,
         )
 
     message = str(exc_info.value)
@@ -1300,7 +1426,7 @@ def test_run_agent_rejects_non_positive_budget(
             model="fake-model",
             workspace=tmp_path,
             user_query="hi",
-            max_context_chars=budget,
+            max_context_tokens=budget,
         )
 
     assert len(completions.requests) == 0
@@ -1319,7 +1445,7 @@ def test_run_agent_rejects_boolean_budget_before_snapshot(tmp_path: Path) -> Non
             model="fake-model",
             workspace=tmp_path,
             user_query="hi",
-            max_context_chars=True,
+            max_context_tokens=True,
             message_snapshot_callback=lambda messages: snapshots.append(messages),
         )
 
@@ -1345,7 +1471,7 @@ def test_run_agent_budget_checks_resumed_session(tmp_path: Path) -> None:
             workspace=tmp_path,
             user_query="继续",
             initial_messages=long_history,
-            max_context_chars=500,
+            max_context_tokens=500,
         )
 
     assert all("tools" not in request for request in completions.requests)
@@ -1390,7 +1516,7 @@ def test_run_agent_compacts_large_tool_result(
     payload = compacted[0][1]
     assert payload["stage"] == "tool_result_budget"
     assert payload["persisted_results"] == 1
-    assert payload["before_chars"] > payload["after_chars"]
+    assert payload["before_tokens"] > payload["after_tokens"]
 
     saved = tmp_path / ".task_outputs" / "tool-results" / "call_001.txt"
     assert saved.read_text(encoding="utf-8") == big
@@ -1571,7 +1697,7 @@ def test_run_agent_runs_micro_and_fit_then_calls_model(tmp_path: Path) -> None:
         workspace=tmp_path,
         user_query="继续",
         initial_messages=initial,
-        max_context_chars=15_000,
+        max_context_tokens=15_000,
         event_callback=lambda t, p: events.append((t, p)),
         message_snapshot_callback=lambda msgs: snapshots.append(
             json.loads(json.dumps(msgs))
@@ -1586,11 +1712,11 @@ def test_run_agent_runs_micro_and_fit_then_calls_model(tmp_path: Path) -> None:
 
     micro = compacted[0][1]
     assert micro["shortened_results"] == 2
-    assert micro["before_chars"] > micro["after_chars"]
+    assert micro["before_tokens"] > micro["after_tokens"]
 
     fit = compacted[1][1]
     assert fit["fitted_results"] == 4
-    assert fit["before_chars"] > fit["after_chars"]
+    assert fit["before_tokens"] > fit["after_tokens"]
 
     snapshot_text = "\n".join(
         json.dumps(s, ensure_ascii=False) for s in snapshots
@@ -1619,7 +1745,7 @@ def test_run_agent_compacts_history_then_calls_model(tmp_path: Path) -> None:
         workspace=tmp_path,
         user_query="继续",
         initial_messages=initial,
-        max_context_chars=20_000,
+        max_context_tokens=20_000,
         event_callback=lambda t, p: events.append((t, p)),
         message_snapshot_callback=lambda msgs: snapshots.append(
             json.loads(json.dumps(msgs))
@@ -1673,7 +1799,7 @@ def test_run_agent_summary_still_over_budget_does_not_call_model(
             workspace=tmp_path,
             user_query="继续",
             initial_messages=initial,
-            max_context_chars=20_000,
+            max_context_tokens=20_000,
             event_callback=lambda t, p: events.append((t, p)),
         )
 
@@ -1708,7 +1834,7 @@ def test_run_agent_summary_failure_propagates(tmp_path: Path) -> None:
             workspace=tmp_path,
             user_query="继续",
             initial_messages=initial,
-            max_context_chars=20_000,
+            max_context_tokens=20_000,
         )
 
 
@@ -1758,7 +1884,7 @@ def test_run_agent_retries_once_on_context_error(tmp_path: Path) -> None:
     assert payload["stage"] == "reactive_compact"
     assert payload["retry"] == 1
     assert str(payload["transcript"]).startswith(".transcripts/transcript_")
-    assert payload["before_chars"] > payload["after_chars"]
+    assert payload["before_tokens"] > payload["after_tokens"]
     assert any(e[0] == "context_summary" for e in events)
 
     snapshot_text = "\n".join(
@@ -1916,7 +2042,7 @@ def test_run_agent_compacts_after_full_batch(
     payload = compacted[0][1]
     assert payload["stage"] == "active_compact"
     assert str(payload["transcript"]).startswith(".transcripts/transcript_")
-    assert payload["before_chars"] > payload["after_chars"]
+    assert payload["before_tokens"] > payload["after_tokens"]
     assert any(e[0] == "context_summary" for e in events)
 
 
@@ -2456,7 +2582,7 @@ def test_run_agent_compaction_preserves_untrusted_instruction(
         workspace=tmp_path,
         user_query="继续",
         initial_messages=initial,
-        max_context_chars=20_000,
+        max_context_tokens=20_000,
     )
 
     main_request = completions.requests[1]

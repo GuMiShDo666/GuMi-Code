@@ -146,6 +146,24 @@ def test_load_session_roundtrip(tmp_path: Path) -> None:
     assert data.messages == _resumable_messages()
 
 
+def test_session_roundtrip_preserves_reasoning_content(tmp_path: Path) -> None:
+    path = tmp_path / "session.json"
+    messages = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u"},
+        {
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": "private reasoning",
+        },
+    ]
+
+    save_session(path, tmp_path, "deepseek-v4-flash", messages)
+    data = load_session(path)
+
+    assert data.messages == messages
+
+
 def test_load_session_preserves_chinese_content(tmp_path: Path) -> None:
     path = tmp_path / "session.json"
     messages = [

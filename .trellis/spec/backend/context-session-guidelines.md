@@ -4,9 +4,13 @@
 
 ## Context Budgeting
 
-`context.py::estimate_request_chars` compact-serializes both `messages` and the
-actual per-run tool schemas. It is a conservative character estimate, not a
-tokenizer. Every normal model request uses this pipeline in order:
+`token_counting.py::DeepSeekV4TokenCounter` renders `messages` and the actual
+per-run tool schemas through the pinned official DeepSeek V4 message encoder,
+then counts IDs with the matching official tokenizer. The CLI creates one
+counter for `deepseek-v4-flash` and reuses it for the whole run. Unsupported
+models and tokenizer load failures fail before the first model request; never
+add a silent character or foreign-model fallback. Every normal model request
+uses this pipeline in order:
 
 ```text
 tool_result_budget
@@ -19,6 +23,22 @@ tool_result_budget
 
 Preserve this low-loss-to-lossy ordering. Large results and old transcripts
 must be written before their in-context content is replaced.
+
+Normal, summary, reactive-compaction, active-compaction, and finalization
+requests must use the same injected counter. Summary-input fitting is governed
+by the complete encoded request token count, even though character slicing is
+used to retain one quarter of the beginning and three quarters of the end.
+
+The local count is a preflight safety value, not a billing guarantee. Emit only
+available numeric provider usage fields after successful responses; gateway
+`usage.prompt_tokens` is authoritative after the request. Missing or partial
+usage must not fail the Agent. Provider-usage events must never include
+messages, tool arguments, response bodies, headers, or credentials.
+
+`DEFAULT_MAX_CONTEXT_TOKENS` and public `*_tokens` names are model-context
+limits. Character names remain correct for local artifact and text controls,
+including Tool Result persistence thresholds, preview lengths,
+`read_tool_output(max_chars)`, Todo content, and command-output limits.
 
 ## Persisted Context Artifacts
 
@@ -60,6 +80,12 @@ Evidence: `context.py`, `agent.py::_is_context_length_error`, and
 
 Do not persist credentials, OpenAI client objects, approval callbacks, or the
 per-run `allow_run_command` switch.
+
+Preserve string `reasoning_content` on assistant messages. DeepSeek thinking
+mode requires every prior assistant reasoning field to be passed back when a
+subsequent request carries tools. It is part of resumable model-visible state,
+must be included in local token counting, and must not be printed in normal
+terminal events.
 
 Session saves must:
 

@@ -12,8 +12,8 @@ def test_context_compacted_event_shows_counts_not_content(
             "step": 2,
             "stage": "tool_result_budget",
             "persisted_results": 1,
-            "before_chars": 250000,
-            "after_chars": 52000,
+            "before_tokens": 250000,
+            "after_tokens": 52000,
             "content": "secret-tool-output",
         },
     )
@@ -37,8 +37,8 @@ def test_context_compacted_snip_compact_stage(
             "stage": "snip_compact",
             "archived_messages": 12,
             "transcript": ".transcripts/transcript_abc.jsonl",
-            "before_chars": 90000,
-            "after_chars": 60000,
+            "before_tokens": 90000,
+            "after_tokens": 60000,
             "content": "secret-archived-history",
         },
     )
@@ -60,8 +60,8 @@ def test_context_compacted_micro_compact_stage(
             "step": 2,
             "stage": "micro_compact",
             "shortened_results": 2,
-            "before_chars": 35000,
-            "after_chars": 25000,
+            "before_tokens": 35000,
+            "after_tokens": 25000,
             "content": "secret-tool-output",
         },
     )
@@ -84,8 +84,8 @@ def test_context_compacted_fit_tool_results_stage(
             "step": 2,
             "stage": "fit_tool_results",
             "fitted_results": 4,
-            "before_chars": 25000,
-            "after_chars": 9000,
+            "before_tokens": 25000,
+            "after_tokens": 9000,
             "content": "secret-tool-output",
         },
     )
@@ -108,8 +108,8 @@ def test_context_compacted_compact_history_stage(
             "step": 2,
             "stage": "compact_history",
             "transcript": ".transcripts/transcript_abc.jsonl",
-            "before_chars": 90000,
-            "after_chars": 6000,
+            "before_tokens": 90000,
+            "after_tokens": 6000,
             "content": "secret-history-content",
         },
     )
@@ -133,8 +133,8 @@ def test_context_compacted_reactive_compact_stage(
             "stage": "reactive_compact",
             "retry": 1,
             "transcript": ".transcripts/transcript_abc.jsonl",
-            "before_chars": 90000,
-            "after_chars": 6000,
+            "before_tokens": 90000,
+            "after_tokens": 6000,
             "content": "secret-summary-content",
         },
     )
@@ -159,8 +159,8 @@ def test_context_compacted_active_compact_stage(
             "step": 2,
             "stage": "active_compact",
             "transcript": ".transcripts/transcript_abc.jsonl",
-            "before_chars": 50000,
-            "after_chars": 6000,
+            "before_tokens": 50000,
+            "after_tokens": 6000,
             "content": "secret-summary-content",
         },
     )
@@ -194,14 +194,34 @@ def test_context_usage_event_includes_usage(
 ) -> None:
     print_terminal_event(
         "context_usage",
-        {"step": 1, "used_chars": 12345, "max_chars": 100000},
+        {"step": 1, "used_tokens": 12345, "max_tokens": 100000},
     )
 
     out = capsys.readouterr().out
 
     assert "12345" in out
     assert "100000" in out
-    assert "字符" in out
+    assert "tokens" in out
+
+
+def test_provider_usage_event_compares_local_and_server_tokens(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    print_terminal_event(
+        "provider_usage",
+        {
+            "step": 1,
+            "local_prompt_tokens": 120,
+            "prompt_tokens": 123,
+            "completion_tokens": 8,
+            "total_tokens": 131,
+        },
+    )
+
+    out = capsys.readouterr().out
+
+    assert "prompt=123" in out
+    assert "本地=120" in out
 
 
 def test_context_usage_event_does_not_print_full_history(
@@ -211,8 +231,8 @@ def test_context_usage_event_does_not_print_full_history(
         "context_usage",
         {
             "step": 1,
-            "used_chars": 100,
-            "max_chars": 100000,
+            "used_tokens": 100,
+            "max_tokens": 100000,
             "messages": "some-long-history-that-should-not-appear",
         },
     )

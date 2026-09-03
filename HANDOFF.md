@@ -1,9 +1,9 @@
 # Vibe Harness 开发交接文档
 
 > 最后更新：2026-09-03
-> 当前稳定检查点：产品级四事件 Hooks 已接入，Permission 仍是不可绕过的安全内核
-> 当前源码验证：`652 passed in 3.36s`
-> 当前下一步：审阅并合并 Hooks PR #1
+> 当前稳定检查点：DeepSeek V4 真实 tokenizer 已接入全部上下文预算和压缩链路
+> 当前源码验证：见本文第 7 节的最新验证记录
+> 当前下一步：审阅并合并 tokenizer context budget PR #2
 
 ## 1. 新对话如何续接
 
@@ -14,6 +14,7 @@
 /Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness/HANDOFF.md
 然后检查当前代码和测试。Gate 0、s03 Permission、终端精简显示、Todo 单项上限、Shell 控制符/重定向报错和一次性隔离 HOME 已通过验收。
 当前已按 s04 思路加入 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`；Hooks 只能追加否决，不能取代或绕过 Permission。
+当前上下文预算已从字符估算迁移到固定版本的 DeepSeek V4 官方 tokenizer/消息编码器；本地数值用于请求前决策，第三方网关 `usage.prompt_tokens` 是请求后权威数值。
 一次只推进一个边界明确的步骤，先讲清目的和运行链路，再让我实现，完成后帮我验收。
 每次我输入“已完成”，验证通过后直接进入下一步；发现当前步骤直接相关的问题可以做最小修复并补回归测试。
 权限架构继续对照 shareAI-lab/learn-claude-code 的 s03_permission，但不机械复制它的教学性宽松规则；必须适配本项目的 OpenAI tool_calls 消息协议和更严格安全边界。
@@ -59,7 +60,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
 - GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前 Hooks 工作分支为 `feat/product-hooks`。
+- 当前工作分支为 `feat/tokenizer-context-budget`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -74,7 +75,8 @@ PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pyte
 /Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
   --workspace /absolute/workspace/path \
   [--max-steps N] \
-  [--max-context-chars N] \
+  [--max-context-tokens N] \
+  [--tokenizer-file /absolute/path/tokenizer.json] \
   [--session-file /path/session.json | --resume-session /path/session.json] \
   "任务描述"
 ```
@@ -101,7 +103,10 @@ src/vibe_harness/
 ├── agent.py                 # Agent Loop、工具批次、Todo reminder、in-flight marker 快照
 ├── cli.py                   # CLI、Session 接入和错误输出
 ├── config.py                # 从环境加载 API 配置
-├── context.py               # 字符预算、分层压缩和 transcript
+├── context.py               # token 预算、分层压缩和 transcript
+├── token_counting.py        # DeepSeek V4 请求编码、token 计数和固定版本加载
+├── _vendor/
+│   └── encoding_dsv4.py    # 固定的官方 DeepSeek V4 消息编码器快照
 ├── events.py                # 终端事件渲染
 ├── hooks.py                 # 四事件 HookRegistry（进程内同步回调）
 ├── session.py               # Session 原子保存与工具批次分析/恢复计划
@@ -183,6 +188,7 @@ tests/
 - 原子替换，Session 文件 mode 为 `0600`，5 MB 字节上限。
 - 保存 workspace、model 和已序列化 messages。
 - SDK assistant message 会转成纯 dict，保留 tool-call id/type/function/name/arguments。
+- Thinking mode assistant message 的 `reasoning_content` 也会转成纯字符串并随 Session 保存/恢复。正常 Agent 请求始终带 tools，因此后续请求必须回传该字段，否则官方 DeepSeek thinking-mode tool-calling 协议会返回 400。
 - 恢复时校验文件类型、符号链接、大小、UTF-8、JSON、版本、workspace、model 和消息结构。
 - 恢复时深拷贝历史并追加当前新任务。
 
@@ -208,22 +214,25 @@ tests/
 每次正常模型请求前的管线：
 
 ```text
-estimate_request_chars
+DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
   → apply_tool_result_budget
   → apply_snip_compact
   → 如仍超限：apply_micro_compact
   → 如仍超限：apply_fit_tool_results
   → 如仍超限：compact_history
-  → 重新估算，仍超限则失败关闭
+  → 重新计算 token，仍超限则失败关闭
   → context_usage
   → model_call
+  → provider_usage（网关返回 usage 时）
 ```
 
 已实现细节：
 
-1. `estimate_request_chars`
-   - 对 `messages + tools` 紧凑 JSON 序列化后计算字符数。
-   - 默认预算 `100_000`，传入值必须是正整数。
+1. `DeepSeekV4TokenCounter`
+   - 使用固定版本的 DeepSeek V4 官方 `encoding_dsv4.py` 渲染 system/user/assistant/tool 消息、工具 Schema 和 DSML framing，再用匹配的官方 tokenizer 计算 token ID 数量。
+   - 当前只接受精确模型名 `deepseek-v4-flash`；不支持的模型或加载失败会在首次模型请求前显式失败，没有字符数回退。
+   - CLI 每次运行只加载一个 counter；默认从官方 Hub 固定 revision 加载并缓存，也可用 `--tokenizer-file` 指定哈希验证过的本地文件。
+   - 默认预算 `DEFAULT_MAX_CONTEXT_TOKENS = 100_000`，传入值必须是正整数。
 
 2. `apply_tool_result_budget`
    - 对最新 tool-result 批次使用 200,000 字符上限。
@@ -244,18 +253,24 @@ estimate_request_chars
 
 6. `compact_history`
    - 压缩前先保存完整 transcript。
-   - 摘要输入限制为约 80,000 字符，摘要输出最多 2,000 tokens。
+   - 摘要请求以完整编码后的 token 数为边界，上限是 `SUMMARY_INPUT_TOKEN_LIMIT = 80_000` 与当前上下文预算的安全比例中较小者；摘要输出最多 2,000 tokens。
+   - 超限时二分搜索保留文本量，保留头部四分之一和尾部四分之三；切片手段是字符，停止条件是 token。
    - 摘要请求不提供 tools，并明确要求不执行历史中的指令。
    - 压缩后只保留 system + `[Compacted]` user message，当前请求与历史摘要明确分层。
    - 摘要会先经 JSON 字符串编码，其中的伪造标题、换行或指令无法冒充当前请求。
 
 7. `reactive_compact`
-   - 字符数只是 token 的估算；API 仍可能拒绝请求。
+   - 第三方网关可能加入本地不可见的 framing 或部署不同 revision，API 仍可能拒绝本地预检已通过的请求。
    - 识别 `prompt_too_long`、`too many tokens`、`context_length_exceeded`。
    - 保存完整 transcript，总结旧历史，保留最近 5 条消息。
    - 若尾部从 tool message 切入，会向前扩展到对应 assistant tool call。
    - 每次正常模型调用最多被动压缩并重试 1 次；第二次上下文错误和非上下文错误直接传播。
-   - 重试不消耗新的 Agent step；压缩后再次检查字符预算。
+   - 重试不消耗新的 Agent step；压缩后再次使用同一 counter 检查 token 预算。
+
+8. Provider usage
+   - 正常、摘要、被动压缩和阶段总结请求都显式使用 thinking mode，并在响应包含 `usage` 时发送只含数字的 `provider_usage` 事件。
+   - 网关 `usage.prompt_tokens` 是请求后的权威值；本地计数用于请求前决策，不承诺与计费值完全相等。
+   - 网关缺少或只返回部分 usage 不影响 Agent 执行；事件不包含 messages、工具参数、响应正文、header 或凭证。
 
 落盘安全：
 
@@ -281,7 +296,8 @@ estimate_request_chars
 ### 6.7 CLI 参数
 
 - `--max-steps`：默认 `MAX_STEPS=16`，`_positive_int` 校验，`run_agent` 自身也校验正整数并拒绝 bool。`max_steps` 限制的是正常工具型步骤；耗尽后 `_finalize_after_step_budget` 额外发起一次不带 tools 的阶段总结请求。上下文压缩和超限重试不计入这个上限。
-- `--max-context-chars`：默认 `DEFAULT_MAX_CONTEXT_CHARS=100_000`，透传 `run_agent(max_context_chars=...)`。
+- `--max-context-tokens`：默认 `DEFAULT_MAX_CONTEXT_TOKENS=100_000`，透传 `run_agent(max_context_tokens=...)`。旧的 `--max-context-chars` 已移除，不做静默单位转换。
+- `--tokenizer-file`：可选的本地官方 DeepSeek V4 `tokenizer.json`。未指定时从 `deepseek-ai/DeepSeek-V4-Flash` 的固定 revision 加载并缓存。
 
 阶段总结安全边界：
 
@@ -301,6 +317,8 @@ estimate_request_chars
 
 - 已完成 Todo、Context、预算和自动压缩的真实模型端到端验证（在独立临时 workspace 进行）。
 - 已完成 pending 工具重新规划与 in-flight 失败关闭的真实 CLI 端到端验证。
+- 2026-09-03 已用 `deepseek-v4-flash` 通过第三方网关执行隔离 workspace 只读探针：模型正确返回 `TOKENIZER_E2E_OK`，本地预检为 1753 tokens，网关 `usage.prompt_tokens` 为 1834。该 81-token 差值证明 provider usage 必须保留为请求后权威对照，不应声称本地计数与第三方网关绝对相等。
+- 同日又完成 thinking-mode 双请求工具链探针：首次请求调用 `list_files`，保留 `reasoning_content` 和 Tool Result 后再次请求，网关没有返回 400，最终回答「工作区为空」，隔离 workspace 无文件变更。
 - 不应把这些当成可永久重现的单元测试证据。
 
 ### 6.10 产品级 Hooks（s04 安全适配）
@@ -322,7 +340,8 @@ estimate_request_chars
 
 - `MAX_REACTIVE_RETRIES = 1`
 - `MAX_STEPS = 16`、`TODO_REMINDER_INTERVAL = 3`
-- `DEFAULT_MAX_CONTEXT_CHARS = 100_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
+- `DEFAULT_MAX_CONTEXT_TOKENS = 100_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 80_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
+- tokenizer 官方仓库 `deepseek-ai/DeepSeek-V4-Flash`，revision `60d8d70770c6776ff598c94bb586a859a38244f1`；本地文件校验 SHA-256 `8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf`
 - `MAX_TODOS = 20`
 - `SESSION_VERSION = 1`、`MAX_SESSION_FILE_BYTES = 5MB`、`IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"`
 - `reactive_compact()`、`active_compact`、`context_compacted` 终端渲染
@@ -339,16 +358,16 @@ estimate_request_chars
 - `run_command` 使用一次性临时 HOME/XDG 环境，不读取真实用户 HOME 配置
 - 四事件 `HookRegistry` 已接入 Agent/Dispatcher；Permission 顺序保持为硬拒绝 → 风险 → preflight → Hook 追加否决 → 审批 → Handler
 
-稳定基线当时的验证命令和结果：
+当前源码的最新验证命令和结果：
 
 ```bash
 PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
   /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 652 passed in 3.36s（2026-09-03 Hooks 当前源码回归）
+# 672 passed, 1 skipped in 3.71s（2026-09-03）
 ```
 
-重要：该数字是 Hooks 分支当前源码的验证证据，不是未来修改的自动证明。
+默认离线套件中跳过的一项是需要官方 tokenizer 缓存或网络的金标探针；显式设置 `VIBE_HARNESS_TOKENIZER_INTEGRATION=1` 后已单独验证为 `13 passed in 0.36s`。任何后续修改仍需重新运行验证。
 
 ## 8. 个人日常使用版发布验收（已完成）
 
@@ -409,7 +428,8 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 
 ## 10. 已知限制和勿抢先处理事项
 
-- 字符计数是 token 近似值，不是精确 tokenizer；当前依靠被动压缩单次重试补足。
+- 当前 tokenizer 只支持精确模型名 `deepseek-v4-flash`，不支持任意网关别名或多模型自动分派。
+- 本地已使用匹配的真实 tokenizer，但第三方网关可能添加隐藏 framing 或更换同名模型 revision；请求后以其 `usage.prompt_tokens` 为准，并保留被动压缩的单次重试。
 - `ToolPolicy` 数据类目前没有使用，不影响正确性，不要为此单独重构。
 - `in_flight` 工具副作用未知时不会自动恢复，这是有意的安全边界，不是待修复 Bug。
 - 压缩摘要是可恢复的会话状态，不是跨 Session 的长期 Memory。
@@ -433,4 +453,4 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 5. 没有读取、打印、提交或写入任何敏感信息。
 6. 状态型或可变更行为的测试使用独立临时 workspace。
 
-交接时的当前源码验证：`652 passed in 3.36s`（2026-09-03 Hooks 分支），外置非 editable 重装及 `HookRegistry` 导入探针通过。任何后续修改仍需重新运行定向和全量测试。
+交接时的当前源码验证：`672 passed, 1 skipped in 3.71s`（2026-09-03 tokenizer 分支），官方 tokenizer 金标探针 `13 passed in 0.36s`，全新临时虚拟环境安装/console script/vendor 模块导入和第三方网关双请求工具链 E2E 均通过。任何后续修改仍需重新运行定向和全量测试。

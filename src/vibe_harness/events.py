@@ -17,51 +17,51 @@ def _truncate(text: str) -> str:
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
     if event_type == "context_compacted":
         stage = payload.get("stage")
-        before_chars = payload.get("before_chars")
-        after_chars = payload.get("after_chars")
+        before_tokens = payload.get("before_tokens")
+        after_tokens = payload.get("after_tokens")
         if stage == "snip_compact":
             print(
                 "── 上下文整理（snip_compact）："
                 f"归档 {payload.get('archived_messages')} 条消息到 "
                 f"{payload.get('transcript')}，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         elif stage == "micro_compact":
             print(
                 "── 上下文整理（micro_compact）："
                 f"缩短 {payload.get('shortened_results')} 条结果，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         elif stage == "fit_tool_results":
             print(
                 "── 上下文整理（fit_tool_results）："
                 f"收纳 {payload.get('fitted_results')} 条结果，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         elif stage == "compact_history":
             print(
                 "── 上下文整理（compact_history）："
                 f"摘要写入 {payload.get('transcript')}，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         elif stage == "reactive_compact":
             print(
                 "── 上下文整理（reactive_compact，第 "
                 f"{payload.get('retry')} 次重试）："
                 f"摘要写入 {payload.get('transcript')}，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         elif stage == "active_compact":
             print(
                 "── 上下文整理（active_compact）："
                 f"摘要写入 {payload.get('transcript')}，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         else:
             print(
                 "── 上下文整理（tool_result_budget）："
                 f"转存 {payload.get('persisted_results')} 条结果，"
-                f"{before_chars} → {after_chars} 字符 ──"
+                f"{before_tokens} → {after_tokens} tokens ──"
             )
         return
 
@@ -79,8 +79,18 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
 
     if event_type == "context_usage":
         print(
-            f"── 上下文：{payload['used_chars']} / {payload['max_chars']} 字符 ──"
+            f"── 上下文：{payload['used_tokens']} / {payload['max_tokens']} tokens ──"
         )
+        return
+
+    if event_type == "provider_usage":
+        prompt_tokens = payload.get("prompt_tokens")
+        local_tokens = payload.get("local_prompt_tokens")
+        if prompt_tokens is not None:
+            print(
+                "── 服务端 Token："
+                f"prompt={prompt_tokens}，本地={local_tokens} ──"
+            )
         return
 
     if event_type == "tool_call":
