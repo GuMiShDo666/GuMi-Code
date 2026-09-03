@@ -1,9 +1,9 @@
 # Vibe Harness 开发交接文档
 
-> 最后更新：2026-08-27
-> 最后一个双方已确认的稳定检查点：Shell 控制符与重定向明确报错完成并通过验收
-> 该稳定检查点的当时验证：`620 passed in 6.42s` + 外置已安装 package 探针通过
-> 当前下一步：`run_command` 一次性隔离 HOME
+> 最后更新：2026-09-03
+> 当前稳定检查点：产品级四事件 Hooks 已接入，Permission 仍是不可绕过的安全内核
+> 当前源码验证：`652 passed in 3.36s`
+> 当前下一步：审阅并合并 Hooks PR #1
 
 ## 1. 新对话如何续接
 
@@ -12,8 +12,8 @@
 ```text
 请先完整阅读
 /Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness/HANDOFF.md
-然后检查当前代码和测试。Gate 0、s03 Permission、终端精简显示、Todo 单项上限和 Shell 控制符/重定向明确报错已通过验收。
-下一步只为 `run_command` 提供一次性隔离 HOME，不暴露真实用户 HOME 或全局配置；不要同时处理包装器绕过、glob 或容器沙箱。
+然后检查当前代码和测试。Gate 0、s03 Permission、终端精简显示、Todo 单项上限、Shell 控制符/重定向报错和一次性隔离 HOME 已通过验收。
+当前已按 s04 思路加入 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`；Hooks 只能追加否决，不能取代或绕过 Permission。
 一次只推进一个边界明确的步骤，先讲清目的和运行链路，再让我实现，完成后帮我验收。
 每次我输入“已完成”，验证通过后直接进入下一步；发现当前步骤直接相关的问题可以做最小修复并补回归测试。
 权限架构继续对照 shareAI-lab/learn-claude-code 的 s03_permission，但不机械复制它的教学性宽松规则；必须适配本项目的 OpenAI tool_calls 消息协议和更严格安全边界。
@@ -58,8 +58,8 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - 敏感配置在 `.env`；绝对不得读取、输出、复述或提交其内容。
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
-- 当前 Git 工作树中项目文件仍显示为未跟踪；用户没有要求创建提交，不要擅自 commit。
-- 当前用户正在改代码；本次交接文档更新不对这些未完成修改运行测试或作出通过判定。
+- GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
+- 当前 Hooks 工作分支为 `feat/product-hooks`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -103,6 +103,7 @@ src/vibe_harness/
 ├── config.py                # 从环境加载 API 配置
 ├── context.py               # 字符预算、分层压缩和 transcript
 ├── events.py                # 终端事件渲染
+├── hooks.py                 # 四事件 HookRegistry（进程内同步回调）
 ├── session.py               # Session 原子保存与工具批次分析/恢复计划
 ├── todo.py                  # TodoManager（MAX_TODOS=20，全量校验原子替换）
 ├── permissions/
@@ -122,6 +123,7 @@ tests/
 ├── test_config.py
 ├── test_context.py
 ├── test_events.py
+├── test_hooks.py
 ├── test_session.py
 ├── test_todo.py
 ├── test_packaging.py
@@ -301,7 +303,22 @@ estimate_request_chars
 - 已完成 pending 工具重新规划与 in-flight 失败关闭的真实 CLI 端到端验证。
 - 不应把这些当成可永久重现的单元测试证据。
 
-## 7. 已确认的稳定状态（不包含当前未验收修改）
+### 6.10 产品级 Hooks（s04 安全适配）
+
+参考 `shareAI-lab/learn-claude-code/s04_hooks` 的“挂在循环上，不写进循环里”思路，已实现：
+
+- `HookRegistry` 为每个调用方独立保存回调，支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`。
+- 同一事件按注册顺序执行；第一个非 `None` 返回值结束该事件的后续回调。
+- `UserPromptSubmit` 在当前请求加入消息前触发，返回值不改写请求。
+- `PreToolUse` 位于硬拒绝、风险判断和 preflight 之后，只能阻止本次 registry 工具；终端审批仍由 Harness 强制执行。
+- `PostToolUse` 只在 Handler 确实被尝试后触发；Gate 0、策略拒绝、审批拒绝、重复拒绝和 Agent 控制工具不会触发它。
+- `Stop` 在模型自然停止前触发；非空字符串作为新 user message 推动下一轮，但不能突破 `max_steps`。
+- Hook 得到参数和消息的防御性副本，不能通过修改入参改变真实工具调用或历史。
+- 当前只支持程序化、同步、进程内 Python Hooks；没有配置文件、外部 Shell Hook、异步加载或自动发现。
+
+本项目没有照搬参考实现中的 `shell=True`、字符串黑名单权限或原始参数日志。Hooks 是可信扩展点，不是沙箱，也不是 Permission 替代品。
+
+## 7. 已确认的稳定状态
 
 - `MAX_REACTIVE_RETRIES = 1`
 - `MAX_STEPS = 16`、`TODO_REMINDER_INTERVAL = 3`
@@ -319,6 +336,8 @@ estimate_request_chars
 - 终端精简显示：隐藏普通参数/成功结果，保留上下文、step + 工具名、限长错误、最终回答和审批预览
 - Todo 单项 `content` 最多 500 字符，Schema 与运行时双层校验，超限更新原子失败
 - `run_command` 在 preflight 拒绝 Shell 控制符和明确重定向；不弹审批、不执行 Handler，且保留 `find -exec ... ;` 与原生模式参数
+- `run_command` 使用一次性临时 HOME/XDG 环境，不读取真实用户 HOME 配置
+- 四事件 `HookRegistry` 已接入 Agent/Dispatcher；Permission 顺序保持为硬拒绝 → 风险 → preflight → Hook 追加否决 → 审批 → Handler
 
 稳定基线当时的验证命令和结果：
 
@@ -326,10 +345,10 @@ estimate_request_chars
 PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
   /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 620 passed in 6.42s（2026-08-27 Shell 控制符/重定向验收基线）
+# 652 passed in 3.36s（2026-09-03 Hooks 当前源码回归）
 ```
 
-重要：该数字是 Shell 控制符/重定向验收当时的历史证据，不是任意后续工作树的自动证明。
+重要：该数字是 Hooks 分支当前源码的验证证据，不是未来修改的自动证明。
 
 ## 8. 个人日常使用版发布验收（已完成）
 
@@ -345,7 +364,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 
 ## 9. 当前必须按顺序推进的修复路线
 
-每次只推进一个边界。当前不应抢先开始 Hooks、Skills、MCP 或 Subagents。
+下列安全边界继续保留；Hooks 已作为独立能力完成，不改变这些边界。
 
 1. **Gate 0（已完成并通过验收）**
    - `run_command` 默认不出现在模型 tools Schema 中。
@@ -374,7 +393,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 5. **显式命令模式的可用性与隔离**
    - 已完成：对 `&&`/`||`/`|`/`;` 和明确重定向语法返回可操作错误，不恢复 shell。
    - 不得笼统拒绝所有含 `*`/`?`/`[]` 的 argv：它们也可能是 `rg`/`find`/解释器的原生模式参数；未展开 glob 需后续做命令感知处理或只增强 Schema 指引。
-   - 使用 Harness 隔离 HOME，不向命令暴露真实用户 HOME 和全局配置。
+   - 已完成：使用 Harness 一次性隔离 HOME/XDG，不向命令暴露真实用户 HOME 和全局配置。
    - 补包装器/解释器绕过测试，评估 Docker 或 OS 沙箱，但不在小步骤中假装已解决架构性问题。
 
 6. **低风险体验/兼容收口**
@@ -386,7 +405,7 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
    - 定向测试、全量测试、外置非 editable 安装探针和隔离 workspace E2E。
    - 同步 `TEST_REPORT.md`/`README.md`/本 `HANDOFF.md`，明确历史基线、当前验证和剩余边界。
 
-更远的 Hooks、Skills、MCP、Subagents、worktree 并行和 Goal Loop 仍是可选路线，但不应在上述安全收口之前抢先实现。
+更远的 Hooks 配置/外部适配、Skills、MCP、Subagents、worktree 并行和 Goal Loop 仍是可选路线，应分别立项，不与本次基础 Hooks 混做。
 
 ## 10. 已知限制和勿抢先处理事项
 
@@ -394,7 +413,8 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 - `ToolPolicy` 数据类目前没有使用，不影响正确性，不要为此单独重构。
 - `in_flight` 工具副作用未知时不会自动恢复，这是有意的安全边界，不是待修复 Bug。
 - 压缩摘要是可恢复的会话状态，不是跨 Session 的长期 Memory。
-- 当前没有 Hooks、Skills、MCP、Subagents 或 Goal Loop。
+- Hooks 当前只有同步、进程内 Python API；没有配置文件、外部命令 Hook、异步 Hook 或自动发现。
+- 当前没有 Skills、MCP、Subagents 或 Goal Loop。
 - 不要读取 `.env`，不要在未经用户审批时运行会更改工作区的真实 Agent 任务。
 - `run_command` 已由 Gate 0 改为默认不向模型可见，但显式开启后仍没有 OS 级文件系统/网络沙箱；它可被 `python -c`、脚本、测试运行器或包装器间接绕过 argv 路径检查。
 - `shell=False` 不支持 Shell 运算符、重定向或 glob 展开；模型使用这些形式时可能得到误导结果。
@@ -413,4 +433,4 @@ PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pyc
 5. 没有读取、打印、提交或写入任何敏感信息。
 6. 状态型或可变更行为的测试使用独立临时 workspace。
 
-交接时的最后已验证稳定基线：`620 passed in 6.42s`（2026-08-27 Shell 控制符/重定向验收当时），外置已安装 package 探针通过。下一个边界是 `run_command` 一次性隔离 HOME；验收新修改时仍需重新运行定向和全量测试。
+交接时的当前源码验证：`652 passed in 3.36s`（2026-09-03 Hooks 分支），外置非 editable 重装及 `HookRegistry` 导入探针通过。任何后续修改仍需重新运行定向和全量测试。

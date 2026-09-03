@@ -11,6 +11,7 @@
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
 - 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
 - 支持 Session 保存、正常续接和中断工具批次的安全恢复。
+- 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop` 四类进程内 Hooks。
 
 ## 快速开始
 
@@ -131,6 +132,51 @@ mkdir -p /Users/gumishdo/.local/share/vibe-harness/sessions
 - `--max-steps` 限制一次运行允许的正常工具型模型步数，默认为 `16`。步数耗尽后，Harness 会额外发起一次「禁止调用工具」的阶段总结请求；上下文压缩和超限重试的模型请求不计入这个上限。
 - `--max-context-chars` 限制模型请求的估算字符数，默认为 `100000`。它是 token 的近似预算；超限时 Harness 会尝试分层压缩上下文。
 
+### 程序化 Hooks
+
+Hooks 通过 Python API 注册，本版本没有 Hook 配置文件或外部命令加载器：
+
+```python
+from vibe_harness.agent import run_agent
+from vibe_harness.hooks import HookEvent, HookRegistry
+
+hooks = HookRegistry()
+
+
+def protect_generated_files(
+    tool_name: str,
+    arguments: dict[str, object],
+) -> str | None:
+    if tool_name == "delete_file" and arguments.get("path") == "generated.txt":
+        return "generated.txt must be kept"
+    return None
+
+
+hooks.register_hook(HookEvent.PRE_TOOL_USE, protect_generated_files)
+
+answer = run_agent(
+    client=client,
+    model=model,
+    workspace=workspace,
+    user_query=query,
+    approval_callback=approval_callback,
+    hook_registry=hooks,
+)
+```
+
+四个事件的参数和控制语义：
+
+| 事件 | 回调参数 | 返回值作用 |
+| --- | --- | --- |
+| `UserPromptSubmit` | `query` | Agent 不使用返回值；用于观察当前请求 |
+| `PreToolUse` | `tool_name, arguments` | 非 `None` 阻止当前 registry 工具 |
+| `PostToolUse` | `tool_name, arguments, result` | Agent 不使用返回值；在 Handler 尝试后观察结果 |
+| `Stop` | `messages` | 非空字符串作为新 user message，要求进入下一轮 |
+
+同一事件的回调按注册顺序执行，第一个非 `None` 返回值会停止该事件的后续回调。传给 Hook 的可变参数是防御性副本，不能靠修改它们改变实际执行或历史。
+
+`PreToolUse` 只是一道额外否决：硬拒绝、风险策略、无副作用 preflight 和终端审批仍由 Harness 强制执行，Hook 不能放宽或绕过它们。`Stop` 也不能突破 `max_steps`。Hook 是可信的进程内扩展代码，不是沙箱；回调不应打印或返回密钥、Token、Cookie、完整工具输出等敏感信息。
+
 ## 源码更新与测试
 
 源码修改验收后，需将新版本重新安装到外部虚拟环境：
@@ -155,5 +201,6 @@ PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
 - 上下文预算使用字符数估算，不是精确 tokenizer。
 - in-flight 工具的副作用未知时必须由使用者核对，Harness 不会自动重放。
 - 压缩摘要是 Session 内的可恢复状态，不是跨 Session 长期 Memory。
-- 当前未实现 Hooks、Skills、MCP、Subagents 或 Goal Loop。
+- Hooks 当前只支持同步、进程内 Python 注册；尚无配置文件、外部命令 Hook、异步 Hook 或自动发现机制。
+- 当前未实现 Skills、MCP、Subagents 或 Goal Loop。
 - `run_command` 默认关闭；显式开启后仍只有 Harness 层审批和参数预检，没有 OS 或网络沙箱。

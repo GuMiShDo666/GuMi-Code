@@ -1,3 +1,4 @@
+import copy
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -26,6 +27,16 @@ from vibe_harness.tools.search import find_files, search_text
 ApprovalCallback = Callable[
     [str, dict[str, object], str],
     bool,
+]
+
+PreToolUseCallback = Callable[
+    [str, dict[str, object]],
+    str | None,
+]
+
+PostToolUseCallback = Callable[
+    [str, dict[str, object], str],
+    object,
 ]
 
 DENIED_BY_USER_PREFIX = "Error: Tool execution denied by user: "
@@ -463,6 +474,8 @@ def execute_tool(
     tool_name: str,
     arguments_json: str,
     approval_callback: ApprovalCallback | None = None,
+    pre_tool_use_callback: PreToolUseCallback | None = None,
+    post_tool_use_callback: PostToolUseCallback | None = None,
 ) -> str:
     handler = ALL_TOOL_HANDLERS.get(tool_name)
     if handler is None:
@@ -483,6 +496,9 @@ def execute_tool(
 
     permission = decide_permission(tool_name, risk)
 
+    if permission.decision is PermissionDecision.DENY:
+        return f"Error: Tool denied by policy: {tool_name}"
+
     if permission.decision is PermissionDecision.ASK:
         preflight = PREFLIGHTS.get(tool_name)
         if preflight is not None:
@@ -491,6 +507,13 @@ def execute_tool(
             except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
                 return _format_tool_error(exc)
 
+    if pre_tool_use_callback is not None:
+        blocked = pre_tool_use_callback(tool_name, copy.deepcopy(arguments))
+        if blocked is not None:
+            detail = f": {blocked}" if blocked else ""
+            return f"Error: Tool blocked by PreToolUse hook{detail}"
+
+    if permission.decision is PermissionDecision.ASK:
         if approval_callback is None:
             return f"Error: Approval required: {tool_name}"
 
@@ -503,10 +526,16 @@ def execute_tool(
         if not approved:
             return ToolExecutionDenied(f"{DENIED_BY_USER_PREFIX}{tool_name}")
 
-    elif permission.decision is PermissionDecision.DENY:
-        return f"Error: Tool denied by policy: {tool_name}"
-
     try:
-        return handler(workspace=workspace, **arguments)
+        result = handler(workspace=workspace, **arguments)
     except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
-        return _format_tool_error(exc)
+        result = _format_tool_error(exc)
+
+    if post_tool_use_callback is not None:
+        post_tool_use_callback(
+            tool_name,
+            copy.deepcopy(arguments),
+            result,
+        )
+
+    return result

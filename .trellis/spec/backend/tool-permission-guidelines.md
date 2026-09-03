@@ -24,8 +24,10 @@ dynamic schema visibility
 -> structured hard deny
 -> risk decision (ALLOW / ASK / DENY)
 -> side-effect-free preflight
+-> PreToolUse Hook (additional veto only)
 -> terminal approval
 -> handler validation and execution
+-> PostToolUse Hook
 -> matching Tool Result
 ```
 
@@ -35,6 +37,8 @@ References: `agent.py::run_agent`, `tools/registry.py::execute_tool`, and
 - Read tools are allowed directly.
 - Write, delete, and execute tools require explicit approval.
 - Unknown tools and unknown risks fail closed.
+- `PreToolUse` can only add a veto after core policy/preflight; it cannot
+  authorize a denied call or replace approval.
 - Only trimmed case-insensitive `y` or `yes` approves terminal execution;
   empty/other input, EOF, and interruption deny.
 - An identical explicitly denied call is not presented repeatedly in one run.

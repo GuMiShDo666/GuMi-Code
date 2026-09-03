@@ -14,6 +14,7 @@ Session recovery, and terminal events. There is no database or web layer.
 |---|---|
 | [Project Structure](./directory-structure.md) | Deciding module ownership or adding a capability |
 | [Tool and Permission Contracts](./tool-permission-guidelines.md) | Changing schemas, handlers, risks, paths, or command execution |
+| [Hook Lifecycle Contracts](./hooks-guidelines.md) | Registering callbacks or changing prompt/tool/stop lifecycle points |
 | [Context and Session Contracts](./context-session-guidelines.md) | Changing messages, compaction, artifacts, snapshots, or resume behavior |
 | [Error Handling](./error-handling.md) | Adding validation, subprocess behavior, tool errors, or CLI failures |
 | [Terminal Events and Logging](./logging-guidelines.md) | Changing progress/error/approval output or event payloads |
