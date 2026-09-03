@@ -1,9 +1,9 @@
 # Vibe Harness 开发交接文档
 
 > 最后更新：2026-09-03
-> 当前实现检查点：同步、单层、只读 Subagent 已完成实现并通过真实第三方网关 E2E
+> 当前实现检查点：交互式工作区选择、持久 REPL 和自动 Session 已实现
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：完成最终回归和标准 Git PR 流程
+> 当前下一步：独立终端手工验收、真实网关验收与标准 Git PR 流程
 
 ## 1. 新对话如何续接
 
@@ -54,7 +54,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - Python 3.11
 - OpenAI Python SDK，使用 OpenAI 兼容网关
 - 虚拟环境已迁移到 `/Users/gumishdo/.local/share/vibe-harness/venv`（非 editable 安装，避免运行时直接 import iCloud 中的源码文件）
-- 已通过 `pip install --force-reinstall --no-deps .` 安装为 Python package，console script 为 `vibe-harness`
+- 已通过 `pip install --force-reinstall --no-deps .` 安装为 Python package；当前唯一 console script 为 `gu-harness`
 
 安全约束：
 
@@ -62,7 +62,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
 - GitHub 仓库为私有仓库 `GuMiShDo666/Gu-Harness`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前工作分支为 `feat/read-only-subagents`。
+- 当前工作分支为 `feat/interactive-workspace-repl`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -71,10 +71,10 @@ cd "/Users/gumishdo/Desktop/01_AI与编程项目/Learn-Agent/vibe-harness"
 PYTHONPATH=src /Users/gumishdo/.local/share/vibe-harness/venv/bin/python -m pytest -q -p no:cacheprovider
 ```
 
-正式 CLI（使用虚拟环境中的 `vibe-harness`，不再要求 `PYTHONPATH=src python -m vibe_harness`）：
+正式 CLI（使用虚拟环境中的 `gu-harness`，不再要求 `PYTHONPATH=src python -m vibe_harness`）：
 
 ```bash
-/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/gu-harness \
   --workspace /absolute/workspace/path \
   [--max-steps N] \
   [--max-context-tokens N] \
@@ -105,15 +105,17 @@ Agent 产品 = Model + Harness
 src/vibe_harness/
 ├── __main__.py              # python -m vibe_harness 入口
 ├── agent.py                 # Agent Loop、工具批次、Todo reminder、in-flight marker 快照
-├── cli.py                   # CLI、Session 接入和错误输出
-├── config.py                # 从环境加载 API 配置
+├── cli.py                   # TTY/one-shot 路由、显式 Session 和错误输出
+├── interactive.py           # 工作区/Session 选择、REPL、配置向导和 Rich UI
+├── user_state.py            # XDG 信任/最近状态和自动 Session 目录
+├── config.py                # 逐键配置优先级、私有写入与 provider 验证
 ├── context.py               # token 预算、分层压缩和 transcript
 ├── token_counting.py        # DeepSeek V4 请求编码、token 计数和固定版本加载
 ├── _vendor/
 │   └── encoding_dsv4.py    # 固定的官方 DeepSeek V4 消息编码器快照
 ├── events.py                # 终端事件渲染
 ├── hooks.py                 # 四事件 HookRegistry（进程内同步回调）
-├── session.py               # Session 原子保存与工具批次分析/恢复计划
+├── session.py               # Session v2、进程锁、原子快照与中断恢复
 ├── subagent.py              # task 契约、只读子循环、报告校验与请求预算
 ├── todo.py                  # TodoManager（MAX_TODOS=20，全量校验原子替换）
 ├── permissions/
@@ -183,7 +185,7 @@ tests/
 
 ### 6.2 正式 CLI、事件与 E2E
 
-- 正式入口为 `vibe-harness --workspace PATH task`（console script，见 6.8）。
+- 正式 shell 入口为 `gu-harness`；TTY 无任务时进入持久 REPL，位置参数 task 仍为 one-shot。
 - workspace 必须是已存在目录。
 - Agent 仍发送完整事件给回调，正式终端渲染只显示上下文、当前 step + 工具名、限长错误和最终回答。
 - 普通工具参数、成功结果和冗余模型请求提示不再输出；压缩事件不输出原始历史或摘要。
@@ -318,7 +320,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 ### 6.8 打包与 console script
 
-- `pyproject.toml` 定义 console script `vibe-harness = "vibe_harness.cli:main"`。
+- `pyproject.toml` 仅定义 console script `gu-harness = "vibe_harness.cli:main"`；distribution 与 import 名仍为 `vibe-harness` / `vibe_harness`。
 - 虚拟环境使用非 editable 安装；源码改动验收后需重新执行 `pip install --force-reinstall --no-deps .` 同步。
 - `.gitignore` 加 `*.egg-info/`。
 - `test_packaging.py` 用 `tomllib` 校验。
@@ -364,6 +366,16 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 `task` → 子 Agent `read_file`/`git_status` → `submit_report` → 根回答，
 工作区前后清单一致，恶意 `core.fsmonitor` 未执行。
 
+### 6.12 交互式工作区、REPL 与 Session v2
+
+- `interactive.py` 负责非全屏 prompt_toolkit 工作区/会话选择、多轮 REPL、Rich 进度与 Markdown 回答；每次输入继续复用现有 `run_agent()`。
+- `/help`、`/workspace`、`/new`、`/resume`、`/sessions`、`/status`、`/verbose`、`/exit` 都是本地命令；未知斜杠命令不进模型，`//` 显式转义。
+- 工作区信任/最近状态在 `~/.config/gu-harness/state.json`；自动 Session 在 `~/.local/share/gu-harness/sessions/`。读状态不创建目录，第一条任务前不创建空 Session。
+- Session v2 仅保存 workspace、model、title 和 messages；v1 在交互恢复时必须先显示源/目标并确认复制为 v2，one-shot 直接恢复 v1 会拒绝，源文件始终不回写。每个正在写入的 Session 用稳定侧边 `.lock` 文件和 POSIX `flock` 持有进程生命期独占锁。
+- Ctrl+C 中断工具批次时保留已完成结果，为每个 in-flight/pending `tool_call_id` 各补一条有界错误结果，不自动重放。provider 在仅有用户尾部时失败会回滚本轮，不留下连续 user message。
+- 配置逐键优先级为 process env > 用户 `.env` > 启动目录旧 `.env`。交互向导隐藏 API Key，真实最小请求通过后才原子写入 `0600`。
+- 首次主 Agent 回答后另发一次 10 秒标题请求，仅携带首条用户任务；失败使用本地时间+任务备选，标题最多 30 字符。
+
 ## 7. 已确认的稳定状态
 
 - `MAX_REACTIVE_RETRIES = 1`
@@ -371,7 +383,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 - `DEFAULT_MAX_CONTEXT_TOKENS = 100_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 80_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
 - tokenizer 官方仓库 `deepseek-ai/DeepSeek-V4-Flash`，revision `60d8d70770c6776ff598c94bb586a859a38244f1`；本地文件校验 SHA-256 `8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf`
 - `MAX_TODOS = 20`
-- `SESSION_VERSION = 1`、`MAX_SESSION_FILE_BYTES = 5MB`、`IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"`
+- `SESSION_VERSION = 2`、`MAX_SESSION_FILE_BYTES = 5MB`、`MAX_SESSION_TITLE_CHARS = 30`、`IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"`
 - `reactive_compact()`、`active_compact`、`context_compacted` 终端渲染
 - 上下文错误的单次重试
 - 中断工具批次安全恢复（completed / pending / in_flight 三段式）
@@ -398,12 +410,12 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
   /Users/gumishdo/.local/share/vibe-harness/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 692 passed, 1 skipped in 40.58s（2026-09-03，包含 Docker 实机测试）
+# 784 passed, 3 skipped in 7.60s（2026-09-03，当前离线全量回归）
 ```
 
-本次通过 `VIBE_HARNESS_DOCKER_E2E_IMAGE=python:3.11-slim` 显式启用 Docker
-实机探针；唯一跳过项是需要官方 tokenizer 缓存或网络的金标探针。tokenizer
-探针的历史结果为 `13 passed in 0.36s`。
+另外，真实第三方网关 Subagent 链为 `1 passed in 12.41s`；本次
+交互运行时的真实回答、自动 Session、标题请求和 `0600` 探针也已通过。
+三个跳过项分别由 Docker 实机、真实网关和 tokenizer 金标外部门禁控制。
 
 ## 8. 个人日常使用版发布验收（已完成）
 
@@ -504,5 +516,6 @@ Docker Sandbox 的历史验证为 `692 passed, 1 skipped in 40.58s`（2026-09-03
 包含真实 Docker 集成测试）；全新临时虚拟环境中正常 `pip install .`、Sandbox
 模块导入和包内 CLI help 均通过。Docker Desktop Server 29.1.3 与用户授权
 手动拉取的 Docker 官方 `python:3.11-slim` 已用于真实边界测试。实现提交
-`f6a890f` 已通过 PR #5 合并到 `main`。当前 Subagent 分支的最新验证见
-`TEST_REPORT.md` 第 10.2 节。
+`f6a890f` 已通过 PR #5 合并到 `main`。当前分支为
+`feat/interactive-workspace-repl`，最新验证见第 7 节；本地详细记录见
+`TEST_REPORT.md`（该文件按用户要求不上传 GitHub）。
