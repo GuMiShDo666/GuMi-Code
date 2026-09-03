@@ -2,7 +2,7 @@
 
 一个面向个人日常使用和 Agent 运行机制学习的本地 CLI 编程 Agent Harness。
 
-它使用 OpenAI 兼容的 `tool_calls` 消息协议，由 Harness 负责工具执行、终端审批、Todo、上下文压缩、Agent step 预算和 Session 恢复。
+它使用 OpenAI 兼容的 `tool_calls` 消息协议，由 Harness 负责工具执行、终端审批、Todo、上下文压缩、只读 Subagent、Agent step 预算和 Session 恢复。
 
 ## 功能
 
@@ -13,6 +13,7 @@
 - 使用固定版本的 DeepSeek V4 官方 tokenizer 和消息编码器计算请求 token，不再用字符数估算上下文。
 - 支持 Session 保存、正常续接和中断工具批次的安全恢复。
 - 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop` 四类进程内 Hooks。
+- 默认开放同步、单层、只读 `task` Subagent，用独立上下文返回有界 JSON 调查报告。
 
 ## 快速开始
 
@@ -111,6 +112,35 @@ mkdir -p /tmp/vibe-harness-first-run
 明显的直接高危命令（例如 `sudo`、关机/重启、磁盘格式化和 `rm -rf /`）会在审批前硬拒绝，不能通过输入 `y` 强制放行。该规则只是纵深防御，不能识别所有包装器或解释器绕过。
 `run_command` 一次只运行一个程序。`&&`、`||`、管道、分号和重定向会在审批前返回明确错误；Harness 不会通过开启 Shell 来执行它们。
 
+### 只读 Subagent
+
+根 Agent 可在需要多步调查时自主调用 `task`。子 Agent 只获得当前任务描述和只读工具，不继承父对话，不能写入、删除、执行命令、再委派或并行运行。简单查询应由根 Agent 直接使用只读工具。
+
+每次根运行最多启动 4 个子 Agent；每个子 Agent 最多发起 8 次模型请求，包括压缩摘要请求。子 Agent 只能用 `submit_report` 单独提交报告，成功结果为最多 20,000 字符的 `status/summary/findings/evidence/risks` JSON。证据校验只确认工作区内文件和行号存在，不证明自然语言断言真实。
+
+如需在本次运行禁用委派：
+
+```bash
+/Users/gumishdo/.local/share/vibe-harness/venv/bin/vibe-harness \
+  --workspace "/absolute/path/to/workspace" \
+  --no-subagent \
+  "直接检查这个文件。"
+```
+
+子 Agent 的上下文转存使用工作区外的临时目录并在结束时清理。共享 Git
+读工具使用隔离环境并禁用仓库 fsmonitor/Hook 与可选索引刷新，避免 READ
+调用继承模型凭据、执行仓库配置代码或改写索引。这个只读承诺不包括用户
+自行注册的可产生副作用的 Python Hook。
+
+真实网关验收用例位于 `tests/test_subagent_gateway_integration.py`，仅在调用方
+显式设置 `VIBE_HARNESS_SUBAGENT_E2E=1` 时运行，并通过项目现有的
+`load_settings()` 加载 `.env` 中的三个 `LLM_*` 配置，不会输出凭据。
+
+```bash
+VIBE_HARNESS_SUBAGENT_E2E=1 PYTHONPATH=src python -m pytest -q \
+  tests/test_subagent_gateway_integration.py
+```
+
 ### 保存与恢复 Session
 
 先准备一个非工作区的 Session 目录：
@@ -145,6 +175,7 @@ Thinking mode 下的 assistant `reasoning_content` 会随消息保存和恢复�
 - 已完成的工具保留真实结果。
 - 尚未开始的 pending 工具不会被直接重放；Harness 会让模型根据当前状态重新规划，新的可变更操作仍需审批。
 - 已开始但副作用未知的 in-flight 工具会拒绝自动恢复，不会覆盖原 Session。
+- in-flight/pending `task` 会被补成 `task_interrupted` 结果并交给根 Agent 重新规划；旧子 Agent 不会自动重放。
 
 ### 调整运行预算
 
@@ -160,6 +191,7 @@ Thinking mode 下的 assistant `reasoning_content` 会随消息保存和恢复�
 - `--max-context-tokens` 限制每次模型请求的本地预检 token 数，默认为 `100000`。计数包含实际启用的工具 Schema；超限时 Harness 会按从低损到高损的顺序压缩上下文。
 - 旧参数 `--max-context-chars` 已移除，不会把旧值静默解释成 token。迁移时请显式改用 `--max-context-tokens` 并重新确认预算值；同样的数字并不代表同样的容量。
 - 无网络或需要完全可复现时，加上 `--tokenizer-file /absolute/path/tokenizer.json`。
+- Subagent 的 4 次委派与 8 次子请求为固定安全/成本上限，当前不提供 CLI 调节。
 
 终端会在网关返回 `usage` 时显示服务端 prompt token 与本地预检值。服务端值是请求后的权威结果；第三方网关可能增加隐藏消息或更换同名模型，所以本地与服务端计数不承诺完全相等。
 
@@ -200,8 +232,8 @@ answer = run_agent(
 | 事件 | 回调参数 | 返回值作用 |
 | --- | --- | --- |
 | `UserPromptSubmit` | `query` | Agent 不使用返回值；用于观察当前请求 |
-| `PreToolUse` | `tool_name, arguments` | 非 `None` 阻止当前 registry 工具 |
-| `PostToolUse` | `tool_name, arguments, result` | Agent 不使用返回值；在 Handler 尝试后观察结果 |
+| `PreToolUse` | `tool_name, arguments` | 非 `None` 阻止当前 registry 工具或根 `task` |
+| `PostToolUse` | `tool_name, arguments, result` | Agent 不使用返回值；在 Handler/子 Agent 尝试后观察结果 |
 | `Stop` | `messages` | 非空字符串作为新 user message，要求进入下一轮 |
 
 同一事件的回调按注册顺序执行，第一个非 `None` 返回值会停止该事件的后续回调。传给 Hook 的可变参数是防御性副本，不能靠修改它们改变实际执行或历史。
@@ -234,7 +266,7 @@ PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/vibe-harness/pycache \
 - in-flight 工具的副作用未知时必须由使用者核对，Harness 不会自动重放。
 - 压缩摘要是 Session 内的可恢复状态，不是跨 Session 长期 Memory。
 - Hooks 当前只支持同步、进程内 Python 注册；尚无配置文件、外部命令 Hook、异步 Hook 或自动发现机制。
-- 当前未实现 Skills、MCP、Subagents 或 Goal Loop。
+- 当前未实现 Skills、MCP、Goal Loop、并行/递归 Subagent 或子 Agent 持久化。
 - `run_command` 默认关闭；显式开启需本地可信镜像和正常的 Docker daemon。
 - Docker Sandbox 保护 workspace 以外的宿主边界，但获批命令仍可修改未遮蔽的
   workspace 文件；普通文件名中自行保存的密钥也无法被自动识别。

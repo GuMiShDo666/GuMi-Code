@@ -15,6 +15,33 @@ def _truncate(text: str) -> str:
 
 
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
+    if event_type == "subagent_start":
+        print(
+            "  └─ Subagent 开始"
+            f"（最多 {payload.get('max_calls')} 次模型请求）"
+        )
+        return
+
+    if event_type == "subagent_step":
+        print(
+            "     第 "
+            f"{payload.get('step')} 步"
+            f"（{payload.get('calls_used')} / {payload.get('max_calls')} 次请求）"
+        )
+        return
+
+    if event_type == "subagent_tool":
+        print(f"     工具：{payload.get('tool_name')}")
+        return
+
+    if event_type == "subagent_end":
+        print(
+            "  └─ Subagent "
+            f"{payload.get('status')}"
+            f"（{payload.get('calls_used')} / {payload.get('max_calls')} 次请求）"
+        )
+        return
+
     if event_type == "context_compacted":
         stage = payload.get("stage")
         before_tokens = payload.get("before_tokens")

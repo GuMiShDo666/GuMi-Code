@@ -461,6 +461,14 @@ def get_tool_schemas(
     ]
 
 
+def get_read_only_tool_schemas() -> list[dict]:
+    return [
+        schema
+        for name, schema in ALL_TOOL_SCHEMAS.items()
+        if name in READ_ONLY_TOOL_NAMES
+    ]
+
+
 TOOL_SCHEMAS = get_tool_schemas()
 
 

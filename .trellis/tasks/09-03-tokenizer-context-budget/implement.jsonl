@@ -1,4 +1,0 @@
-{"file": ".trellis/tasks/09-03-tokenizer-context-budget/research.md", "reason": "Official model/tokenizer/encoding findings and accuracy boundary"}
-{"file": ".trellis/tasks/09-03-tokenizer-context-budget/design.md", "reason": "Approved technical design and unit migration"}
-{"file": ".trellis/spec/backend/context-session-guidelines.md", "reason": "Existing compaction and Session safety invariants"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "Fail-closed sanitized tokenizer and provider errors"}

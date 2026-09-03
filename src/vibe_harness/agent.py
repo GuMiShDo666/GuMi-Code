@@ -18,6 +18,14 @@ from vibe_harness.context import (
 from vibe_harness.events import AgentEventCallback
 from vibe_harness.hooks import HookEvent, HookRegistry
 from vibe_harness.session import IN_FLIGHT_MARKER_KEY
+from vibe_harness.subagent import (
+    MAX_DELEGATIONS_PER_RUN,
+    TASK_TOOL_SCHEMA,
+    error_result,
+    normalize_task_description,
+    parse_task_description,
+    run_read_only_subagent,
+)
 from vibe_harness.todo import MAX_TODO_CONTENT_CHARS, MAX_TODOS, TodoManager
 from vibe_harness.token_counting import RequestTokenCounter, load_token_counter
 from vibe_harness.tools.command import DockerSandboxConfig
@@ -395,6 +403,7 @@ def run_agent(
     hook_registry: HookRegistry | None = None,
     token_counter: RequestTokenCounter | None = None,
     command_sandbox: DockerSandboxConfig | None = None,
+    allow_subagent: bool = True,
 ) -> str:
     if (
         isinstance(max_context_tokens, bool)
@@ -461,6 +470,8 @@ def run_agent(
         *get_tool_schemas(allow_run_command=allow_run_command),
         *AGENT_CONTROL_TOOL_SCHEMAS,
     ]
+    if allow_subagent:
+        agent_tool_schemas.append(TASK_TOOL_SCHEMA)
 
     allowed_tool_names = {
         schema["function"]["name"]
@@ -498,6 +509,8 @@ def run_agent(
     todo_manager = TodoManager()
     rounds_since_todo = 0
     denied_tool_calls: set[tuple[str, str]] = set()
+    delegations_started = 0
+    started_descriptions: set[str] = set()
 
     for step in range(1, max_steps + 1):
         used_tokens = token_counter.count_request(messages, agent_tool_schemas)
@@ -748,21 +761,113 @@ def run_agent(
                 reminder = None
 
         compact_requested = False
+        first_task_index = next(
+            (
+                index
+                for index, call in enumerate(message.tool_calls)
+                if call.function.name == "task"
+            ),
+            None,
+        )
 
         for index, tool_call in enumerate(message.tool_calls):
             if event_callback is not None:
+                payload: dict[str, object] = {
+                    "step": step,
+                    "tool_name": tool_call.function.name,
+                }
+                if tool_call.function.name != "task":
+                    payload["arguments"] = tool_call.function.arguments
                 event_callback(
                     "tool_call",
-                    {
-                        "step": step,
-                        "tool_name": tool_call.function.name,
-                        "arguments": tool_call.function.arguments,
-                    },
+                    payload,
                 )
 
             tool_name = tool_call.function.name
 
-            if tool_name not in allowed_tool_names:
+            if tool_name == "task" and index != first_task_index:
+                result = error_result(
+                    "delegation_limit",
+                    "Only the first task call in a tool batch may start.",
+                )
+            elif tool_name == "task" and not allow_subagent:
+                result = error_result(
+                    "subagent_disabled",
+                    "Subagent delegation is disabled for this run.",
+                )
+            elif tool_name == "task":
+                try:
+                    description = parse_task_description(
+                        tool_call.function.arguments
+                    )
+                except ValueError:
+                    result = error_result(
+                        "invalid_task",
+                        "task requires one non-blank description of at most 4000 characters.",
+                    )
+                else:
+                    normalized_description = normalize_task_description(
+                        description
+                    )
+                    if normalized_description in started_descriptions:
+                        result = error_result(
+                            "duplicate_task",
+                            "An equivalent task already started in this run.",
+                        )
+                    elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
+                        result = error_result(
+                            "delegation_limit",
+                            "The per-run subagent delegation limit was reached.",
+                        )
+                    else:
+                        in_flight_snapshot = copy.deepcopy(messages)
+                        in_flight_snapshot.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tool_call.id,
+                                "content": "",
+                                IN_FLIGHT_MARKER_KEY: True,
+                            }
+                        )
+                        _send_message_snapshot(
+                            message_snapshot_callback,
+                            in_flight_snapshot,
+                        )
+
+                        parsed_arguments = {"description": description}
+                        blocked = None
+                        if pre_tool_use_callback is not None:
+                            blocked = pre_tool_use_callback(
+                                "task", copy.deepcopy(parsed_arguments)
+                            )
+
+                        if blocked is not None:
+                            result = error_result(
+                                "hook_blocked",
+                                "The task was blocked by a PreToolUse hook.",
+                            )
+                        else:
+                            delegations_started += 1
+                            started_descriptions.add(normalized_description)
+                            result = run_read_only_subagent(
+                                client=client,
+                                model=model,
+                                workspace=workspace,
+                                description=description,
+                                parent_tool_call_id=tool_call.id,
+                                token_counter=token_counter,
+                                max_context_tokens=max_context_tokens,
+                                event_callback=event_callback,
+                                pre_tool_use_callback=pre_tool_use_callback,
+                                post_tool_use_callback=post_tool_use_callback,
+                            )
+                            if post_tool_use_callback is not None:
+                                post_tool_use_callback(
+                                    "task",
+                                    copy.deepcopy(parsed_arguments),
+                                    result,
+                                )
+            elif tool_name not in allowed_tool_names:
                 result = (
                     f"Error: Tool is not enabled for this run: {tool_name}"
                 )
@@ -810,17 +915,23 @@ def run_agent(
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)
 
-            if reminder is not None and index == len(message.tool_calls) - 1:
+            if (
+                reminder is not None
+                and index == len(message.tool_calls) - 1
+                and tool_name != "task"
+            ):
                 result = f"{result}\n\n{reminder}"
 
             if event_callback is not None:
+                payload = {
+                    "step": step,
+                    "tool_name": tool_call.function.name,
+                }
+                if tool_name != "task":
+                    payload["result"] = result
                 event_callback(
                     "tool_result",
-                    {
-                        "step": step,
-                        "tool_name": tool_call.function.name,
-                        "result": result,
-                    },
+                    payload,
                 )
 
             messages.append(

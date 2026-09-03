@@ -68,6 +68,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-subagent",
+        dest="allow_subagent",
+        action="store_false",
+        help=(
+            "关闭默认启用的同步、单层、只读 task Subagent"
+        ),
+    )
+    parser.add_argument(
         "--sandbox-image",
         default=None,
         help=(
@@ -212,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:
             if command_sandbox is not None
             else {}
         )
+        subagent_kwargs = (
+            {"allow_subagent": False}
+            if not args.allow_subagent
+            else {}
+        )
 
         run_agent(
             client=client,
@@ -227,6 +240,7 @@ def main(argv: list[str] | None = None) -> int:
             initial_messages=initial_messages,
             token_counter=token_counter,
             **sandbox_kwargs,
+            **subagent_kwargs,
         )
     except (RuntimeError, OpenAIError, OSError, ValueError) as exc:
         sys.stdout.flush()

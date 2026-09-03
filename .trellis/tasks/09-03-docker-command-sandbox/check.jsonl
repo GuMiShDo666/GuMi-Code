@@ -1,7 +1,0 @@
-{"file": ".trellis/tasks/09-03-docker-command-sandbox/prd.md", "reason": "Source requirements, non-goals, and acceptance criteria"}
-{"file": ".trellis/tasks/09-03-docker-command-sandbox/design.md", "reason": "Security invariants, failure modes, and rollback boundary"}
-{"file": ".trellis/spec/backend/tool-permission-guidelines.md", "reason": "Permission/preflight and sensitive-workspace review contract"}
-{"file": ".trellis/spec/backend/error-handling.md", "reason": "Model-visible and CLI error review contract"}
-{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Offline tests, live probe, secret scan, and Git quality gates"}
-{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "Docker failures and command data must not leak through events"}
-{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer runtime and Session regression review"}
