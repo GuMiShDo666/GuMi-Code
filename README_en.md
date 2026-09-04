@@ -116,6 +116,8 @@ New Sessions use private append-only v3 JSONL event logs with the existing 5 MiB
 
 Within one model step, adjacent executions of the same tool produce one terminal progress line while every call, result, and Session event remains distinct.
 
+Adjacent `task` calls in one model step form a parallel group. Non-`task` tools are serial barriers, and the parent waits for the whole group before committing results in the original Tool Call order. A root run starts at most four Subagents. They share the current OpenAI-compatible client, so an injected client must support concurrent `chat.completions.create()` calls. `Ctrl+C` cooperatively cancels later work but cannot forcibly stop a synchronous HTTP request already in progress.
+
 ## Current capabilities and boundaries
 
 | Area | Current capability | Boundary |
@@ -127,6 +129,6 @@ Within one model step, adjacent executions of the same tool produce one terminal
 | Context | Bounds tool results, performs structured compaction, supports manual compaction, and retries once after a context-length error. The terminal reports only the percentage of the configured context limit. | Compaction state belongs to the current Session. Gum Code does not provide cross-Session long-term memory. |
 | Sessions | Stores interactive history in v3 JSONL event logs and supports structural audit, completed-turn forks, listing, renaming, resuming, and safe interrupted-batch closure. | Each file is capped at 5 MiB. Start or fork a Session at the limit. Inspect current state when an in-flight tool may have produced side effects; the harness does not replay it. |
 | Skills | Reuses the top-level Codex user Skill library through explicit sticky activation and progressive root-Agent reads. | `.system`, plugin, and project Skills are excluded. Scripts never execute, and Subagents receive no Skills. |
-| Subagents | A root run can start up to four synchronous, single-level, read-only subagents. Each subagent can make up to eight model requests. | Subagents cannot write, run commands, execute in parallel, delegate recursively, or persist between runs. |
+| Subagents | Adjacent `task` calls run in parallel. A root run starts at most four single-level, read-only subagents, each with at most eight model requests. | Each Subagent has isolated context and no Skills. It cannot write, run commands, delegate recursively, or persist; ordinary tools remain serial. |
 | Hooks | The Python API supports `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. | Hooks support synchronous in-process registration only. Gum Code has no hook configuration file, external-command hooks, async callbacks, or automatic discovery. |
-| Not implemented | Gum Code currently has no MCP, Goal Loop, long-term memory, parallel or recursive subagents, or persistent child agents. | Treat these entries as current boundaries, not commitments for a future release. |
+| Not implemented | Gum Code currently has no MCP, Goal Loop, long-term memory, recursive subagents, or persistent child agents. | Treat these entries as current boundaries, not commitments for a future release. |

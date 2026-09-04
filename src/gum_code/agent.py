@@ -3,7 +3,9 @@
 import copy
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Barrier, BrokenBarrierError, Event, RLock
 
 from openai import OpenAI
 
@@ -131,6 +133,22 @@ MessageSnapshotCallback = Callable[
     [list[dict[str, object]]],
     None,
 ]
+
+
+class _LockedTokenCounter:
+    """Serialize a caller-provided counter shared by sibling subagents."""
+
+    def __init__(self, counter: RequestTokenCounter) -> None:
+        self._counter = counter
+        self._lock = RLock()
+
+    def count_request(
+        self,
+        messages: list[dict[str, object]],
+        tools: list[dict[str, object]],
+    ) -> int:
+        with self._lock:
+            return self._counter.count_request(messages, tools)
 
 
 def _send_message_snapshot(
@@ -505,6 +523,19 @@ def run_agent(
     Tool handlers run only after applicable policy, hook, and approval gates.
     """
     if event_callback is not None:
+        raw_event_callback = event_callback
+        event_lock = RLock()
+
+        def serialized_event_callback(
+            event_type: str,
+            payload: dict[str, object],
+        ) -> None:
+            with event_lock:
+                raw_event_callback(event_type, payload)
+
+        event_callback = serialized_event_callback
+
+    if event_callback is not None:
         event_callback("request_prepare", {"step": 1})
 
     if (
@@ -553,11 +584,16 @@ def run_agent(
 
     if token_counter is None:
         token_counter = load_token_counter(model)
-    base_token_counter = token_counter
+    base_token_counter = _LockedTokenCounter(token_counter)
     token_budget = TokenBudgetTracker(base_token_counter)
 
+    hook_lock = RLock()
     if hook_registry is not None:
-        hook_registry.trigger_hooks(HookEvent.USER_PROMPT_SUBMIT, user_query)
+        with hook_lock:
+            hook_registry.trigger_hooks(
+                HookEvent.USER_PROMPT_SUBMIT,
+                user_query,
+            )
 
     if initial_messages is None:
         messages = [
@@ -614,23 +650,25 @@ def run_agent(
             tool_name: str,
             arguments: dict[str, object],
         ) -> str | None:
-            return hook_registry.trigger_hooks(
-                HookEvent.PRE_TOOL_USE,
-                tool_name,
-                arguments,
-            )
+            with hook_lock:
+                return hook_registry.trigger_hooks(
+                    HookEvent.PRE_TOOL_USE,
+                    tool_name,
+                    arguments,
+                )
 
         def trigger_post_tool_use(
             tool_name: str,
             arguments: dict[str, object],
             result: str,
         ) -> None:
-            hook_registry.trigger_hooks(
-                HookEvent.POST_TOOL_USE,
-                tool_name,
-                arguments,
-                result,
-            )
+            with hook_lock:
+                hook_registry.trigger_hooks(
+                    HookEvent.POST_TOOL_USE,
+                    tool_name,
+                    arguments,
+                    result,
+                )
 
         pre_tool_use_callback = trigger_pre_tool_use
         post_tool_use_callback = trigger_post_tool_use
@@ -851,10 +889,11 @@ def run_agent(
         if not message.tool_calls:
             continuation = None
             if hook_registry is not None:
-                continuation = hook_registry.trigger_hooks(
-                    HookEvent.STOP,
-                    copy.deepcopy(messages),
-                )
+                with hook_lock:
+                    continuation = hook_registry.trigger_hooks(
+                        HookEvent.STOP,
+                        copy.deepcopy(messages),
+                    )
             if continuation:
                 messages.append(
                     {
@@ -890,71 +929,230 @@ def run_agent(
                 reminder = None
 
         compact_requested = False
-        first_task_index = next(
-            (
-                index
-                for index, call in enumerate(message.tool_calls)
-                if call.function.name == "task"
-            ),
-            None,
-        )
+        task_group_end = 0
 
         for index, tool_call in enumerate(message.tool_calls):
-            if event_callback is not None:
-                payload: dict[str, object] = {
-                    "step": step,
-                    "tool_name": tool_call.function.name,
-                }
-                if tool_call.function.name != "task":
-                    payload["arguments"] = tool_call.function.arguments
-                event_callback(
-                    "tool_call",
-                    payload,
-                )
+            if index < task_group_end:
+                continue
 
             tool_name = tool_call.function.name
+            if tool_name == "task":
+                task_group_end = index + 1
+                while (
+                    task_group_end < len(message.tool_calls)
+                    and message.tool_calls[task_group_end].function.name
+                    == "task"
+                ):
+                    task_group_end += 1
+                task_calls = message.tool_calls[index:task_group_end]
 
-            # Do not emit execution progress until each branch's gates pass.
-            if tool_name == "task" and index != first_task_index:
-                result = error_result(
-                    "delegation_limit",
-                    "Only the first task call in a tool batch may start.",
-                )
-            elif tool_name == "task" and not allow_subagent:
-                result = error_result(
-                    "subagent_disabled",
-                    "Subagent delegation is disabled for this run.",
-                )
-            elif tool_name == "task":
-                try:
-                    description = parse_task_description(
-                        tool_call.function.arguments
-                    )
-                except ValueError:
-                    result = error_result(
-                        "invalid_task",
-                        "task requires one non-blank description of at most 4000 characters.",
-                    )
-                else:
-                    normalized_description = normalize_task_description(
-                        description
-                    )
-                    if normalized_description in started_descriptions:
-                        result = error_result(
-                            "duplicate_task",
-                            "An equivalent task already started in this run.",
+                if event_callback is not None:
+                    for _ in task_calls:
+                        event_callback(
+                            "tool_call",
+                            {"step": step, "tool_name": "task"},
                         )
-                    elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
+
+                task_results: list[str | None] = [None] * len(task_calls)
+                task_descriptions: dict[int, str] = {}
+                accepted_offsets: list[int] = []
+                committed_prefix = 0
+                marker_saved = False
+
+                for offset, task_call in enumerate(task_calls):
+                    result: str | None = None
+                    if not allow_subagent:
                         result = error_result(
-                            "delegation_limit",
-                            "The per-run subagent delegation limit was reached.",
+                            "subagent_disabled",
+                            "Subagent delegation is disabled for this run.",
                         )
                     else:
+                        try:
+                            description = parse_task_description(
+                                task_call.function.arguments
+                            )
+                        except ValueError:
+                            result = error_result(
+                                "invalid_task",
+                                "task requires one non-blank description of at most 4000 characters.",
+                            )
+                        else:
+                            normalized_description = normalize_task_description(
+                                description
+                            )
+                            if normalized_description in started_descriptions:
+                                result = error_result(
+                                    "duplicate_task",
+                                    "An equivalent task already started in this run.",
+                                )
+                            elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
+                                result = error_result(
+                                    "delegation_limit",
+                                    "The per-run subagent delegation limit was reached.",
+                                )
+                            else:
+                                if not marker_saved:
+                                    in_flight_snapshot = copy.deepcopy(messages)
+                                    in_flight_snapshot.append(
+                                        {
+                                            "role": "tool",
+                                            "tool_call_id": task_call.id,
+                                            "content": "",
+                                            IN_FLIGHT_MARKER_KEY: True,
+                                        }
+                                    )
+                                    _send_message_snapshot(
+                                        message_snapshot_callback,
+                                        in_flight_snapshot,
+                                    )
+                                    marker_saved = True
+
+                                parsed_arguments = {"description": description}
+                                blocked = None
+                                if pre_tool_use_callback is not None:
+                                    blocked = pre_tool_use_callback(
+                                        "task",
+                                        copy.deepcopy(parsed_arguments),
+                                    )
+
+                                if blocked is not None:
+                                    result = error_result(
+                                        "hook_blocked",
+                                        "The task was blocked by a PreToolUse hook.",
+                                    )
+                                else:
+                                    delegations_started += 1
+                                    started_descriptions.add(
+                                        normalized_description
+                                    )
+                                    task_descriptions[offset] = description
+                                    accepted_offsets.append(offset)
+
+                    task_results[offset] = result
+                    if result is not None and not marker_saved:
+                        if event_callback is not None:
+                            event_callback(
+                                "tool_result",
+                                {"step": step, "tool_name": "task"},
+                            )
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": task_call.id,
+                                "content": result,
+                            }
+                        )
+                        _send_message_snapshot(
+                            message_snapshot_callback,
+                            messages,
+                        )
+                        committed_prefix += 1
+
+                cancel_event = Event()
+                start_barrier: Barrier | None = None
+
+                def execute_task(offset: int) -> str:
+                    task_call = task_calls[offset]
+                    try:
+                        _emit_tool_execution(event_callback, step, "task")
+                    except BaseException:
+                        cancel_event.set()
+                        if start_barrier is not None:
+                            start_barrier.abort()
+                        raise
+                    if start_barrier is not None:
+                        try:
+                            # Keep sibling task events adjacent for terminal deduplication.
+                            start_barrier.wait()
+                        except BrokenBarrierError:
+                            pass
+                    return run_read_only_subagent(
+                        client=client,
+                        model=model,
+                        workspace=workspace,
+                        description=task_descriptions[offset],
+                        parent_tool_call_id=task_call.id,
+                        token_counter=base_token_counter,
+                        max_context_tokens=max_context_tokens,
+                        event_callback=event_callback,
+                        pre_tool_use_callback=pre_tool_use_callback,
+                        post_tool_use_callback=post_tool_use_callback,
+                        cancel_event=cancel_event,
+                    )
+
+                if len(accepted_offsets) == 1:
+                    offset = accepted_offsets[0]
+                    try:
+                        task_results[offset] = execute_task(offset)
+                    except KeyboardInterrupt:
+                        cancel_event.set()
+                        raise
+                elif len(accepted_offsets) > 1:
+                    start_barrier = Barrier(len(accepted_offsets))
+                    future_offsets = {}
+                    with ThreadPoolExecutor(
+                        max_workers=len(accepted_offsets)
+                    ) as executor:
+                        try:
+                            for offset in accepted_offsets:
+                                future = executor.submit(
+                                    execute_task,
+                                    offset,
+                                )
+                                future_offsets[future] = offset
+                            for future in as_completed(future_offsets):
+                                task_results[future_offsets[future]] = (
+                                    future.result()
+                                )
+                        except BaseException:
+                            cancel_event.set()
+                            start_barrier.abort()
+                            for future in future_offsets:
+                                future.cancel()
+                            raise
+
+                deferred_offsets = range(committed_prefix, len(task_calls))
+                for position, offset in enumerate(deferred_offsets):
+                    result = task_results[offset]
+                    if result is None:
+                        raise RuntimeError("Subagent result is missing")
+
+                    description = task_descriptions.get(offset)
+                    if (
+                        description is not None
+                        and post_tool_use_callback is not None
+                    ):
+                        post_tool_use_callback(
+                            "task",
+                            {"description": description},
+                            result,
+                        )
+
+                    if event_callback is not None:
+                        event_callback(
+                            "tool_result",
+                            {"step": step, "tool_name": "task"},
+                        )
+
+                    task_call = task_calls[offset]
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": task_call.id,
+                            "content": result,
+                        }
+                    )
+                    _send_message_snapshot(
+                        message_snapshot_callback,
+                        messages,
+                    )
+                    if position + 1 < len(deferred_offsets):
+                        next_call = task_calls[offset + 1]
                         in_flight_snapshot = copy.deepcopy(messages)
                         in_flight_snapshot.append(
                             {
                                 "role": "tool",
-                                "tool_call_id": tool_call.id,
+                                "tool_call_id": next_call.id,
                                 "content": "",
                                 IN_FLIGHT_MARKER_KEY: True,
                             }
@@ -963,42 +1161,21 @@ def run_agent(
                             message_snapshot_callback,
                             in_flight_snapshot,
                         )
+                continue
 
-                        parsed_arguments = {"description": description}
-                        blocked = None
-                        if pre_tool_use_callback is not None:
-                            blocked = pre_tool_use_callback(
-                                "task", copy.deepcopy(parsed_arguments)
-                            )
+            if event_callback is not None:
+                payload: dict[str, object] = {
+                    "step": step,
+                    "tool_name": tool_name,
+                }
+                payload["arguments"] = tool_call.function.arguments
+                event_callback(
+                    "tool_call",
+                    payload,
+                )
 
-                        if blocked is not None:
-                            result = error_result(
-                                "hook_blocked",
-                                "The task was blocked by a PreToolUse hook.",
-                            )
-                        else:
-                            _emit_tool_execution(event_callback, step, "task")
-                            delegations_started += 1
-                            started_descriptions.add(normalized_description)
-                            result = run_read_only_subagent(
-                                client=client,
-                                model=model,
-                                workspace=workspace,
-                                description=description,
-                                parent_tool_call_id=tool_call.id,
-                                token_counter=base_token_counter,
-                                max_context_tokens=max_context_tokens,
-                                event_callback=event_callback,
-                                pre_tool_use_callback=pre_tool_use_callback,
-                                post_tool_use_callback=post_tool_use_callback,
-                            )
-                            if post_tool_use_callback is not None:
-                                post_tool_use_callback(
-                                    "task",
-                                    copy.deepcopy(parsed_arguments),
-                                    result,
-                                )
-            elif tool_name not in allowed_tool_names:
+            # Do not emit execution progress until each branch's gates pass.
+            if tool_name not in allowed_tool_names:
                 result = (
                     f"Error: Tool is not enabled for this run: {tool_name}"
                 )

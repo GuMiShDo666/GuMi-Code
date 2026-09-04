@@ -116,6 +116,8 @@ Skills 只作为只读指令与文本资源加载。Gum Code 不执行 Skill 脚
 
 同一模型步骤中连续调用同名工具时，终端只显示一次该工具的执行提示；每次调用、结果与 Session 事件仍分别保留。
 
+同一模型步骤中相邻的 `task` 会组成并行组；非 `task` 工具是串行屏障，父 Agent 会等待整组结束并按原 Tool Call 顺序提交结果。每次根运行最多启动 4 个 Subagent。Subagent 共用当前 OpenAI 兼容 client，因此外部自定义 client 必须支持并发 `chat.completions.create()`。`Ctrl+C` 会协作取消后续步骤，但不能强杀已经进入的同步 HTTP 请求。
+
 ## 当前能力与边界
 
 | 范围 | 当前能力 | 边界 |
@@ -127,6 +129,6 @@ Skills 只作为只读指令与文本资源加载。Gum Code 不执行 Skill 脚
 | 上下文 | 支持工具结果裁剪、结构化压缩、主动压缩和超限后的单次重试；终端只显示上下文占上限的百分比。 | 压缩摘要属于当前 Session，不是跨 Session 长期 Memory。 |
 | Session | 使用 v3 JSONL 事件日志自动保存交互记录，支持安全审计、已完成 turn fork、重命名、恢复和安全闭合中断工具批次。 | 单文件上限 5 MiB；达到上限后需新建或 fork Session。已开始工具的副作用未知时，使用者必须检查当前状态，Harness 不会自动重放。 |
 | Skills | 共用 Codex 顶层用户 Skill 库，支持显式 sticky 加载和根 Agent 的渐进式只读加载。 | 不扫描 `.system`、插件或项目 Skill；不执行脚本；Subagent 不接收 Skills。 |
-| Subagent | 每次根 Agent 运行最多可启动 4 个同步、单层、只读子 Agent，每个最多使用 8 次模型请求。 | 子 Agent 不能写入、执行命令、并行或递归委派，也不会持久化。 |
+| Subagent | 相邻 `task` 默认并行；每次根 Agent 运行最多启动 4 个单层、只读子 Agent，每个最多使用 8 次模型请求。 | 子 Agent 使用独立上下文且不接收 Skills，不能写入、执行命令或递归委派，也不会持久化。普通工具仍串行。 |
 | Hooks | Python API 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`。 | Hooks 只支持同步、进程内注册；没有配置文件、外部命令、异步回调或自动发现。 |
-| 尚未实现 | 项目当前不包含 MCP、Goal Loop、长期 Memory、并行/递归 Subagent 或子 Agent 持久化。 | 不要把 README 中的边界当作未来版本承诺。 |
+| 尚未实现 | 项目当前不包含 MCP、Goal Loop、长期 Memory、递归 Subagent 或子 Agent 持久化。 | 不要把 README 中的边界当作未来版本承诺。 |

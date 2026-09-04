@@ -3,6 +3,7 @@
 import json
 import tempfile
 from pathlib import Path
+from threading import Event
 
 from gum_code.context import (
     CONTEXT_TARGET_RATIO,
@@ -13,6 +14,7 @@ from gum_code.context import (
     reactive_compact,
 )
 from gum_code.events import AgentEventCallback
+from gum_code.session import TASK_INTERRUPTED_RESULT
 from gum_code.token_counting import RequestTokenCounter, TokenBudgetTracker
 from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
 from gum_code.tools.registry import (
@@ -40,9 +42,10 @@ TASK_TOOL_SCHEMA = {
         "name": "task",
         "description": (
             "Delegate one synchronous, one-level, read-only workspace research "
-            "task. The subagent cannot write or delete files, execute commands, "
-            "choose a model, create another subagent, or run in parallel. Use "
-            "the root read tools directly for simple lookups."
+            "task. Adjacent task calls from the parent may run as parallel "
+            "siblings. Each subagent stays isolated and cannot write or delete "
+            "files, execute commands, choose a model, or delegate. Use the root "
+            "read tools directly for simple lookups."
         ),
         "parameters": {
             "type": "object",
@@ -152,6 +155,15 @@ _EVIDENCE_KEYS = frozenset(
 
 class _ProviderBudgetExhausted(RuntimeError):
     pass
+
+
+class _SubagentCancelled(BaseException):
+    pass
+
+
+class _SubagentCallbackError(BaseException):
+    def __init__(self, error: Exception) -> None:
+        self.error = error
 
 
 def error_result(code: str, message: str) -> str:
@@ -390,6 +402,7 @@ def run_read_only_subagent(
     event_callback: AgentEventCallback | None = None,
     pre_tool_use_callback: PreToolUseCallback | None = None,
     post_tool_use_callback: PostToolUseCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> str:
     """Run one read-only child that completes only through a validated report.
 
@@ -421,6 +434,15 @@ def run_read_only_subagent(
         name = str(tool_name)[:MAX_EVENT_TOOL_NAME_CHARS]
         emit("tool_execution", {"step": step, "tool_name": name})
 
+    def check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise _SubagentCancelled
+
+    def begin_tool_execution(step: int, tool_name: object) -> None:
+        check_cancelled()
+        emit_tool_execution(step, tool_name)
+        check_cancelled()
+
     def reserve_provider_call() -> None:
         nonlocal calls_used
         if calls_used >= MAX_SUBAGENT_PROVIDER_CALLS:
@@ -428,11 +450,17 @@ def run_read_only_subagent(
         calls_used += 1
 
     def before_summary_request() -> None:
+        check_cancelled()
         reserve_provider_call()
-        emit("context_summary", {"step": max(main_step, 1)})
+        try:
+            emit("context_summary", {"step": max(main_step, 1)})
+        except Exception as error:
+            raise _SubagentCallbackError(error) from error
+        check_cancelled()
 
     emit("subagent_start", {"max_calls": MAX_SUBAGENT_PROVIDER_CALLS})
     try:
+        check_cancelled()
         workspace_root = workspace.resolve()
         # Keep child context artifacts outside the real workspace write boundary.
         temp_parent = Path(tempfile.gettempdir()).resolve()
@@ -469,6 +497,7 @@ def run_read_only_subagent(
             reactive_retries = 0
 
             while True:
+                check_cancelled()
                 emit(
                     "subagent_prepare",
                     {
@@ -477,12 +506,15 @@ def run_read_only_subagent(
                         "max_calls": MAX_SUBAGENT_PROVIDER_CALLS,
                     },
                 )
+                check_cancelled()
                 used_tokens = token_budget.count_request(
                     messages, child_tool_schemas
                 )
+                check_cancelled()
                 messages, persisted = apply_tool_result_budget(
                     messages, artifact_root
                 )
+                check_cancelled()
                 if persisted:
                     token_budget.reset()
                 used_tokens = token_budget.count_request(
@@ -493,6 +525,7 @@ def run_read_only_subagent(
                     target_tokens = int(
                         max_context_tokens * CONTEXT_TARGET_RATIO
                     )
+                    check_cancelled()
                     messages, shortened = apply_micro_compact(
                         messages,
                         artifact_root,
@@ -506,6 +539,7 @@ def run_read_only_subagent(
                         messages, child_tool_schemas
                     )
                     if used_tokens >= max_context_tokens:
+                        check_cancelled()
                         messages, fitted = apply_fit_tool_results(
                             messages,
                             artifact_root,
@@ -520,6 +554,7 @@ def run_read_only_subagent(
                         )
 
                 if used_tokens >= max_context_tokens:
+                    check_cancelled()
                     try:
                         token_budget.reset()
                         messages, _ = compact_history(
@@ -553,6 +588,7 @@ def run_read_only_subagent(
                     )
 
                 try:
+                    check_cancelled()
                     reserve_provider_call()
                 except _ProviderBudgetExhausted:
                     return _budget_exhausted_result(report_attempted)
@@ -566,6 +602,7 @@ def run_read_only_subagent(
                         "max_calls": MAX_SUBAGENT_PROVIDER_CALLS,
                     },
                 )
+                check_cancelled()
                 try:
                     response = client.chat.completions.create(
                         model=model,
@@ -587,6 +624,7 @@ def run_read_only_subagent(
                             "The subagent model request failed.",
                         )
                     reactive_retries += 1
+                    check_cancelled()
                     try:
                         token_budget.reset()
                         messages, _ = reactive_compact(
@@ -611,6 +649,7 @@ def run_read_only_subagent(
                         )
                     continue
 
+                check_cancelled()
                 token_budget.observe(response, messages, child_tool_schemas)
                 try:
                     message = response.choices[0].message
@@ -663,6 +702,7 @@ def run_read_only_subagent(
                 if has_submit and len(tool_calls) != 1:
                     report_attempted = True
                     for call in tool_calls:
+                        check_cancelled()
                         emit_tool(main_step, call.function.name)
                         messages.append(
                             {
@@ -680,6 +720,7 @@ def run_read_only_subagent(
                 if call is not None and call.function.name == "submit_report":
                     report_attempted = True
                     emit_tool(main_step, "submit_report")
+                    check_cancelled()
                     try:
                         result = validate_report(
                             workspace, call.function.arguments
@@ -696,7 +737,7 @@ def run_read_only_subagent(
                             }
                         )
                         continue
-                    emit_tool_execution(main_step, "submit_report")
+                    begin_tool_execution(main_step, "submit_report")
                     messages.append(
                         {
                             "role": "tool",
@@ -709,6 +750,7 @@ def run_read_only_subagent(
 
                 compact_requested = False
                 for call in tool_calls:
+                    check_cancelled()
                     tool_name = call.function.name
                     emit_tool(main_step, tool_name)
                     if tool_name == "compact":
@@ -717,12 +759,13 @@ def run_read_only_subagent(
                         except (TypeError, json.JSONDecodeError):
                             compact_args = None
                         if compact_args == {}:
-                            emit_tool_execution(main_step, "compact")
+                            begin_tool_execution(main_step, "compact")
                             result = "Compaction requested after this tool batch."
                             compact_requested = True
                         else:
                             result = "Error: compact requires an empty JSON object."
                     elif tool_name in allowed_read_tools:
+                        check_cancelled()
                         tool_workspace = workspace
                         if tool_name == "read_tool_output":
                             tool_workspace = _artifact_workspace_for_read(
@@ -736,8 +779,9 @@ def run_read_only_subagent(
                             arguments_json=call.function.arguments,
                             pre_tool_use_callback=pre_tool_use_callback,
                             post_tool_use_callback=post_tool_use_callback,
-                            before_execute_callback=lambda: emit_tool_execution(
-                                main_step, tool_name
+                            before_execute_callback=lambda: begin_tool_execution(
+                                main_step,
+                                tool_name,
                             ),
                         )
                     else:
@@ -754,6 +798,7 @@ def run_read_only_subagent(
                     )
 
                 if compact_requested:
+                    check_cancelled()
                     try:
                         token_budget.reset()
                         messages, _ = compact_history(
@@ -777,6 +822,11 @@ def run_read_only_subagent(
                             "child_model_error",
                             "The subagent context request failed.",
                         )
+    except _SubagentCancelled:
+        status = "cancelled"
+        return TASK_INTERRUPTED_RESULT
+    except _SubagentCallbackError as error:
+        raise error.error
     finally:
         emit(
             "subagent_end",
