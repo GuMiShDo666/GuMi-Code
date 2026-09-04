@@ -1,3 +1,5 @@
+"""Load, validate, and privately persist provider configuration."""
+
 import json
 import os
 import tempfile
@@ -42,6 +44,7 @@ def load_settings(
     user_config_path: Path | None = None,
     legacy_path: Path | None = None,
 ) -> Settings:
+    """Resolve settings by environment, user config, then legacy-file precedence."""
     effective = {
         key: value.strip()
         for key in CONFIG_KEYS
@@ -109,6 +112,7 @@ def validate_settings(settings: Settings) -> None:
 
 
 def save_user_settings(path: Path, settings: Settings) -> None:
+    """Validate and atomically replace a private provider settings file."""
     validate_settings(settings)
     target = Path(path)
     if target.is_symlink():

@@ -1,3 +1,5 @@
+"""Persist private Sessions and safely close interrupted tool-call batches."""
+
 import copy
 import json
 import os
@@ -81,6 +83,10 @@ def save_session(
     messages: list[dict[str, object]],
     title: str = "",
 ) -> None:
+    """Atomically save a private v2 Session after fitting closed large results.
+
+    Caller messages stay unchanged; publication failure keeps old bytes intact.
+    """
     target = Path(path)
 
     if target.is_symlink():
@@ -165,6 +171,7 @@ def load_session(
     allow_incomplete_tool_batch: bool = False,
     allow_pending_user_tail: bool = False,
 ) -> SessionData:
+    """Validate and copy a v1/v2 Session under explicit incomplete-tail policy."""
     target = Path(path)
 
     if target.is_symlink():
@@ -414,6 +421,7 @@ def analyze_tool_batch_tail(
 def plan_tool_batch_recovery(
     messages: list[dict[str, object]],
 ) -> ToolBatchRecoveryPlan | None:
+    """Plan closure of an interrupted tail without executing any pending call."""
     last_assistant_index: int | None = None
     for index in range(len(messages) - 1, -1, -1):
         if messages[index].get("role") == "assistant":
@@ -490,6 +498,7 @@ def plan_tool_batch_recovery(
 def build_tool_batch_recovery_messages(
     messages: list[dict[str, object]],
 ) -> list[dict[str, object]]:
+    """Close pending calls with synthetic Tool Results instead of replaying them."""
     plan = plan_tool_batch_recovery(messages)
 
     result = [
@@ -528,7 +537,7 @@ def build_tool_batch_recovery_messages(
 def build_interrupted_turn_messages(
     messages: list[dict[str, object]],
 ) -> list[dict[str, object]]:
-    """Close a live interrupted tool batch without replaying any call."""
+    """Close a live batch without claiming in-flight side effects failed."""
     state = analyze_tool_batch_tail(messages)
     if state is None:
         return copy.deepcopy(messages)
@@ -542,6 +551,7 @@ def build_interrupted_turn_messages(
     if not isinstance(tool_calls, list):
         raise ValueError("assistant tool_calls 必须是列表")
 
+    # Keep completed results and synthesize the rest; never replay tools.
     result = [
         message
         for message in copy.deepcopy(messages)

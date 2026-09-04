@@ -1,3 +1,5 @@
+"""Validate and run argv-only commands inside a fixed Docker sandbox."""
+
 import os
 import queue
 import re
@@ -517,6 +519,7 @@ def _communicate_bounded(
 
     events: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=8)
     stop = threading.Event()
+    # Drain both pipes concurrently to avoid child-process capture deadlocks.
     threads = [
         threading.Thread(
             target=_read_pipe,
@@ -619,6 +622,10 @@ def run_command(
     *,
     sandbox: DockerSandboxConfig | None = None,
 ) -> str:
+    """Run validated argv in Docker and return bounded output.
+
+    Error cleanup targets only this invocation's randomized container.
+    """
     _validate_run_command(
         workspace,
         argv,
@@ -651,6 +658,7 @@ def run_command(
         except OSError:
             return "Error: 无法启动 Docker Sandbox"
 
+        # Abnormal paths remove only this invocation's randomized container.
         try:
             stdout_bytes, stderr_bytes = _communicate_bounded(
                 process,

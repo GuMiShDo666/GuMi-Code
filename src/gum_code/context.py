@@ -1,3 +1,5 @@
+"""Budget and compact model context without breaking protocol batches."""
+
 import copy
 import json
 import os
@@ -167,6 +169,7 @@ def apply_tool_result_budget(
     workspace: Path,
     max_chars: int = TOOL_RESULT_BATCH_CHAR_LIMIT,
 ) -> tuple[list[dict[str, object]], int]:
+    """Externalize oversized results from the newest batch on a deep copy."""
     result = copy.deepcopy(messages)
 
     last_assistant = -1
@@ -328,6 +331,7 @@ def apply_micro_compact(
     token_counter: RequestTokenCounter,
     target_tokens: int,
 ) -> tuple[list[dict[str, object]], int]:
+    """Replace older consumed results with persisted artifacts up to a target."""
     result = copy.deepcopy(messages)
 
     last_assistant = -1
@@ -397,6 +401,7 @@ def apply_fit_tool_results(
     token_counter: RequestTokenCounter,
     target_tokens: int,
 ) -> tuple[list[dict[str, object]], int]:
+    """Shrink the largest Tool Results while preserving complete artifacts."""
     result = copy.deepcopy(messages)
 
     tool_indices = [
@@ -927,6 +932,10 @@ def compact_history(
     usage_callback: SummaryUsageCallback | None = None,
     before_request: BeforeSummaryRequestCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
+    """Archive history and replace older complete batches with a validated capsule.
+
+    Recent exact batches and the caller's input stay intact if validation fails.
+    """
     history = copy.deepcopy(messages)
     transcript_path = _write_transcript(workspace, history)
     prior, marker_index, legacy = _extract_prior_capsule(history)
@@ -940,6 +949,7 @@ def compact_history(
         if index == marker_index and legacy:
             source_message["role"] = "legacy_reference"
         working.append(source_message)
+    # Select whole batches so Tool Calls stay with their ordered results.
     batches = _split_protocol_batches(working)
     selected = _select_recent_batches(
         system_message, batches, tools, token_counter, max_context_tokens
@@ -1037,6 +1047,7 @@ def reactive_compact(
     usage_callback: SummaryUsageCallback | None = None,
     before_request: BeforeSummaryRequestCallback | None = None,
 ) -> tuple[list[dict[str, object]], str]:
+    """Apply the same safe compaction after a provider context-length error."""
     return compact_history(
         client,
         model,

@@ -1,3 +1,5 @@
+"""Own the terminal REPL and its durable, locked Session lifecycle."""
+
 import copy
 import re
 from dataclasses import dataclass
@@ -571,6 +573,7 @@ class InteractiveRuntime:
         self.messages = candidate
 
     def load_locked(self, path: Path) -> None:
+        """Validate and lock a destination before releasing the current Session."""
         destination = Path(path).resolve()
         if self.session_path is not None and destination == self.session_path.resolve():
             return
@@ -672,6 +675,7 @@ class InteractiveRuntime:
         return copy.deepcopy(data.messages)
 
     def run_turn(self, task: str) -> None:
+        """Run one turn with durable snapshots and safe interruption recovery."""
         self._ensure_session()
         if self.first_task is None:
             self.first_task = task
@@ -681,6 +685,7 @@ class InteractiveRuntime:
         def snapshot(messages: list[dict[str, object]]) -> None:
             nonlocal latest
             latest = copy.deepcopy(messages)
+            # Persist boundaries so recovery can close unfinished calls without replay.
             self._save(messages)
 
         renderer = RichEventRenderer(self.console, verbose=self.verbose)

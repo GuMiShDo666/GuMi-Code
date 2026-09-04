@@ -1,3 +1,5 @@
+"""Count DeepSeek V4 requests against a pinned tokenizer contract."""
+
 import copy
 import hashlib
 from pathlib import Path
@@ -32,9 +34,11 @@ class DeepSeekV4TokenCounter:
         messages: list[dict[str, object]],
         tools: list[dict[str, object]],
     ) -> int:
+        """Count provider serialization without mutating request data."""
         encoded_messages = copy.deepcopy(messages)
 
         if tools:
+            # Mirror DeepSeek's schema placement without mutating caller input.
             copied_tools = copy.deepcopy(tools)
             for message in encoded_messages:
                 if message.get("role") == "system":
@@ -78,6 +82,7 @@ def load_token_counter(
     model: str,
     tokenizer_file: Path | None = None,
 ) -> DeepSeekV4TokenCounter:
+    """Load only the pinned model tokenizer, verifying explicit files by hash."""
     if model != SUPPORTED_MODEL:
         raise RuntimeError(
             "当前 tokenizer 只支持模型 deepseek-v4-flash，"
