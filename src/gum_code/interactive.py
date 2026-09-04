@@ -15,7 +15,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from gum_code.agent import run_agent
+from gum_code.agent import build_agent_tool_schemas, run_agent
+from gum_code.context import compact_history, latest_user_request
 from gum_code.config import (
     Settings,
     default_user_config_path,
@@ -25,7 +26,7 @@ from gum_code.config import (
     save_user_settings,
     validate_provider_settings,
 )
-from gum_code.events import RichEventRenderer, create_console
+from gum_code.events import RichEventRenderer, context_percentage, create_console
 from gum_code.permissions.terminal import make_interactive_approval
 from gum_code.session import (
     LEGACY_SESSION_VERSION,
@@ -58,6 +59,7 @@ from gum_code.user_state import (
 
 KNOWN_COMMANDS = {
     "/help",
+    "/compact",
     "/workspace",
     "/new",
     "/resume",
@@ -558,14 +560,15 @@ class InteractiveRuntime:
 
     def _save(self, messages: list[dict[str, object]]) -> None:
         self._ensure_session()
-        self.messages = copy.deepcopy(messages)
+        candidate = copy.deepcopy(messages)
         save_session(
             self.session_path,
             self.workspace,
             self.settings.model,
-            self.messages,
+            candidate,
             self.title,
         )
+        self.messages = candidate
 
     def load_locked(self, path: Path) -> None:
         destination = Path(path).resolve()
@@ -737,6 +740,55 @@ class InteractiveRuntime:
         self.title = ""
         self.first_task = None
 
+    def compact_context(self) -> bool:
+        if not self.messages:
+            self.console.print(Text("当前 Session 没有可整理的上下文。", style="yellow"))
+            return False
+        try:
+            active_request = latest_user_request(self.messages)
+        except RuntimeError:
+            self.console.print(Text("上下文整理失败，已保留原 Session。", style="red"))
+            return False
+        if not active_request:
+            self.console.print(Text("当前 Session 没有可整理的用户请求。", style="yellow"))
+            return False
+        tools = build_agent_tool_schemas(
+            allow_run_command=bool(getattr(self.args, "allow_run_command", False)),
+            allow_subagent=bool(getattr(self.args, "allow_subagent", True)),
+        )
+        before_tokens = self.token_counter.count_request(self.messages, tools)
+        renderer = RichEventRenderer(self.console, verbose=self.verbose)
+        renderer("context_summary", {"step": 1})
+        try:
+            compacted, _ = compact_history(
+                self.client,
+                self.settings.model,
+                self.workspace,
+                self.messages,
+                active_request,
+                tools=tools,
+                token_counter=self.token_counter,
+                max_context_tokens=self.args.max_context_tokens,
+            )
+            after_tokens = self.token_counter.count_request(compacted, tools)
+            self._save(compacted)
+        except Exception:
+            renderer.close()
+            self.console.print(Text("上下文整理失败，已保留原 Session。", style="red"))
+            return False
+        else:
+            renderer(
+                "context_compacted",
+                {
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "max_tokens": self.args.max_context_tokens,
+                },
+            )
+            return True
+        finally:
+            renderer.close()
+
     def show_status(self, *, show_title: bool = False) -> None:
         table = Table(show_header=False, box=None)
         table.add_row("Workspace", Text(_safe_terminal_text(self.workspace)))
@@ -747,6 +799,16 @@ class InteractiveRuntime:
         table.add_row("Session", Text(_safe_terminal_text(session)))
         table.add_row("Sandbox", "on" if self.args.allow_run_command else "off")
         table.add_row("Subagent", "on" if self.args.allow_subagent else "off")
+        if self.messages:
+            tools = build_agent_tool_schemas(
+                allow_run_command=self.args.allow_run_command,
+                allow_subagent=self.args.allow_subagent,
+            )
+            used_tokens = self.token_counter.count_request(self.messages, tools)
+            percent = context_percentage(used_tokens, self.args.max_context_tokens)
+        else:
+            percent = 0
+        table.add_row("上下文占用", f"{percent}%")
         if show_title:
             self.console.print(Text("Gum Code", style="bold cyan"))
         self.console.print(Panel(table, border_style="cyan"))
@@ -881,6 +943,8 @@ def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
         return True
     if command == "/help":
         runtime.console.print(Text(" ".join(sorted(KNOWN_COMMANDS))))
+    elif command == "/compact":
+        runtime.compact_context()
     elif command == "/status":
         runtime.show_status()
     elif command == "/verbose":

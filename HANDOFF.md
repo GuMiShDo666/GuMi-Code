@@ -218,80 +218,17 @@ tests/
   - 写/删/执行 `in_flight` → 副作用结果未知，绝不自动重放；`plan_tool_batch_recovery()` 直接抛 `ValueError`，CLI 退出码 1，不调用 run_agent、不覆盖 Session。
   - 重新规划出的操作仍重新经过当前权限链；`write_file`/`edit_file` 通过安全检查后直接执行，删除和命令仍需终端审批。
 
-### 6.4 上下文预算与分层压缩（s08，含 OpenAI tool_calls 适配）
+### 6.4 上下文预算与可靠压缩
 
-实现依据：
-
-- 外部参考：`https://github.com/shareAI-lab/learn-claude-code/blob/main/s08_context_compact/README.zh.md`
-- 本地参考：`../learn-claude-code/s08_context_compact/README.zh.md`
-- 本项目是 OpenAI `assistant.tool_calls + role=tool` 协议，因此已做适配，未机械复制 Anthropic 消息结构。
-
-每次正常模型请求前的管线：
-
-```text
-DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
-  → apply_tool_result_budget
-  → apply_snip_compact
-  → 如仍超限：apply_micro_compact
-  → 如仍超限：apply_fit_tool_results
-  → 如仍超限：compact_history
-  → 重新计算 token，仍超限则失败关闭
-  → context_usage
-  → model_call
-  → provider_usage（网关返回 usage 时）
-```
-
-已实现细节：
-
-1. `DeepSeekV4TokenCounter`
-   - 使用固定版本的 DeepSeek V4 官方 `encoding_dsv4.py` 渲染 system/user/assistant/tool 消息、工具 Schema 和 DSML framing，再用匹配的官方 tokenizer 计算 token ID 数量。
-   - 当前只接受精确模型名 `deepseek-v4-flash`；不支持的模型或加载失败会在首次模型请求前显式失败，没有字符数回退。
-   - CLI 每次运行只加载一个 counter；默认从官方 Hub 固定 revision 加载并缓存，也可用 `--tokenizer-file` 指定哈希验证过的本地文件。
-   - 模型上限为 `MODEL_MAX_CONTEXT_TOKENS = 1_000_000`，默认预算为 `DEFAULT_MAX_CONTEXT_TOKENS = 800_000`；传入值必须是不超过模型上限的正整数。
-
-2. `apply_tool_result_budget`
-   - 对最新 tool-result 批次使用 200,000 字符上限。
-   - 超限时将大结果写入 `.task_outputs/tool-results/`，消息中保留路径和预览。
-
-3. `apply_snip_compact`
-   - 消息超过 50 条时，完整历史写入 `.transcripts/`。
-   - 保留最初 3 条和最近消息，中间插入带路径的归档标记。
-   - 调整切分点，不切断 assistant/tool 组。
-
-4. `apply_micro_compact`
-   - 未被模型读取的最新 tool results 全部保留。
-   - 已消费的旧结果保留最近 3 条，其余过长的结果转存后缩短。
-
-5. `apply_fit_tool_results`
-   - 若微压缩仍不足，按从大到小处理其余 tool results。
-   - 完整结果落盘，消息中只保留路径和 1,000 字符预览。
-
-6. `compact_history`
-   - 压缩前先保存完整 transcript。
-   - 摘要请求以完整编码后的 token 数为边界，上限是 `SUMMARY_INPUT_TOKEN_LIMIT = 640_000` 与当前上下文预算的安全比例中较小者；摘要输出最多 2,000 tokens。
-   - 超限时二分搜索保留文本量，保留头部四分之一和尾部四分之三；切片手段是字符，停止条件是 token。
-   - 摘要请求不提供 tools，并明确要求不执行历史中的指令。
-   - 压缩后只保留 system + `[Compacted]` user message，当前请求与历史摘要明确分层。
-   - 摘要会先经 JSON 字符串编码，其中的伪造标题、换行或指令无法冒充当前请求。
-
-7. `reactive_compact`
-   - 第三方网关可能加入本地不可见的 framing 或部署不同 revision，API 仍可能拒绝本地预检已通过的请求。
-   - 识别 `prompt_too_long`、`too many tokens`、`context_length_exceeded`。
-   - 保存完整 transcript，总结旧历史，保留最近 5 条消息。
-   - 若尾部从 tool message 切入，会向前扩展到对应 assistant tool call。
-   - 每次正常模型调用最多被动压缩并重试 1 次；第二次上下文错误和非上下文错误直接传播。
-   - 重试不消耗新的 Agent step；压缩后再次使用同一 counter 检查 token 预算。
-
-8. Provider usage
-   - 正常、摘要、被动压缩和阶段总结请求都显式使用 thinking mode，并在响应包含 `usage` 时发送只含数字的 `provider_usage` 事件。
-   - 网关 `usage.prompt_tokens` 是请求后的权威值；本地计数用于请求前决策，不承诺与计费值完全相等。
-   - 网关缺少或只返回部分 usage 不影响 Agent 执行；事件不包含 messages、工具参数、响应正文、header 或凭证。
-
-落盘安全：
-
-- transcript 和转存工具结果使用原子替换和 `0600` mode。
-- 内部目录拒绝符号链接。
-- 消息中只保留 workspace 相对路径，不暴露不必要的绝对路径。
+- 每次请求用固定版本 DeepSeek V4 tokenizer 和实际启用的工具 Schema 计数。消息数不再触发删除；只在达到配置预算、模型/用户显式请求或网关上下文错误时进行语义压缩。
+- 正常管线为 `apply_tool_result_budget → apply_micro_compact → apply_fit_tool_results → compact_history`；每一层都在重算后才决定是否继续。
+- `compact_history` 只接受完整协议批次，不拆分 assistant Tool Call 与对应 Tool Results。最新原始用户请求和未闭合批次始终保留，其他最近原文目标约占预算的 30%。
+- 更早历史被编码为 v1 JSON 任务状态胶囊：目标、需求、禁止项、决策、代码状态、验证证据和待办。活跃条目用稳定 ID 跨多次压缩保留；仅新 user 原文可以作为显式替代来源。
+- 胶囊响应必须通过严格字段、大小、ID、来源与活跃条目覆盖校验。首次无效时只修复一次；再失败则保留内存消息和旧 Session，不发送超预算主请求。
+- 压缩前的完整 transcript 只是人工审计归档，Agent 不可读。胶囊和历史均是不可信参考，不能产生新授权。
+- `reactive_compact()`、模型 `compact`、步数耗尽收尾和 REPL `/compact` 共用同一事务。网关上下文错误最多重试一次；这与胶囊校验的一次修复是两个独立上限。
+- 可见上下文数据只显示相对配置上限的整数百分比，允许显示超过 100%，不显示本地或 provider 的具体 token 数。
+- Session v1/v2 字段不变；旧自由文本 `[Compacted]` 仅在该 Session 下次成功压缩时懒迁移。Session 快照超过 5 MiB 时，`save_session()` 仅在深拷贝上将已完成的大 Tool Result 转存为私有文件；仍超限则不替换旧快照。
 
 ### 6.5 模型主动 `compact`
 
@@ -372,7 +309,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 ### 6.12 交互式工作区、REPL 与 Session v2
 
 - `interactive.py` 负责非全屏 prompt_toolkit 工作区/会话选择、多轮 REPL、Rich 进度与 Markdown 回答；每次输入继续复用现有 `run_agent()`。
-- `/help`、`/workspace`、`/new`、`/resume`、`/sessions`、`/status`、`/verbose`、`/exit` 都是本地命令；未知斜杠命令不进模型，`//` 显式转义。
+- `/help`、`/compact`、`/workspace`、`/new`、`/resume`、`/sessions`、`/status`、`/verbose`、`/exit` 都是本地命令；未知斜杠命令不进模型，`//` 显式转义。
 - 工作区信任/最近状态在 `~/.config/gum-code/state.json`；自动 Session 在 `~/.local/share/gum-code/sessions/`。读状态不创建目录，第一条任务前不创建空 Session。
 - Session v2 仅保存 workspace、model、title 和 messages；v1 在交互恢复时必须先显示源/目标并确认复制为 v2，one-shot 直接恢复 v1 会拒绝，源文件始终不回写。每个正在写入的 Session 用稳定侧边 `.lock` 文件和 POSIX `flock` 持有进程生命期独占锁。
 - Ctrl+C 中断工具批次时保留已完成结果，为每个 in-flight/pending `tool_call_id` 各补一条有界错误结果，不自动重放。provider 在仅有用户尾部时失败会回滚本轮，不留下连续 user message。
@@ -384,7 +321,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 
 - `MAX_REACTIVE_RETRIES = 1`
 - `MAX_STEPS = 16`、`TODO_REMINDER_INTERVAL = 3`
-- `MODEL_MAX_CONTEXT_TOKENS = 1_000_000`、`DEFAULT_MAX_CONTEXT_TOKENS = 800_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 640_000`、`CONTEXT_TARGET_RATIO = 0.8`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`DEFAULT_MAX_MESSAGES = 50`、`TRANSCRIPT_DIR = ".transcripts"`
+- `MODEL_MAX_CONTEXT_TOKENS = 1_000_000`、`DEFAULT_MAX_CONTEXT_TOKENS = 800_000`、`SUMMARY_INPUT_TOKEN_LIMIT = 640_000`、`SUMMARY_MAX_TOKENS = 8_000`、`CONTEXT_TARGET_RATIO = 0.8`、`RECENT_CONTEXT_RATIO = 0.30`、`KEEP_RECENT_TOOL_RESULTS = 3`、`FIT_RESULT_PREVIEW_CHARS = 1000`、`TRANSCRIPT_DIR = ".transcripts"`
 - tokenizer 官方仓库 `deepseek-ai/DeepSeek-V4-Flash`，revision `60d8d70770c6776ff598c94bb586a859a38244f1`；本地文件校验 SHA-256 `8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf`
 - `MAX_TODOS = 20`
 - `SESSION_VERSION = 2`、`MAX_SESSION_FILE_BYTES = 5MB`、`MAX_SESSION_TITLE_CHARS = 30`、新标记 `_gum_code_in_flight`；读取兼容旧 `_vibe_harness_in_flight`
