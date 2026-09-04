@@ -13,7 +13,6 @@ dependencies = [
     "python-dotenv>=1",
     "prompt-toolkit>=3.0.52,<4",
     "rich>=14,<15",
-    "tokenizers>=0.22,<0.24",
 ]
 
 

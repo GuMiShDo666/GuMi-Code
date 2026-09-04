@@ -13,7 +13,7 @@ from gum_code.context import (
     reactive_compact,
 )
 from gum_code.events import AgentEventCallback
-from gum_code.token_counting import RequestTokenCounter
+from gum_code.token_counting import RequestTokenCounter, TokenBudgetTracker
 from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
 from gum_code.tools.registry import (
     PostToolUseCallback,
@@ -400,6 +400,7 @@ def run_read_only_subagent(
         COMPACT_TOOL_SCHEMA,
         SUBMIT_REPORT_TOOL_SCHEMA,
     ]
+    token_budget = TokenBudgetTracker(token_counter)
     allowed_read_tools = set(READ_ONLY_TOOL_NAMES)
     calls_used = 0
     main_step = 0
@@ -476,11 +477,15 @@ def run_read_only_subagent(
                         "max_calls": MAX_SUBAGENT_PROVIDER_CALLS,
                     },
                 )
-                used_tokens = token_counter.count_request(
+                used_tokens = token_budget.count_request(
                     messages, child_tool_schemas
                 )
-                messages, _ = apply_tool_result_budget(messages, artifact_root)
-                used_tokens = token_counter.count_request(
+                messages, persisted = apply_tool_result_budget(
+                    messages, artifact_root
+                )
+                if persisted:
+                    token_budget.reset()
+                used_tokens = token_budget.count_request(
                     messages, child_tool_schemas
                 )
 
@@ -488,30 +493,35 @@ def run_read_only_subagent(
                     target_tokens = int(
                         max_context_tokens * CONTEXT_TARGET_RATIO
                     )
-                    messages, _ = apply_micro_compact(
+                    messages, shortened = apply_micro_compact(
                         messages,
                         artifact_root,
                         child_tool_schemas,
-                        token_counter,
+                        token_budget,
                         target_tokens,
                     )
-                    used_tokens = token_counter.count_request(
+                    if shortened:
+                        token_budget.reset()
+                    used_tokens = token_budget.count_request(
                         messages, child_tool_schemas
                     )
                     if used_tokens >= max_context_tokens:
-                        messages, _ = apply_fit_tool_results(
+                        messages, fitted = apply_fit_tool_results(
                             messages,
                             artifact_root,
                             child_tool_schemas,
-                            token_counter,
+                            token_budget,
                             target_tokens,
                         )
-                        used_tokens = token_counter.count_request(
+                        if fitted:
+                            token_budget.reset()
+                        used_tokens = token_budget.count_request(
                             messages, child_tool_schemas
                         )
 
                 if used_tokens >= max_context_tokens:
                     try:
+                        token_budget.reset()
                         messages, _ = compact_history(
                             client,
                             model,
@@ -519,7 +529,7 @@ def run_read_only_subagent(
                             messages,
                             description,
                             tools=child_tool_schemas,
-                            token_counter=token_counter,
+                            token_counter=token_budget,
                             max_context_tokens=max_context_tokens,
                             before_request=before_summary_request,
                         )
@@ -532,7 +542,7 @@ def run_read_only_subagent(
                             "child_model_error",
                             "The subagent context request failed.",
                         )
-                    used_tokens = token_counter.count_request(
+                    used_tokens = token_budget.count_request(
                         messages, child_tool_schemas
                     )
 
@@ -578,6 +588,7 @@ def run_read_only_subagent(
                         )
                     reactive_retries += 1
                     try:
+                        token_budget.reset()
                         messages, _ = reactive_compact(
                             client,
                             model,
@@ -585,7 +596,7 @@ def run_read_only_subagent(
                             messages,
                             description,
                             tools=child_tool_schemas,
-                            token_counter=token_counter,
+                            token_counter=token_budget,
                             max_context_tokens=max_context_tokens,
                             before_request=before_summary_request,
                         )
@@ -600,6 +611,7 @@ def run_read_only_subagent(
                         )
                     continue
 
+                token_budget.observe(response, messages, child_tool_schemas)
                 try:
                     message = response.choices[0].message
                     messages.append(_assistant_message_to_dict(message))
@@ -743,6 +755,7 @@ def run_read_only_subagent(
 
                 if compact_requested:
                     try:
+                        token_budget.reset()
                         messages, _ = compact_history(
                             client,
                             model,
@@ -750,7 +763,7 @@ def run_read_only_subagent(
                             messages,
                             description,
                             tools=child_tool_schemas,
-                            token_counter=token_counter,
+                            token_counter=token_budget,
                             max_context_tokens=max_context_tokens,
                             active_compaction_completed=True,
                             before_request=before_summary_request,
