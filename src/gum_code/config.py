@@ -11,7 +11,16 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values
 from openai import OpenAI
 
-CONFIG_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+REQUIRED_CONFIG_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
+CONFIG_KEYS = (*REQUIRED_CONFIG_KEYS, "LLM_CONTEXT_WINDOW")
+BUILTIN_CONTEXT_WINDOWS = {"deepseek-v4-flash": 1_000_000}
+CONTEXT_WINDOW_FIELDS = (
+    "context_window",
+    "context_length",
+    "max_context_length",
+    "max_model_len",
+)
+DEFAULT_CONTEXT_BUDGET_RATIO = 0.8
 
 
 @dataclass(frozen=True)
@@ -19,6 +28,7 @@ class Settings:
     api_key: str
     base_url: str
     model: str
+    context_window: int | None = None
 
 
 def default_user_config_path() -> Path:
@@ -66,14 +76,22 @@ def load_settings(
         for key in CONFIG_KEYS:
             if key not in effective and key in legacy_values:
                 effective[key] = legacy_values[key].strip()
-    for key in CONFIG_KEYS:
+    for key in REQUIRED_CONFIG_KEYS:
         if key not in effective:
             raise RuntimeError(f"{key} 未设置，请配置 Gum Code provider")
+
+    context_window = None
+    if "LLM_CONTEXT_WINDOW" in effective:
+        try:
+            context_window = int(effective["LLM_CONTEXT_WINDOW"])
+        except ValueError:
+            raise RuntimeError("LLM_CONTEXT_WINDOW 必须是正整数") from None
 
     settings = Settings(
         api_key=effective["LLM_API_KEY"],
         base_url=effective["LLM_BASE_URL"],
         model=effective["LLM_MODEL"],
+        context_window=context_window,
     )
     validate_settings(settings)
     return settings
@@ -87,17 +105,20 @@ def legacy_public_defaults(path: Path) -> tuple[str, str]:
 def has_complete_legacy_settings(path: Path) -> bool:
     try:
         values = _read_values(Path(path))
-        if any(key not in values for key in CONFIG_KEYS):
+        if any(key not in values for key in REQUIRED_CONFIG_KEYS):
             return False
         validate_settings(
             Settings(
                 values["LLM_API_KEY"],
                 values["LLM_BASE_URL"],
                 values["LLM_MODEL"],
+                int(values["LLM_CONTEXT_WINDOW"])
+                if "LLM_CONTEXT_WINDOW" in values
+                else None,
             )
         )
         return True
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -109,6 +130,15 @@ def validate_settings(settings: Settings) -> None:
         raise RuntimeError("LLM_BASE_URL 必须是有效的 HTTP(S) URL")
     if not settings.model.strip():
         raise RuntimeError("LLM_MODEL 未设置")
+    if (
+        settings.context_window is not None
+        and (
+            isinstance(settings.context_window, bool)
+            or not isinstance(settings.context_window, int)
+            or settings.context_window <= 0
+        )
+    ):
+        raise RuntimeError("LLM_CONTEXT_WINDOW 必须是正整数")
 
 
 def save_user_settings(path: Path, settings: Settings) -> None:
@@ -124,6 +154,11 @@ def save_user_settings(path: Path, settings: Settings) -> None:
             f"LLM_API_KEY={json.dumps(settings.api_key)}\n",
             f"LLM_BASE_URL={json.dumps(settings.base_url)}\n",
             f"LLM_MODEL={json.dumps(settings.model)}\n",
+            *(
+                (f"LLM_CONTEXT_WINDOW={settings.context_window}\n",)
+                if settings.context_window is not None
+                else ()
+            ),
         )
     )
     descriptor, temporary = tempfile.mkstemp(
@@ -166,3 +201,73 @@ def validate_provider_settings(
         raise
     except Exception:
         raise RuntimeError("无法验证 provider 配置") from None
+
+
+def _positive_context_window(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not value.isdigit():
+            return None
+        value = int(value)
+    if isinstance(value, int) and value > 0:
+        return value
+    return None
+
+
+def _provider_context_window(client: object, model: str) -> int | None:
+    try:
+        with_options = getattr(client, "with_options", None)
+        metadata_client = (
+            with_options(timeout=10, max_retries=0)
+            if callable(with_options)
+            else client
+        )
+        metadata = metadata_client.models.retrieve(model)  # type: ignore[attr-defined]
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:
+        return None
+
+    extra = getattr(metadata, "model_extra", None)
+    for field in CONTEXT_WINDOW_FIELDS:
+        value = getattr(metadata, field, None)
+        if value is None and isinstance(extra, dict):
+            value = extra.get(field)
+        if (parsed := _positive_context_window(value)) is not None:
+            return parsed
+    return None
+
+
+def resolve_context_window(settings: Settings, client: object) -> int:
+    """Resolve capacity without exposing provider metadata failures."""
+    validate_settings(settings)
+    if settings.context_window is not None:
+        return settings.context_window
+    discovered = _provider_context_window(client, settings.model)
+    if discovered is not None:
+        return discovered
+    builtin = BUILTIN_CONTEXT_WINDOWS.get(settings.model)
+    if builtin is not None:
+        return builtin
+    raise RuntimeError("无法确定模型上下文窗口，请设置 LLM_CONTEXT_WINDOW")
+
+
+def resolve_context_budget(
+    context_window: int,
+    requested_tokens: int | None,
+) -> int:
+    """Return the 80% default or validate a caller-selected lower budget."""
+    window = _positive_context_window(context_window)
+    if window is None:
+        raise RuntimeError("模型上下文窗口必须是正整数")
+    if requested_tokens is None:
+        return max(1, int(window * DEFAULT_CONTEXT_BUDGET_RATIO))
+    requested = _positive_context_window(requested_tokens)
+    if requested is None:
+        raise RuntimeError("max_context_tokens 必须是正整数")
+    if requested > window:
+        raise RuntimeError(
+            f"max_context_tokens 不能超过模型上下文窗口 {window}"
+        )
+    return requested

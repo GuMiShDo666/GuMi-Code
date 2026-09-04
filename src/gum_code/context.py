@@ -10,7 +10,7 @@ from pathlib import Path
 
 from gum_code.token_counting import RequestTokenCounter
 
-MODEL_MAX_CONTEXT_TOKENS = 1_000_000
+# Kept for direct library callers; CLI requests derive their budget per model.
 DEFAULT_MAX_CONTEXT_TOKENS = 800_000
 
 TOOL_RESULT_BATCH_CHAR_LIMIT = 200_000

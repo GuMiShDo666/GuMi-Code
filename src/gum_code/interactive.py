@@ -2,7 +2,7 @@
 
 import copy
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -25,6 +25,8 @@ from gum_code.config import (
     has_complete_legacy_settings,
     legacy_public_defaults,
     load_settings,
+    resolve_context_budget,
+    resolve_context_window,
     save_user_settings,
     validate_provider_settings,
 )
@@ -392,6 +394,23 @@ def ensure_interactive_settings(
                 default_model=model,
             )
     return settings
+
+
+def _prompt_context_window(
+    console: Console,
+    *,
+    text_prompt: Callable[..., str] = prompt,
+) -> int:
+    while True:
+        try:
+            value = int(text_prompt("模型上下文窗口 token 数：").strip())
+        except (KeyboardInterrupt, EOFError):
+            raise RuntimeError("已取消模型上下文窗口配置") from None
+        except ValueError:
+            value = 0
+        if value > 0:
+            return value
+        console.print(Text("模型上下文窗口必须是正整数。", style="red"))
 
 
 def sanitize_title(value: object) -> str:
@@ -1098,6 +1117,18 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
                         console,
                     )
                 )
+        client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        try:
+            context_window = resolve_context_window(settings, client)
+        except RuntimeError:
+            context_window = _prompt_context_window(console)
+            settings = replace(settings, context_window=context_window)
+            save_user_settings(default_user_config_path(), settings)
+        else:
+            settings = replace(settings, context_window=context_window)
+        args.max_context_tokens = resolve_context_budget(
+            context_window, args.max_context_tokens
+        )
 
         command_sandbox = None
         if args.allow_run_command:
@@ -1105,10 +1136,10 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
         runtime = InteractiveRuntime(
             workspace=workspace,
             settings=settings,
-            client=OpenAI(api_key=settings.api_key, base_url=settings.base_url),
+            client=client,
             console=console,
             args=args,
-            token_counter=load_token_counter(settings.model, args.tokenizer_file),
+            token_counter=load_token_counter(settings.model),
             command_sandbox=command_sandbox,
             session_path=session_path or explicit_new_path,
             lease=initial_lease,

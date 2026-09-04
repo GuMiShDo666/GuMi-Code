@@ -5,11 +5,11 @@ from pathlib import Path
 from openai import OpenAI, OpenAIError
 
 from gum_code.agent import MAX_STEPS, run_agent
-from gum_code.context import (
-    DEFAULT_MAX_CONTEXT_TOKENS,
-    MODEL_MAX_CONTEXT_TOKENS,
+from gum_code.config import (
+    load_settings,
+    resolve_context_budget,
+    resolve_context_window,
 )
-from gum_code.config import load_settings
 from gum_code.events import create_console, print_terminal_event
 from gum_code.interactive import (
     run_interactive,
@@ -39,15 +39,6 @@ def _positive_int(value: str) -> int:
     return parsed
 
 
-def _context_tokens(value: str) -> int:
-    parsed = _positive_int(value)
-    if parsed > MODEL_MAX_CONTEXT_TOKENS:
-        raise argparse.ArgumentTypeError(
-            f"不能超过模型上限 {MODEL_MAX_CONTEXT_TOKENS}"
-        )
-    return parsed
-
-
 def _is_interactive_terminal() -> bool:
     return bool(sys.stdin.isatty() and sys.stdout.isatty())
 
@@ -64,13 +55,9 @@ def parse_args(
         help=f"最多执行的正模型步骤数（默认 {MAX_STEPS}）",
     )
     parser.add_argument(
-        "--max-context-tokens", type=_context_tokens,
-        default=DEFAULT_MAX_CONTEXT_TOKENS,
-        help="模型请求允许的最大上下文 token 数",
-    )
-    parser.add_argument(
-        "--tokenizer-file", type=Path, default=None,
-        help="本地 DeepSeek V4 tokenizer.json；未指定时从固定版本加载并缓存",
+        "--max-context-tokens", type=_positive_int,
+        default=None,
+        help="模型请求预算；默认使用模型上下文窗口的 80%%",
     )
     parser.add_argument(
         "--allow-run-command", action="store_true",
@@ -171,13 +158,17 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             )
 
         settings = load_settings()
-        token_counter = load_token_counter(settings.model, args.tokenizer_file)
+        if resumed is not None and resumed.model != settings.model:
+            raise ValueError("Session model 与当前 provider 不匹配")
         client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
+        context_window = resolve_context_window(settings, client)
+        max_context_tokens = resolve_context_budget(
+            context_window, args.max_context_tokens
+        )
+        token_counter = load_token_counter(settings.model)
         initial_messages = None
         title = ""
         if resumed is not None:
-            if resumed.model != settings.model:
-                raise ValueError("Session model 与当前 provider 不匹配")
             title = resumed.title
             if resumed.pending_user_message is not None:
                 initial_messages = resumed.messages[:-1]
@@ -213,7 +204,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             workspace=args.workspace,
             user_query=args.task,
             max_steps=args.max_steps,
-            max_context_tokens=args.max_context_tokens,
+            max_context_tokens=max_context_tokens,
             allow_run_command=args.allow_run_command,
             approval_callback=request_terminal_approval,
             event_callback=print_terminal_event,

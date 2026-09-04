@@ -18,8 +18,7 @@
 
 - Git.
 - Python 3.11 or newer.
-- An OpenAI-compatible model service that supports Chat Completions and `tool_calls`. The tokenizer currently accepts only the exact model name `deepseek-v4-flash`.
-- Network access for the first model request so Gum Code can download and cache the pinned DeepSeek V4 tokenizer. You can also pass a downloaded, hash-matched `tokenizer.json` with `--tokenizer-file`.
+- An OpenAI-compatible model service that supports Chat Completions and `tool_calls`.
 - Docker only if you enable the optional `run_command` tool.
 
 ### macOS / Linux
@@ -52,7 +51,9 @@ The Python version selected by `py -3` must be 3.11 or newer. These commands hav
 
 - `LLM_API_KEY`
 - `LLM_BASE_URL`
-- `LLM_MODEL`, which must currently be `deepseek-v4-flash`
+- `LLM_MODEL`
+
+Gum Code first asks the provider for the model context window. If the provider does not supply it and there is no built-in value for that model, interactive mode asks for `LLM_CONTEXT_WINDOW`; non-interactive mode reports a configuration error.
 
 The wizard hides the API key while you type. It saves the settings to your user configuration directory only after a minimal model request succeeds.
 
@@ -68,7 +69,7 @@ Run this command in Windows PowerShell:
 Copy-Item .env.example .env
 ```
 
-Edit `.env` and replace every example value. Do not commit a real API key. Gum Code loads each setting in this order: process environment, user configuration, then `.env` in the startup directory.
+Edit `.env` and replace every example value. If the provider cannot report its context window, uncomment `LLM_CONTEXT_WINDOW` in `.env.example` and set the model's positive integer limit. Do not commit a real API key. Gum Code loads each setting in this order: process environment, user configuration, then `.env` in the startup directory.
 
 ### Run a one-shot task
 
@@ -90,6 +91,8 @@ Windows PowerShell:
 
 `--workspace` must point to an existing directory. Non-interactive terminals also require a task string.
 
+The request budget defaults to 80% of the resolved model context window. Use `--max-context-tokens` for a smaller positive integer budget; a value above the model window is a configuration error. A window discovered from provider metadata is used only for the current run and is not written to configuration.
+
 ### Optional: enable the Docker command sandbox
 
 Start Docker and prepare a trusted local image first. Gum Code does not pull or build an image for you.
@@ -108,7 +111,7 @@ On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`. The term
 | Area | Current capability | Boundary |
 | --- | --- | --- |
 | Runtime | Provides workspace selection, a persistent REPL, and one-shot CLI tasks. | Gum Code is a local single-user harness. It does not provide a web service or multi-user authorization. |
-| Model protocol | Calls OpenAI-compatible Chat Completions with `tool_calls`. | The local tokenizer accepts only the exact model name `deepseek-v4-flash`. Third-party gateways may enforce a different context limit. |
+| Model protocol | Calls OpenAI-compatible Chat Completions with `tool_calls`, using a generic local estimate calibrated by valid provider `usage` values for token budgeting. | Only text messages and tool definitions are counted. A manual model window is required when a third-party gateway does not expose one. |
 | Files and Git | Lists, reads, searches, writes, and edits files, and reads Git status and diffs. | File tools stay inside the workspace. Deletion requires approval. Path, symlink, sensitive filename, and size rules apply. |
 | Command execution | Runs one argv command in a network-disabled Docker container after explicit enablement. | `run_command` is disabled by default and always requires approval. The container can modify the workspace and cannot protect against malicious images, a compromised Docker daemon, or runtime vulnerabilities. |
 | Context | Bounds tool results, performs structured compaction, supports manual compaction, and retries once after a context-length error. The terminal reports only the percentage of the configured context limit. | Compaction state belongs to the current Session. Gum Code does not provide cross-Session long-term memory. |

@@ -18,8 +18,7 @@
 
 - Git。
 - Python 3.11 或更高版本。
-- 一个支持 Chat Completions 和 `tool_calls` 的 OpenAI 兼容模型服务。当前 tokenizer 仅支持精确模型名 `deepseek-v4-flash`。
-- 首次模型请求需要网络下载并缓存固定版本的 DeepSeek V4 tokenizer。也可以通过 `--tokenizer-file` 使用已下载且哈希匹配的 `tokenizer.json`。
+- 一个支持 Chat Completions 和 `tool_calls` 的 OpenAI 兼容模型服务。
 - Docker 只在启用可选的 `run_command` 工具时需要。
 
 ### macOS / Linux
@@ -52,7 +51,9 @@ py -3 -m venv .venv
 
 - `LLM_API_KEY`
 - `LLM_BASE_URL`
-- `LLM_MODEL`，当前必须是 `deepseek-v4-flash`
+- `LLM_MODEL`
+
+Gum Code 会优先从 provider 的模型元数据获取上下文窗口。如果 provider 不提供且本地没有该模型的内置值，交互模式会请你输入 `LLM_CONTEXT_WINDOW`；非交互模式会直接报配置错误。
 
 向导会隐藏 API Key 输入，并在一次最小模型请求验证成功后才将配置保存到用户配置目录。
 
@@ -68,7 +69,7 @@ Windows PowerShell 执行：
 Copy-Item .env.example .env
 ```
 
-编辑 `.env` 并替换所有示例值。不要提交真实的 API Key。配置优先级为：进程环境变量 > 用户配置 > 启动目录中的 `.env`。
+编辑 `.env` 并替换所有示例值。当 provider 无法提供上下文窗口时，取消 `.env.example` 中 `LLM_CONTEXT_WINDOW` 的注释并填入模型的正整数上限。不要提交真实的 API Key。配置优先级为：进程环境变量 > 用户配置 > 启动目录中的 `.env`。
 
 ### 执行一次性任务
 
@@ -90,6 +91,8 @@ Windows PowerShell：
 
 `--workspace` 必须指向已存在的目录。非交互终端还必须同时提供任务文本。
 
+请求预算默认为已解析模型上下文窗口的 80%。可用 `--max-context-tokens` 设置更小的正整数预算；超过模型窗口会直接报配置错误。从 provider 自动识别的窗口只用于当前运行，不会写入配置。
+
 ### 可选：启用 Docker 命令沙箱
 
 先启动 Docker，并在本地准备一个可信的镜像。Gum Code 不会自动 pull 或 build 镜像。
@@ -108,7 +111,7 @@ Windows 用户将可执行文件替换为 `.\.venv\Scripts\gum-code.exe`。模�
 | 范围 | 当前能力 | 边界 |
 | --- | --- | --- |
 | 运行方式 | 支持工作区选择、持久 REPL 和一次性 CLI 任务。 | 它是本地单用户 Harness，没有 Web 服务或多用户权限系统。 |
-| 模型协议 | 调用 OpenAI 兼容的 Chat Completions 和 `tool_calls`。 | 本地 tokenizer 仅接受精确模型名 `deepseek-v4-flash`；第三方网关可能使用不同的上下文上限。 |
+| 模型协议 | 调用 OpenAI 兼容的 Chat Completions 和 `tool_calls`，通过通用本地估算和有效的 provider `usage` 校准管理 token 预算。 | 仅统计文本消息和工具定义；第三方网关不提供模型窗口时需要手动配置。 |
 | 文件与 Git | 支持列出、读取、搜索、写入和编辑文件，以及查看 Git 状态和差异。 | 文件工具只能访问工作区；删除需要审批；路径、符号链接、敏感文件名和大小受到限制。 |
 | 命令执行 | 显式启用后，可以在断网 Docker 容器中运行单个 argv 命令。 | `run_command` 默认关闭，且每次都需要审批。容器仍可修改工作区，也不能防御恶意镜像、Docker daemon 入侵或运行时漏洞。 |
 | 上下文 | 支持工具结果裁剪、结构化压缩、主动压缩和超限后的单次重试；终端只显示上下文占上限的百分比。 | 压缩摘要属于当前 Session，不是跨 Session 长期 Memory。 |
