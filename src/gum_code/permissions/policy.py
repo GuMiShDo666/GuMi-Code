@@ -1,3 +1,5 @@
+"""Classify tool risk and enforce denials that approval cannot override."""
+
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -35,6 +37,7 @@ def decide_permission(
     tool_name: str,
     risk: ToolRisk | None,
 ) -> PermissionResult:
+    """Map registered risk to allow, ask, or deny without collecting approval."""
     if risk is None:
         return PermissionResult(
             decision=PermissionDecision.DENY,
@@ -120,6 +123,7 @@ def check_hard_deny(
     tool_name: str,
     arguments: dict[str, object],
 ) -> PermissionResult | None:
+    """Return a non-overridable denial for prohibited command argv."""
     if tool_name != "run_command":
         return None
 

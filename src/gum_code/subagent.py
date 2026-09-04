@@ -1,3 +1,5 @@
+"""Run bounded synchronous research behind a read-only subagent boundary."""
+
 import json
 import tempfile
 from pathlib import Path
@@ -389,6 +391,10 @@ def run_read_only_subagent(
     pre_tool_use_callback: PreToolUseCallback | None = None,
     post_tool_use_callback: PostToolUseCallback | None = None,
 ) -> str:
+    """Run one read-only child that completes only through a validated report.
+
+    Provider calls are bounded and context artifacts stay outside the workspace.
+    """
     child_tool_schemas = [
         *get_read_only_tool_schemas(),
         COMPACT_TOOL_SCHEMA,
@@ -427,6 +433,7 @@ def run_read_only_subagent(
     emit("subagent_start", {"max_calls": MAX_SUBAGENT_PROVIDER_CALLS})
     try:
         workspace_root = workspace.resolve()
+        # Keep child context artifacts outside the real workspace write boundary.
         temp_parent = Path(tempfile.gettempdir()).resolve()
         if temp_parent.is_relative_to(workspace_root):
             return error_result(

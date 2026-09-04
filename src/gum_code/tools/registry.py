@@ -1,3 +1,5 @@
+"""Register model tools and dispatch them through ordered safety gates."""
+
 import copy
 import json
 from collections.abc import Callable
@@ -494,6 +496,10 @@ def execute_tool(
     command_sandbox: DockerSandboxConfig | None = None,
     before_execute_callback: BeforeExecuteCallback | None = None,
 ) -> str:
+    """Dispatch one tool through policy, preflight, hook, and approval gates.
+
+    The execution callback fires after all gates and before handler dispatch.
+    """
     handler = ALL_TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Unknown tool: {tool_name}"
@@ -506,6 +512,7 @@ def execute_tool(
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
 
+    # Hard denials run before approval and cannot be overridden by it.
     if check_hard_deny(tool_name, arguments) is not None:
         return f"Error: Tool denied by policy: {tool_name}"
 
@@ -549,6 +556,7 @@ def execute_tool(
         if not approved:
             return ToolExecutionDenied(f"{DENIED_BY_USER_PREFIX}{tool_name}")
 
+    # Announce execution only after every gate has passed.
     if before_execute_callback is not None:
         before_execute_callback()
 

@@ -1,3 +1,5 @@
+"""Render structured Agent events with bounded, sanitized terminal text."""
+
 import os
 import re
 from collections.abc import Callable
@@ -170,6 +172,7 @@ def _truncate(text: str) -> str:
 
 
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
+    """Render one event while sanitizing model-derived terminal text."""
     progress_text = {
         "request_prepare": "准备中...",
         "subagent_prepare": "准备中...",

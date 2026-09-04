@@ -1,3 +1,5 @@
+"""Manage private XDG workspace trust, recents, and the Session catalog."""
+
 import json
 import os
 import secrets
@@ -122,6 +124,7 @@ def _publish_private_file(path: Path, content: bytes) -> bool:
             os.fsync(file.fileno())
             os.fchmod(file.fileno(), 0o600)
         try:
+            # A hard link publishes atomically without replacing a concurrent winner.
             os.link(temporary, path)
         except FileExistsError:
             return False
@@ -259,6 +262,7 @@ def _existing_directory(value: object) -> str | None:
 
 
 def load_user_state(path: Path | None = None) -> UserState:
+    """Load valid existing workspace paths, treating malformed state as empty."""
     target = state_path() if path is None else Path(path)
     if not target.exists() or target.is_symlink() or not target.is_file():
         return UserState()
@@ -324,6 +328,7 @@ def _atomic_private_json(path: Path, value: dict[str, object]) -> None:
 
 
 def save_user_state(state: UserState, path: Path | None = None) -> None:
+    """Atomically persist user state in a private file."""
     target = state_path() if path is None else Path(path)
     _atomic_private_json(
         target,

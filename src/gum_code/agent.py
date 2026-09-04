@@ -1,3 +1,5 @@
+"""Orchestrate the model loop while preserving tool and snapshot ordering."""
+
 import copy
 import json
 from collections.abc import Callable
@@ -292,6 +294,7 @@ def _finalize_after_step_budget(
     event_callback: AgentEventCallback | None,
     message_snapshot_callback: MessageSnapshotCallback | None,
 ) -> str:
+    """Request one tool-free answer after safely fitting the final context."""
     if event_callback is not None:
         event_callback("request_prepare", {"step": final_step})
 
@@ -481,6 +484,10 @@ def run_agent(
     command_sandbox: DockerSandboxConfig | None = None,
     allow_subagent: bool = True,
 ) -> str:
+    """Run a bounded model/tool loop with recoverable protocol snapshots.
+
+    Tool handlers run only after applicable policy, hook, and approval gates.
+    """
     if event_callback is not None:
         event_callback("request_prepare", {"step": 1})
 
@@ -598,6 +605,7 @@ def run_agent(
         if step > 1 and event_callback is not None:
             event_callback("request_prepare", {"step": step})
 
+        # Keep this degradation order so summaries see already-bounded Tool Results.
         used_tokens = token_counter.count_request(messages, agent_tool_schemas)
 
         messages, persisted = apply_tool_result_budget(messages, workspace)
@@ -855,6 +863,7 @@ def run_agent(
 
             tool_name = tool_call.function.name
 
+            # Do not emit execution progress until each branch's gates pass.
             if tool_name == "task" and index != first_task_index:
                 result = error_result(
                     "delegation_limit",
