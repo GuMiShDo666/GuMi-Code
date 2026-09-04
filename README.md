@@ -9,7 +9,7 @@
 - 支持文件读写、搜索、Git 状态检查和可选的 Docker 隔离命令执行。
 - 读取、`write_file` 和 `edit_file` 直接允许；删除仍需审批；命令执行默认不向模型开放。
 - 支持 Todo 跟踪和可配置的 Agent step 上限；Todo 数量与单项长度有硬上限。
-- 支持工具结果裁剪、历史摘要、模型主动 `compact` 和上下文超限后的单次压缩重试。
+- 支持工具结果裁剪、结构化任务状态压缩、模型主动 `compact` 和上下文超限后的单次压缩重试。
 - 使用固定版本的 DeepSeek V4 官方 tokenizer 和消息编码器计算请求 token，不再用字符数估算上下文。
 - 支持工作区选择、持久 REPL、自动 Session 保存和中断工具批次的安全恢复。
 - 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop` 四类进程内 Hooks。
@@ -92,7 +92,7 @@ TTY 中直接执行 `gum-code` 会打开工作区选择器；也可直接指定�
   --workspace "/absolute/path/to/workspace"
 ```
 
-REPL 支持 `/help`、`/workspace`、`/new`、`/resume`、`/sessions`、
+REPL 支持 `/help`、`/compact`、`/workspace`、`/new`、`/resume`、`/sessions`、
 `/status`、`/verbose` 和 `/exit`。`//text` 会将 `/text` 作为普通任务发送；
 未知斜杠命令不会进入模型。Enter 提交，Escape 后按 Enter（部分终端为
 Alt/Meta+Enter）插入换行，Up/Down 仅浏览当前进程内的输入历史。
@@ -113,6 +113,8 @@ Ctrl+C 取消编辑或中断当前轮，Ctrl+D 正常退出。
 撤销工作区信任或从最近列表移除都不会删除真实目录或 Session。
 交互恢复 v1 Session 时也会显示源和目标，确认复制为 v2 后才继续；
 源文件保持不变。one-shot 不能完成这次交互确认，因此会拒绝直接恢复 v1。
+当 Session 快照因已完成的大型工具结果超过 5 MiB 时，会先将完整结果私有转存到工作区，
+Session 只保留有界预览与相对引用；仍无法容纳时会保留旧快照并明确失败。
 
 ### 执行任务
 
@@ -241,12 +243,13 @@ one-shot 的新任务一律优先，不会静默重发旧输入。
 - `--max-steps` 限制一次运行允许的正常工具型模型步数，默认为 `16`。步数耗尽后，Harness 会额外发起一次「禁止调用工具」的阶段总结请求；上下文压缩和超限重试的模型请求不计入这个上限。
 - `--max-context-tokens` 默认为 `800000`，且不能超过
   DeepSeek-V4-Flash 的 `1000000` token 模型上限。历史摘要输入最多使用
-  `640000` tokens；计数仍包含实际启用的工具 Schema。
+  `640000` tokens，结构化胶囊输出最多 `8000` tokens；计数仍包含实际
+  启用的工具 Schema。
 - 旧参数 `--max-context-chars` 已移除，不会把旧值静默解释成 token。迁移时请显式改用 `--max-context-tokens` 并重新确认预算值；同样的数字并不代表同样的容量。
 - 无网络或需要完全可复现时，加上 `--tokenizer-file /absolute/path/tokenizer.json`。
 - Subagent 的 4 次委派与 8 次子请求为固定安全/成本上限，当前不提供 CLI 调节。
 
-终端会在网关返回 `usage` 时显示服务端 prompt token 与本地预检值。
+终端只显示当前上下文占配置上限的整数百分比；`/status` 和压缩前后反馈也不显示具体 token 数。
 `1M` 是官方模型能力，不证明第三方网关接受同样的上限；网关拒绝会直接显示为错误，
 Gum Code 不会改用字符估算或静默降低预算。
 

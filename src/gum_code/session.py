@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover - POSIX is the supported runtime.
     fcntl = None
 
 from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
+from gum_code.context import LARGE_RESULT_CHAR_LIMIT, persist_tool_result
 
 SESSION_VERSION = 2
 LEGACY_SESSION_VERSION = 1
@@ -99,16 +100,46 @@ def save_session(
     if any(ord(character) < 32 for character in title):
         raise ValueError("Session title 不允许控制字符")
 
-    data = {
+    data: dict[str, object] = {
         "version": SESSION_VERSION,
         "workspace": str(Path(workspace).resolve()),
         "model": model,
         "title": title,
-        "messages": messages,
+        "messages": copy.deepcopy(messages),
     }
 
     content = json.dumps(data, ensure_ascii=False, indent=2)
     content_size = len(content.encode("utf-8"))
+    if content_size > MAX_SESSION_FILE_BYTES:
+        fitted_messages = data["messages"]
+        assert isinstance(fitted_messages, list)
+        candidates = sorted(
+            (
+                message
+                for message in fitted_messages
+                if isinstance(message, dict)
+                and message.get("role") == "tool"
+                and not _has_in_flight_marker(message)
+                and isinstance(message.get("content"), str)
+                and len(message["content"]) > LARGE_RESULT_CHAR_LIMIT
+                and not str(message["content"]).startswith("<persisted-output>")
+            ),
+            key=lambda message: len(str(message["content"])),
+            reverse=True,
+        )
+        for message in candidates:
+            try:
+                message["content"] = persist_tool_result(
+                    workspace,
+                    message.get("tool_call_id", "result"),
+                    str(message["content"]),
+                )
+            except OSError:
+                continue
+            content = json.dumps(data, ensure_ascii=False, indent=2)
+            content_size = len(content.encode("utf-8"))
+            if content_size <= MAX_SESSION_FILE_BYTES:
+                break
     if content_size > MAX_SESSION_FILE_BYTES:
         raise ValueError(
             f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限"

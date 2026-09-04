@@ -16,6 +16,36 @@ AgentEventCallback = Callable[
 ]
 
 
+def context_percentage(used_tokens: object, max_tokens: object) -> int:
+    if (
+        isinstance(used_tokens, bool)
+        or not isinstance(used_tokens, int)
+        or used_tokens < 0
+        or isinstance(max_tokens, bool)
+        or not isinstance(max_tokens, int)
+        or max_tokens <= 0
+    ):
+        raise ValueError("上下文用量必须是有效的非负整数")
+    return (used_tokens * 100 + max_tokens // 2) // max_tokens
+
+
+def _usage_text(payload: dict[str, object]) -> str | None:
+    try:
+        percent = context_percentage(payload.get("used_tokens"), payload.get("max_tokens"))
+    except ValueError:
+        return None
+    return f"上下文占用：{percent}%"
+
+
+def _compacted_text(payload: dict[str, object]) -> str | None:
+    try:
+        before = context_percentage(payload.get("before_tokens"), payload.get("max_tokens"))
+        after = context_percentage(payload.get("after_tokens"), payload.get("max_tokens"))
+    except ValueError:
+        return None
+    return f"上下文占用：{before}% → {after}%"
+
+
 def _safe_inline(value: object) -> str:
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", "", str(value))
 
@@ -111,7 +141,8 @@ class RichEventRenderer:
             self.console.print(Text(f"Subagent：{status}"))
             return
         if event_type == "context_compacted":
-            self.console.print(Text("已整理上下文。", style="cyan"))
+            text = _compacted_text(payload)
+            self.console.print(Text(text or "已整理上下文。", style="cyan"))
             return
         if event_type == "tool_batch_recovery":
             self.console.print(
@@ -119,17 +150,12 @@ class RichEventRenderer:
             )
             return
         if self.verbose and event_type == "context_usage":
-            self.console.print(
-                Text(
-                    "Context: "
-                    f"{payload.get('used_tokens')} / {payload.get('max_tokens')} tokens"
-                )
-            )
+            text = _usage_text(payload)
+            if text is not None:
+                self.console.print(Text(text))
             return
         if self.verbose and event_type == "provider_usage":
-            prompt_tokens = payload.get("prompt_tokens")
-            if prompt_tokens is not None:
-                self.console.print(Text(f"Provider prompt tokens: {prompt_tokens}"))
+            return
 
     def render_answer(self, answer: str) -> None:
         self._stop_status()
@@ -188,53 +214,8 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         return
 
     if event_type == "context_compacted":
-        stage = payload.get("stage")
-        before_tokens = payload.get("before_tokens")
-        after_tokens = payload.get("after_tokens")
-        if stage == "snip_compact":
-            print(
-                "── 上下文整理（snip_compact）："
-                f"归档 {payload.get('archived_messages')} 条消息到 "
-                f"{payload.get('transcript')}，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        elif stage == "micro_compact":
-            print(
-                "── 上下文整理（micro_compact）："
-                f"缩短 {payload.get('shortened_results')} 条结果，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        elif stage == "fit_tool_results":
-            print(
-                "── 上下文整理（fit_tool_results）："
-                f"收纳 {payload.get('fitted_results')} 条结果，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        elif stage == "compact_history":
-            print(
-                "── 上下文整理（compact_history）："
-                f"摘要写入 {payload.get('transcript')}，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        elif stage == "reactive_compact":
-            print(
-                "── 上下文整理（reactive_compact，第 "
-                f"{payload.get('retry')} 次重试）："
-                f"摘要写入 {payload.get('transcript')}，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        elif stage == "active_compact":
-            print(
-                "── 上下文整理（active_compact）："
-                f"摘要写入 {payload.get('transcript')}，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
-        else:
-            print(
-                "── 上下文整理（tool_result_budget）："
-                f"转存 {payload.get('persisted_results')} 条结果，"
-                f"{before_tokens} → {after_tokens} tokens ──"
-            )
+        text = _compacted_text(payload)
+        print(f"── {text or '已整理上下文。'} ──")
         return
 
     if event_type == "tool_batch_recovery":
@@ -254,20 +235,12 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         return
 
     if event_type == "context_usage":
-        print(
-            "── 上下文："
-            f"{payload['used_tokens']} / {payload['max_tokens']} tokens ──"
-        )
+        text = _usage_text(payload)
+        if text is not None:
+            print(f"── {text} ──")
         return
 
     if event_type == "provider_usage":
-        prompt_tokens = payload.get("prompt_tokens")
-        local_tokens = payload.get("local_prompt_tokens")
-        if prompt_tokens is not None:
-            print(
-                "── 服务端 Token："
-                f"prompt={prompt_tokens}，本地={local_tokens} ──"
-            )
         return
 
     if event_type == "tool_call":

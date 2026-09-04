@@ -6,7 +6,6 @@ from gum_code.context import (
     CONTEXT_TARGET_RATIO,
     apply_fit_tool_results,
     apply_micro_compact,
-    apply_snip_compact,
     apply_tool_result_budget,
     compact_history,
     reactive_compact,
@@ -474,12 +473,11 @@ def run_read_only_subagent(
                     messages, child_tool_schemas
                 )
                 messages, _ = apply_tool_result_budget(messages, artifact_root)
-                messages, _, _ = apply_snip_compact(messages, artifact_root)
                 used_tokens = token_counter.count_request(
                     messages, child_tool_schemas
                 )
 
-                if used_tokens > max_context_tokens:
+                if used_tokens >= max_context_tokens:
                     target_tokens = int(
                         max_context_tokens * CONTEXT_TARGET_RATIO
                     )
@@ -493,7 +491,7 @@ def run_read_only_subagent(
                     used_tokens = token_counter.count_request(
                         messages, child_tool_schemas
                     )
-                    if used_tokens > max_context_tokens:
+                    if used_tokens >= max_context_tokens:
                         messages, _ = apply_fit_tool_results(
                             messages,
                             artifact_root,
@@ -505,7 +503,7 @@ def run_read_only_subagent(
                             messages, child_tool_schemas
                         )
 
-                if used_tokens > max_context_tokens:
+                if used_tokens >= max_context_tokens:
                     try:
                         messages, _ = compact_history(
                             client,
@@ -513,6 +511,7 @@ def run_read_only_subagent(
                             artifact_root,
                             messages,
                             description,
+                            tools=child_tool_schemas,
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
                             before_request=before_summary_request,
@@ -530,7 +529,7 @@ def run_read_only_subagent(
                         messages, child_tool_schemas
                     )
 
-                if used_tokens > max_context_tokens:
+                if used_tokens >= max_context_tokens:
                     return error_result(
                         "child_model_error",
                         "The subagent context exceeds its token limit.",
@@ -578,6 +577,7 @@ def run_read_only_subagent(
                             artifact_root,
                             messages,
                             description,
+                            tools=child_tool_schemas,
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
                             before_request=before_summary_request,
@@ -742,6 +742,7 @@ def run_read_only_subagent(
                             artifact_root,
                             messages,
                             description,
+                            tools=child_tool_schemas,
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
                             active_compaction_completed=True,
