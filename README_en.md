@@ -106,6 +106,16 @@ Start Docker and prepare a trusted local image first. Gum Code does not pull or 
 
 On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`. The terminal asks for approval each time the model requests a command.
 
+## Skills and Sessions
+
+Use `$skill-name` in a task to load a Codex user Skill before the first model request. Gum Code scans only direct children of `$CODEX_HOME/skills` (or `~/.codex/skills` when unset). Explicit Skills stay sticky in the current Session, with a maximum of three active Skills per task and three sticky names per Session. The root Agent can also use `find_skills`, `load_skill`, and `read_skill_resource`; automatic loads last only for the current task. `/skills` lists, disables, or clears sticky names without printing Skill content.
+
+Skills are read-only instructions and text resources. Gum Code does not execute or install Skill scripts, and Subagents receive neither Skill tools nor Skill content.
+
+New Sessions use private append-only v3 JSONL event logs with the existing 5 MiB total-file limit. The first resume/import of v1 or v2 creates a migrated copy while preserving the source. `/sessions` can show a structural audit timeline without prompts, arguments, results, or Skill bodies, and can fork an independently replayable child from a completed turn. Context compaction appends a replacement projection without deleting earlier events.
+
+Within one model step, adjacent executions of the same tool produce one terminal progress line while every call, result, and Session event remains distinct.
+
 ## Current capabilities and boundaries
 
 | Area | Current capability | Boundary |
@@ -115,7 +125,8 @@ On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`. The term
 | Files and Git | Lists, reads, searches, writes, and edits files, and reads Git status and diffs. | File tools stay inside the workspace. Deletion requires approval. Path, symlink, sensitive filename, and size rules apply. |
 | Command execution | Runs one argv command in a network-disabled Docker container after explicit enablement. | `run_command` is disabled by default and always requires approval. The container can modify the workspace and cannot protect against malicious images, a compromised Docker daemon, or runtime vulnerabilities. |
 | Context | Bounds tool results, performs structured compaction, supports manual compaction, and retries once after a context-length error. The terminal reports only the percentage of the configured context limit. | Compaction state belongs to the current Session. Gum Code does not provide cross-Session long-term memory. |
-| Sessions | Saves interactive history and supports listing, renaming, resuming, and safely closing interrupted tool batches. | You must inspect current state when an in-flight tool may have produced side effects. The harness does not replay that call automatically. |
+| Sessions | Stores interactive history in v3 JSONL event logs and supports structural audit, completed-turn forks, listing, renaming, resuming, and safe interrupted-batch closure. | Each file is capped at 5 MiB. Start or fork a Session at the limit. Inspect current state when an in-flight tool may have produced side effects; the harness does not replay it. |
+| Skills | Reuses the top-level Codex user Skill library through explicit sticky activation and progressive root-Agent reads. | `.system`, plugin, and project Skills are excluded. Scripts never execute, and Subagents receive no Skills. |
 | Subagents | A root run can start up to four synchronous, single-level, read-only subagents. Each subagent can make up to eight model requests. | Subagents cannot write, run commands, execute in parallel, delegate recursively, or persist between runs. |
 | Hooks | The Python API supports `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. | Hooks support synchronous in-process registration only. Gum Code has no hook configuration file, external-command hooks, async callbacks, or automatic discovery. |
-| Not implemented | Gum Code currently has no Skills, MCP, Goal Loop, long-term memory, parallel or recursive subagents, or persistent child agents. | Treat these entries as current boundaries, not commitments for a future release. |
+| Not implemented | Gum Code currently has no MCP, Goal Loop, long-term memory, parallel or recursive subagents, or persistent child agents. | Treat these entries as current boundaries, not commitments for a future release. |

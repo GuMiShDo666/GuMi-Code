@@ -18,6 +18,24 @@ AgentEventCallback = Callable[
 ]
 
 
+def deduplicate_tool_execution(
+    callback: AgentEventCallback,
+) -> AgentEventCallback:
+    """Hide adjacent same-tool progress within one model step only."""
+    last_key: tuple[object, object] | None = None
+
+    def emit(event_type: str, payload: dict[str, object]) -> None:
+        nonlocal last_key
+        if event_type == "tool_execution":
+            key = (payload.get("step"), payload.get("tool_name"))
+            if key == last_key:
+                return
+            last_key = key
+        callback(event_type, payload)
+
+    return emit
+
+
 def context_percentage(used_tokens: object, max_tokens: object) -> int:
     if (
         isinstance(used_tokens, bool)
