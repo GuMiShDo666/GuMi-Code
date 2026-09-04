@@ -10,7 +10,11 @@ from gum_code.config import (
     resolve_context_budget,
     resolve_context_window,
 )
-from gum_code.events import create_console, print_terminal_event
+from gum_code.events import (
+    create_console,
+    deduplicate_tool_execution,
+    print_terminal_event,
+)
 from gum_code.interactive import (
     run_interactive,
     select_workspace,
@@ -18,15 +22,18 @@ from gum_code.interactive import (
 )
 from gum_code.permissions.terminal import request_terminal_approval
 from gum_code.session import (
-    LEGACY_SESSION_VERSION,
+    SESSION_VERSION,
     SessionLease,
+    append_session_event,
     build_tool_batch_recovery_messages,
     load_session,
+    migrate_session_to_v3,
     save_session,
 )
+from gum_code.skills import SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
-from gum_code.user_state import migrate_legacy_user_data
+from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
 
 
 def _positive_int(value: str) -> int:
@@ -72,8 +79,8 @@ def parse_args(
         help="run_command 使用的本地可信 Docker 镜像；Harness 不会自动拉取",
     )
     session_group = parser.add_mutually_exclusive_group()
-    session_group.add_argument("--session-file", help="Session 保存路径（JSON 文件）")
-    session_group.add_argument("--resume-session", help="要恢复的 Session JSON")
+    session_group.add_argument("--session-file", help="Session 保存路径（JSONL 文件）")
+    session_group.add_argument("--resume-session", help="要恢复的 Session JSON/JSONL")
     parser.add_argument("task", nargs="?", help="要执行的任务描述")
 
     args = parser.parse_args(argv)
@@ -131,11 +138,24 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 allow_incomplete_tool_batch=True,
                 allow_pending_user_tail=True,
             )
-            if resumed.version == LEGACY_SESSION_VERSION:
-                raise ValueError(
-                    "one-shot 不能直接恢复 v1 Session；"
-                    "请先在交互模式的 /sessions 中显式导入"
-                )
+            if resumed.version != SESSION_VERSION:
+                destination = allocate_session_path()
+                destination_lease = SessionLease(destination).acquire()
+                try:
+                    migrate_session_to_v3(args.resume_session, destination)
+                    migrated = load_session(
+                        destination,
+                        allow_incomplete_tool_batch=True,
+                        allow_pending_user_tail=True,
+                    )
+                except BaseException:
+                    destination_lease.release()
+                    raise
+                assert lease is not None
+                lease.release()
+                lease = destination_lease
+                session_file = destination
+                resumed = migrated
             if args.workspace is None:
                 args.workspace = resumed.workspace.resolve()
             elif resumed.workspace.resolve() != args.workspace:
@@ -168,11 +188,19 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         token_counter = load_token_counter(settings.model)
         initial_messages = None
         title = ""
+        sticky_skills: tuple[str, ...] = ()
         if resumed is not None:
             title = resumed.title
+            sticky_skills = resumed.sticky_skills
             if resumed.pending_user_message is not None:
                 initial_messages = resumed.messages[:-1]
                 print_terminal_event("pending_user_discarded", {})
+                assert session_file is not None
+                append_session_event(
+                    session_file,
+                    "session.recovered",
+                    {"kind": "pending_user_discarded"},
+                )
             elif resumed.tool_batch_state is not None:
                 initial_messages = build_tool_batch_recovery_messages(resumed.messages)
                 print_terminal_event(
@@ -182,8 +210,43 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                         "pending": len(resumed.tool_batch_state.pending_call_ids),
                     },
                 )
+                assert session_file is not None
+                append_session_event(
+                    session_file,
+                    "session.recovered",
+                    {"kind": "tool_batch_closed"},
+                )
             else:
                 initial_messages = resumed.messages
+
+        pending_activations: list[SkillSnapshot] = []
+
+        def flush_activations() -> None:
+            if session_file is None or not Path(session_file).exists():
+                return
+            while pending_activations:
+                snapshot = pending_activations[0]
+                append_session_event(
+                    session_file,
+                    "skill.activated",
+                    {
+                        "name": snapshot.name,
+                        "display_name": snapshot.display_name,
+                        "source": snapshot.source,
+                        "sha256": snapshot.sha256,
+                        "content": snapshot.content,
+                    },
+                )
+                pending_activations.pop(0)
+
+        def record_activation(snapshot: SkillSnapshot) -> None:
+            pending_activations.append(snapshot)
+            flush_activations()
+
+        skill_runtime = SkillRuntime(
+            sticky_names=sticky_skills,
+            activation_callback=record_activation if session_file is not None else None,
+        )
 
         message_snapshot_callback = None
         if session_file is not None:
@@ -191,7 +254,15 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             model = settings.model
 
             def message_snapshot_callback(messages: list[dict[str, object]]) -> None:
-                save_session(session_file, workspace, model, messages, title)
+                save_session(
+                    session_file,
+                    workspace,
+                    model,
+                    messages,
+                    title,
+                    skill_runtime.sticky_names,
+                )
+                flush_activations()
 
         kwargs: dict[str, object] = {}
         if command_sandbox is not None:
@@ -207,10 +278,11 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             max_context_tokens=max_context_tokens,
             allow_run_command=args.allow_run_command,
             approval_callback=request_terminal_approval,
-            event_callback=print_terminal_event,
+            event_callback=deduplicate_tool_execution(print_terminal_event),
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
             token_counter=token_counter,
+            skill_runtime=skill_runtime,
             **kwargs,
         )
         return 0

@@ -30,18 +30,29 @@ from gum_code.config import (
     save_user_settings,
     validate_provider_settings,
 )
-from gum_code.events import RichEventRenderer, context_percentage, create_console
+from gum_code.events import (
+    RichEventRenderer,
+    context_percentage,
+    create_console,
+    deduplicate_tool_execution,
+)
 from gum_code.permissions.terminal import make_interactive_approval
 from gum_code.session import (
-    LEGACY_SESSION_VERSION,
     MAX_SESSION_TITLE_CHARS,
+    SESSION_VERSION,
     SessionData,
     SessionLease,
+    append_session_event,
     build_interrupted_turn_messages,
     build_tool_batch_recovery_messages,
+    completed_session_turns,
+    fork_session,
     load_session,
+    migrate_session_to_v3,
     save_session,
+    session_audit_entries,
 )
+from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import (
@@ -68,6 +79,7 @@ KNOWN_COMMANDS = {
     "/new",
     "/resume",
     "/sessions",
+    "/skills",
     "/status",
     "/verbose",
     "/exit",
@@ -522,24 +534,18 @@ def _copy_legacy_session_for_resume(
     destination = allocate_session_path()
     console.print(
         Text(
-            "v1 Session 需要先复制导入：\n"
+            "旧版 Session 需要先复制导入为 v3 JSONL：\n"
             f"源：{_safe_terminal_text(source.resolve())}\n"
             f"目标：{_safe_terminal_text(destination.resolve())}",
             style="yellow",
         )
     )
     if not _confirm("复制导入后恢复？"):
-        raise RuntimeError("v1 Session 未导入，源文件保持不变")
+        raise RuntimeError("旧版 Session 未导入，源文件保持不变")
 
     destination_lease = SessionLease(destination).acquire()
     try:
-        save_session(
-            destination,
-            data.workspace,
-            data.model,
-            data.messages,
-            data.title,
-        )
+        migrate_session_to_v3(source, destination)
         copied = load_session(
             destination,
             allow_incomplete_tool_batch=True,
@@ -567,6 +573,9 @@ class InteractiveRuntime:
     title: str = ""
     first_task: str | None = None
     verbose: bool = False
+    sticky_skills: tuple[str, ...] = ()
+    skill_runtime: SkillRuntime | None = None
+    pending_skill_activations: list[SkillSnapshot] | None = None
 
     def close(self) -> None:
         if self.lease is not None:
@@ -588,8 +597,40 @@ class InteractiveRuntime:
             self.settings.model,
             candidate,
             self.title,
+            (
+                self.skill_runtime.sticky_names
+                if self.skill_runtime is not None
+                else self.sticky_skills
+            ),
         )
         self.messages = candidate
+        self._flush_skill_activations()
+
+    def _record_skill_activation(self, snapshot: SkillSnapshot) -> None:
+        if self.pending_skill_activations is None:
+            self.pending_skill_activations = []
+        self.pending_skill_activations.append(snapshot)
+        if self.session_path is not None and self.session_path.exists():
+            self._flush_skill_activations()
+
+    def _flush_skill_activations(self) -> None:
+        if self.session_path is None or not self.session_path.exists():
+            return
+        pending = self.pending_skill_activations or []
+        while pending:
+            snapshot = pending[0]
+            append_session_event(
+                self.session_path,
+                "skill.activated",
+                {
+                    "name": snapshot.name,
+                    "display_name": snapshot.display_name,
+                    "source": snapshot.source,
+                    "sha256": snapshot.sha256,
+                    "content": snapshot.content,
+                },
+            )
+            pending.pop(0)
 
     def load_locked(self, path: Path) -> None:
         """Validate and lock a destination before releasing the current Session."""
@@ -608,7 +649,7 @@ class InteractiveRuntime:
             destination_workspace = data.workspace.resolve()
             if destination_workspace != self.workspace:
                 trust_workspace(destination_workspace, self.console)
-            if data.version == LEGACY_SESSION_VERSION:
+            if data.version != SESSION_VERSION:
                 destination, data, lease = _copy_legacy_session_for_resume(
                     destination,
                     data,
@@ -623,6 +664,7 @@ class InteractiveRuntime:
         self.session_path = destination.resolve()
         self.lease = lease
         self.title = data.title
+        self.sticky_skills = data.sticky_skills
         self.first_task = next(
             (
                 str(message.get("content"))
@@ -650,11 +692,23 @@ class InteractiveRuntime:
                     else latest[:-1]
                 )
             self._save(recovered)
+            assert self.session_path is not None
+            append_session_event(
+                self.session_path,
+                "session.recovered",
+                {"kind": "interrupted_turn"},
+            )
             if not any(message.get("role") == "user" for message in recovered):
                 self.first_task = None
         except (IndexError, ValueError):
             if completed is not None:
                 self._save(completed)
+                assert self.session_path is not None
+                append_session_event(
+                    self.session_path,
+                    "session.recovered",
+                    {"kind": "last_completed_projection"},
+                )
 
     def _recover_loaded_data(self, data: SessionData) -> list[dict[str, object]]:
         if data.pending_user_message is not None:
@@ -667,6 +721,12 @@ class InteractiveRuntime:
             resend = _confirm("重新发送这条消息？")
             base = copy.deepcopy(data.messages[:-1])
             if resend:
+                assert self.session_path is not None
+                append_session_event(
+                    self.session_path,
+                    "session.recovered",
+                    {"kind": "pending_user_resend"},
+                )
                 self.messages = base
                 self.run_turn(data.pending_user_message)
                 return self.messages or base
@@ -676,6 +736,13 @@ class InteractiveRuntime:
                 data.model,
                 base,
                 data.title,
+                data.sticky_skills,
+            )
+            assert self.session_path is not None
+            append_session_event(
+                self.session_path,
+                "session.recovered",
+                {"kind": "pending_user_discarded"},
             )
             return base
         if data.tool_batch_state is not None:
@@ -686,6 +753,13 @@ class InteractiveRuntime:
                 data.model,
                 recovered,
                 data.title,
+                data.sticky_skills,
+            )
+            assert self.session_path is not None
+            append_session_event(
+                self.session_path,
+                "session.recovered",
+                {"kind": "tool_batch_closed"},
             )
             self.console.print(
                 Text("已安全闭合上次中断的工具批次。", style="yellow")
@@ -700,6 +774,10 @@ class InteractiveRuntime:
             self.first_task = task
         completed = copy.deepcopy(self.messages)
         latest = copy.deepcopy(self.messages)
+        self.skill_runtime = SkillRuntime(
+            sticky_names=self.sticky_skills,
+            activation_callback=self._record_skill_activation,
+        )
 
         def snapshot(messages: list[dict[str, object]]) -> None:
             nonlocal latest
@@ -708,6 +786,7 @@ class InteractiveRuntime:
             self._save(messages)
 
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
+        event_callback = deduplicate_tool_execution(renderer)
         kwargs: dict[str, object] = {}
         if self.command_sandbox is not None:
             kwargs["command_sandbox"] = self.command_sandbox
@@ -725,10 +804,11 @@ class InteractiveRuntime:
                 approval_callback=make_interactive_approval(
                     self.workspace, self.console
                 ),
-                event_callback=renderer,
+                event_callback=event_callback,
                 message_snapshot_callback=snapshot,
                 initial_messages=self.messages,
                 token_counter=self.token_counter,
+                skill_runtime=self.skill_runtime,
                 **kwargs,
             )
         except KeyboardInterrupt:
@@ -746,6 +826,8 @@ class InteractiveRuntime:
             self._recover_failed_turn(latest, completed)
             raise
         finally:
+            if self.skill_runtime is not None:
+                self.sticky_skills = self.skill_runtime.sticky_names
             renderer.close()
 
         renderer.render_answer(answer)
@@ -763,6 +845,9 @@ class InteractiveRuntime:
         self.session_path = None
         self.title = ""
         self.first_task = None
+        self.sticky_skills = ()
+        self.skill_runtime = None
+        self.pending_skill_activations = None
 
     def compact_context(self) -> bool:
         if not self.messages:
@@ -895,6 +980,8 @@ def _manage_sessions(runtime: InteractiveRuntime) -> None:
                 _safe_terminal_text(entry.title),
                 options=[
                     ("view", "查看元数据"),
+                    ("audit", "查看安全审计时间线"),
+                    ("fork", "从已完成 turn 创建 fork"),
                     ("resume", "恢复"),
                     ("rename", "重命名"),
                     ("delete", "删除"),
@@ -904,12 +991,55 @@ def _manage_sessions(runtime: InteractiveRuntime) -> None:
         except (KeyboardInterrupt, EOFError):
             continue
         if operation == "view":
+            data = load_session(
+                entry.path,
+                allow_incomplete_tool_batch=True,
+                allow_pending_user_tail=True,
+            )
+            lineage = (
+                f"\nparent={data.parent_session_id}@{data.parent_seq}"
+                if data.parent_session_id is not None
+                else ""
+            )
             runtime.console.print(
                 Text(
                     f"{display_path(entry.path)}\n"
-                    f"{display_path(entry.workspace)}\n{entry.title}"
+                    f"{display_path(entry.workspace)}\n{entry.title}{lineage}"
                 )
             )
+        elif operation == "audit":
+            table = Table("seq", "time", "type", "status", "tool")
+            for item in session_audit_entries(entry.path):
+                table.add_row(
+                    str(item["seq"]),
+                    _safe_terminal_text(item["time"]),
+                    _safe_terminal_text(item["type"]),
+                    _safe_terminal_text(item["status"]),
+                    _safe_terminal_text(item["tool_name"] or ""),
+                )
+            runtime.console.print(table)
+        elif operation == "fork":
+            turns = completed_session_turns(entry.path)
+            if not turns:
+                runtime.console.print(Text("没有可 fork 的已完成 turn。", style="yellow"))
+                continue
+            try:
+                boundary = choice(
+                    "选择已完成 turn",
+                    options=[
+                        (seq, f"seq {seq} — {_safe_terminal_text(time)}")
+                        for seq, time in turns
+                    ],
+                )
+            except (KeyboardInterrupt, EOFError):
+                continue
+            destination = allocate_session_path()
+            lease = SessionLease(destination).acquire()
+            try:
+                fork_session(entry.path, boundary, destination)
+            finally:
+                lease.release()
+            runtime.console.print(Text(f"已创建 fork：{display_path(destination)}"))
         elif operation == "resume":
             if entry.workspace != runtime.workspace:
                 runtime.console.print(
@@ -953,12 +1083,51 @@ def _manage_sessions(runtime: InteractiveRuntime) -> None:
                 runtime.console.print(
                     Text("不能删除当前正在使用的 Session。", style="red")
                 )
-            elif _confirm("仅删除该 Session JSON？"):
+            elif _confirm("仅删除该 Session 文件？"):
                 lease = SessionLease(entry.path).acquire()
                 try:
                     delete_session(entry.path)
                 finally:
                     lease.release()
+
+
+def _manage_skills(runtime: InteractiveRuntime) -> None:
+    while True:
+        names = runtime.sticky_skills
+        options: list[tuple[object, str]] = [("back", "返回")]
+        options.extend((name, f"禁用 {name}") for name in names)
+        if names:
+            options.append(("clear", "清除全部 sticky Skills"))
+        runtime.console.print(
+            Text("Sticky Skills: " + (", ".join(names) if names else "无"))
+        )
+        try:
+            action = choice("Skills 管理", options=options)
+        except (KeyboardInterrupt, EOFError):
+            return
+        if action == "back":
+            return
+        updated = () if action == "clear" else tuple(
+            name for name in names if name != action
+        )
+        runtime.sticky_skills = updated
+        if runtime.skill_runtime is not None:
+            runtime.skill_runtime.sticky_names = updated
+        if runtime.messages:
+            cleaned = copy.deepcopy(runtime.messages)
+            for message in cleaned:
+                content = message.get("content")
+                if message.get("role") != "system" or not isinstance(content, str):
+                    continue
+                start = content.find(SKILL_SECTION_START)
+                end = content.find(SKILL_SECTION_END)
+                if start >= 0 and end >= start:
+                    message["content"] = (
+                        content[:start].rstrip()
+                        + content[end + len(SKILL_SECTION_END) :]
+                    ).strip()
+                break
+            runtime._save(cleaned)
 
 
 def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
@@ -994,6 +1163,8 @@ def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
             runtime.show_status()
     elif command == "/sessions":
         _manage_sessions(runtime)
+    elif command == "/skills":
+        _manage_skills(runtime)
     elif command == "/workspace":
         selected = select_workspace(runtime.console)
         if selected is not None:
@@ -1106,9 +1277,9 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
                 raise ValueError("Session workspace 不匹配")
             if data.model != settings.model:
                 raise ValueError("Session model 与当前 provider 不匹配")
-            if data.version == LEGACY_SESSION_VERSION:
+            if data.version != SESSION_VERSION:
                 if session_path is None or initial_lease is None:
-                    raise RuntimeError("v1 Session 恢复状态无效")
+                    raise RuntimeError("旧版 Session 恢复状态无效")
                 session_path, data, initial_lease = (
                     _copy_legacy_session_for_resume(
                         session_path,
@@ -1144,6 +1315,7 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
             session_path=session_path or explicit_new_path,
             lease=initial_lease,
             title=data.title if data else "",
+            sticky_skills=data.sticky_skills if data else (),
             first_task=next(
                 (
                     str(message.get("content"))

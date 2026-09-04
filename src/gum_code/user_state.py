@@ -10,9 +10,11 @@ from pathlib import Path
 
 from gum_code.session import (
     MAX_SESSION_FILE_BYTES,
+    SESSION_VERSION,
     SessionData,
     SessionLease,
     load_session,
+    migrate_session_to_v3,
     save_session,
 )
 
@@ -423,7 +425,7 @@ def allocate_session_path(directory: Path | None = None) -> Path:
         name = (
             datetime.now().strftime("%Y%m%d-%H%M%S-")
             + secrets.token_hex(4)
-            + ".json"
+            + ".jsonl"
         )
         target = root / name
         if (
@@ -443,8 +445,9 @@ def list_sessions(
     if not root.exists() or root.is_symlink() or not root.is_dir():
         return []
     wanted = workspace.resolve() if workspace is not None else None
-    entries: list[SessionEntry] = []
-    for path in root.glob("*.json"):
+    loaded: list[tuple[Path, SessionData]] = []
+    paths = [*root.glob("*.jsonl"), *root.glob("*.json")]
+    for path in paths:
         if path.is_symlink() or not path.is_file():
             continue
         try:
@@ -453,19 +456,29 @@ def list_sessions(
                 allow_incomplete_tool_batch=True,
                 allow_pending_user_tail=True,
             )
-            resolved_workspace = data.workspace.resolve()
-            if wanted is not None and resolved_workspace != wanted:
-                continue
-            entries.append(
-                SessionEntry(
-                    path=path.resolve(),
-                    workspace=resolved_workspace,
-                    title=data.title or path.stem,
-                    modified_at=path.stat().st_mtime,
-                )
-            )
+            loaded.append((path, data))
         except (OSError, ValueError):
             continue
+    migrated_sources = {
+        data.legacy_source.resolve()
+        for _, data in loaded
+        if data.legacy_source is not None
+    }
+    entries: list[SessionEntry] = []
+    for path, data in loaded:
+        if data.version != SESSION_VERSION and path.resolve() in migrated_sources:
+            continue
+        resolved_workspace = data.workspace.resolve()
+        if wanted is not None and resolved_workspace != wanted:
+            continue
+        entries.append(
+            SessionEntry(
+                path=path.resolve(),
+                workspace=resolved_workspace,
+                title=data.title or path.stem,
+                modified_at=path.stat().st_mtime,
+            )
+        )
     entries.sort(key=lambda entry: entry.modified_at, reverse=True)
     return entries if limit is None else entries[:limit]
 
@@ -490,13 +503,17 @@ def import_session(
         else Path(destination)
     )
     with SessionLease(target):
-        save_session(
-            target,
-            data.workspace,
-            data.model,
-            data.messages,
-            data.title,
-        )
+        if data.version != SESSION_VERSION:
+            migrate_session_to_v3(source_path, target)
+        else:
+            save_session(
+                target,
+                data.workspace,
+                data.model,
+                data.messages,
+                data.title,
+                data.sticky_skills,
+            )
     return target
 
 

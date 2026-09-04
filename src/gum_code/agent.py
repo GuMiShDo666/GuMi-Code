@@ -19,6 +19,7 @@ from gum_code.context import (
 from gum_code.events import AgentEventCallback
 from gum_code.hooks import HookEvent, HookRegistry
 from gum_code.session import IN_FLIGHT_MARKER_KEY
+from gum_code.skills import SKILL_TOOL_NAMES, SKILL_TOOL_SCHEMAS, SkillRuntime
 from gum_code.subagent import (
     MAX_DELEGATIONS_PER_RUN,
     TASK_TOOL_SCHEMA,
@@ -144,6 +145,7 @@ def build_agent_tool_schemas(
     *,
     allow_run_command: bool = False,
     allow_subagent: bool = True,
+    allow_skills: bool = False,
 ) -> list[dict[str, object]]:
     schemas = [
         *get_tool_schemas(allow_run_command=allow_run_command),
@@ -151,6 +153,8 @@ def build_agent_tool_schemas(
     ]
     if allow_subagent:
         schemas.append(TASK_TOOL_SCHEMA)
+    if allow_skills:
+        schemas.extend(SKILL_TOOL_SCHEMAS)
     return schemas
 
 
@@ -494,6 +498,7 @@ def run_agent(
     token_counter: RequestTokenCounter | None = None,
     command_sandbox: DockerSandboxConfig | None = None,
     allow_subagent: bool = True,
+    skill_runtime: SkillRuntime | None = None,
 ) -> str:
     """Run a bounded model/tool loop with recoverable protocol snapshots.
 
@@ -543,6 +548,9 @@ def run_agent(
     if not allow_run_command and command_sandbox is not None:
         raise RuntimeError("Docker Sandbox 仅能与 allow_run_command 一起启用")
 
+    if skill_runtime is not None:
+        skill_runtime.start_task(user_query)
+
     if token_counter is None:
         token_counter = load_token_counter(model)
     base_token_counter = token_counter
@@ -580,11 +588,18 @@ def run_agent(
             }
         )
 
+    if skill_runtime is not None:
+        for message in messages:
+            if message.get("role") == "system" and isinstance(message.get("content"), str):
+                message["content"] = skill_runtime.apply_to_system(message["content"])
+                break
+
     _send_message_snapshot(message_snapshot_callback, messages)
 
     agent_tool_schemas = build_agent_tool_schemas(
         allow_run_command=allow_run_command,
         allow_subagent=allow_subagent,
+        allow_skills=skill_runtime is not None,
     )
 
     allowed_tool_names = {
@@ -1022,6 +1037,14 @@ def run_agent(
                         tool_call.function.arguments,
                         lambda: _emit_tool_execution(
                             event_callback, step, "todo_write"
+                        ),
+                    )
+                elif skill_runtime is not None and tool_name in SKILL_TOOL_NAMES:
+                    result = skill_runtime.execute(
+                        tool_name,
+                        tool_call.function.arguments,
+                        lambda: _emit_tool_execution(
+                            event_callback, step, tool_name
                         ),
                     )
                 else:

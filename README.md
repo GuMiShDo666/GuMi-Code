@@ -106,6 +106,16 @@ Windows PowerShell：
 
 Windows 用户将可执行文件替换为 `.\.venv\Scripts\gum-code.exe`。模型每次请求命令都需要终端审批。
 
+## Skills 与 Session
+
+在任务中写 `$skill-name` 可在第一次模型请求前加载对应的 Codex 用户 Skill。Gum Code 只扫描 `$CODEX_HOME/skills`（未设置时为 `~/.codex/skills`）的直接子目录；显式 Skill 会在当前 Session 中保持 sticky，单个任务与 Session 最多同时保留 3 个。根 Agent 也可按需使用 `find_skills`、`load_skill` 和 `read_skill_resource`，自动加载仅对当前任务有效。`/skills` 可查看、禁用或清空 sticky 名称，不显示 Skill 内容。
+
+Skills 只作为只读指令与文本资源加载。Gum Code 不执行 Skill 脚本、不安装 Skill，也不会把 Skill 工具或内容交给 Subagent。
+
+新 Session 使用私有、追加写入的 v3 JSONL 事件日志，文件总上限仍为 5 MiB。v1/v2 Session 在首次恢复或导入时复制迁移，源文件保持不变。`/sessions` 可查看不含提示词、参数、结果或 Skill 正文的安全审计时间线，也可从已完成 turn 创建独立 fork。上下文压缩只追加新的活动投影，不删除旧事件。
+
+同一模型步骤中连续调用同名工具时，终端只显示一次该工具的执行提示；每次调用、结果与 Session 事件仍分别保留。
+
 ## 当前能力与边界
 
 | 范围 | 当前能力 | 边界 |
@@ -115,7 +125,8 @@ Windows 用户将可执行文件替换为 `.\.venv\Scripts\gum-code.exe`。模�
 | 文件与 Git | 支持列出、读取、搜索、写入和编辑文件，以及查看 Git 状态和差异。 | 文件工具只能访问工作区；删除需要审批；路径、符号链接、敏感文件名和大小受到限制。 |
 | 命令执行 | 显式启用后，可以在断网 Docker 容器中运行单个 argv 命令。 | `run_command` 默认关闭，且每次都需要审批。容器仍可修改工作区，也不能防御恶意镜像、Docker daemon 入侵或运行时漏洞。 |
 | 上下文 | 支持工具结果裁剪、结构化压缩、主动压缩和超限后的单次重试；终端只显示上下文占上限的百分比。 | 压缩摘要属于当前 Session，不是跨 Session 长期 Memory。 |
-| Session | 自动保存交互记录，支持查看、重命名、恢复和安全闭合中断的工具批次。 | 已开始工具的副作用未知时，使用者必须检查当前状态；Harness 不会自动重放该调用。 |
+| Session | 使用 v3 JSONL 事件日志自动保存交互记录，支持安全审计、已完成 turn fork、重命名、恢复和安全闭合中断工具批次。 | 单文件上限 5 MiB；达到上限后需新建或 fork Session。已开始工具的副作用未知时，使用者必须检查当前状态，Harness 不会自动重放。 |
+| Skills | 共用 Codex 顶层用户 Skill 库，支持显式 sticky 加载和根 Agent 的渐进式只读加载。 | 不扫描 `.system`、插件或项目 Skill；不执行脚本；Subagent 不接收 Skills。 |
 | Subagent | 每次根 Agent 运行最多可启动 4 个同步、单层、只读子 Agent，每个最多使用 8 次模型请求。 | 子 Agent 不能写入、执行命令、并行或递归委派，也不会持久化。 |
 | Hooks | Python API 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`。 | Hooks 只支持同步、进程内注册；没有配置文件、外部命令、异步回调或自动发现。 |
-| 尚未实现 | 项目当前不包含 Skills、MCP、Goal Loop、长期 Memory、并行/递归 Subagent 或子 Agent 持久化。 | 不要把 README 中的边界当作未来版本承诺。 |
+| 尚未实现 | 项目当前不包含 MCP、Goal Loop、长期 Memory、并行/递归 Subagent 或子 Agent 持久化。 | 不要把 README 中的边界当作未来版本承诺。 |
