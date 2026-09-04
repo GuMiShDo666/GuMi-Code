@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/gum-code-logo.jpg" alt="Gum Code" width="180" />
+  <img src="docs/assets/gum-code-logo.png" alt="Gum Code" width="180" />
 </p>
 
 <h1 align="center">Gum Code</h1>
