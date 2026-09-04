@@ -411,11 +411,19 @@ def run_read_only_subagent(
         name = str(tool_name)[:MAX_EVENT_TOOL_NAME_CHARS]
         emit("subagent_tool", {"step": step, "tool_name": name})
 
+    def emit_tool_execution(step: int, tool_name: object) -> None:
+        name = str(tool_name)[:MAX_EVENT_TOOL_NAME_CHARS]
+        emit("tool_execution", {"step": step, "tool_name": name})
+
     def reserve_provider_call() -> None:
         nonlocal calls_used
         if calls_used >= MAX_SUBAGENT_PROVIDER_CALLS:
             raise _ProviderBudgetExhausted
         calls_used += 1
+
+    def before_summary_request() -> None:
+        reserve_provider_call()
+        emit("context_summary", {"step": max(main_step, 1)})
 
     emit("subagent_start", {"max_calls": MAX_SUBAGENT_PROVIDER_CALLS})
     try:
@@ -454,6 +462,14 @@ def run_read_only_subagent(
             reactive_retries = 0
 
             while True:
+                emit(
+                    "subagent_prepare",
+                    {
+                        "step": main_step + 1,
+                        "calls_used": calls_used,
+                        "max_calls": MAX_SUBAGENT_PROVIDER_CALLS,
+                    },
+                )
                 used_tokens = token_counter.count_request(
                     messages, child_tool_schemas
                 )
@@ -499,7 +515,7 @@ def run_read_only_subagent(
                             description,
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
-                            before_request=reserve_provider_call,
+                            before_request=before_summary_request,
                         )
                     except _ProviderBudgetExhausted:
                         return _budget_exhausted_result(report_attempted)
@@ -564,7 +580,7 @@ def run_read_only_subagent(
                             description,
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
-                            before_request=reserve_provider_call,
+                            before_request=before_summary_request,
                         )
                     except _ProviderBudgetExhausted:
                         return _budget_exhausted_result(report_attempted)
@@ -661,6 +677,7 @@ def run_read_only_subagent(
                             }
                         )
                         continue
+                    emit_tool_execution(main_step, "submit_report")
                     messages.append(
                         {
                             "role": "tool",
@@ -681,6 +698,7 @@ def run_read_only_subagent(
                         except (TypeError, json.JSONDecodeError):
                             compact_args = None
                         if compact_args == {}:
+                            emit_tool_execution(main_step, "compact")
                             result = "Compaction requested after this tool batch."
                             compact_requested = True
                         else:
@@ -699,6 +717,9 @@ def run_read_only_subagent(
                             arguments_json=call.function.arguments,
                             pre_tool_use_callback=pre_tool_use_callback,
                             post_tool_use_callback=post_tool_use_callback,
+                            before_execute_callback=lambda: emit_tool_execution(
+                                main_step, tool_name
+                            ),
                         )
                     else:
                         result = (
@@ -724,7 +745,7 @@ def run_read_only_subagent(
                             token_counter=token_counter,
                             max_context_tokens=max_context_tokens,
                             active_compaction_completed=True,
-                            before_request=reserve_provider_call,
+                            before_request=before_summary_request,
                         )
                     except _ProviderBudgetExhausted:
                         return _budget_exhausted_result(report_attempted)

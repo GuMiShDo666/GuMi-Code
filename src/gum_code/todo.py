@@ -1,3 +1,6 @@
+from collections.abc import Callable
+
+
 MAX_TODOS = 20
 MAX_TODO_CONTENT_CHARS = 500
 
@@ -14,7 +17,11 @@ class TodoManager:
     def __init__(self) -> None:
         self.items: list[dict[str, str]] = []
 
-    def update(self, todos: object) -> str:
+    def update(
+        self,
+        todos: object,
+        before_update_callback: Callable[[], None] | None = None,
+    ) -> str:
         if not isinstance(todos, list):
             raise ValueError("todos 必须是列表")
 
@@ -54,6 +61,8 @@ class TodoManager:
                 }
             )
 
+        if before_update_callback is not None:
+            before_update_callback()
         self.items = normalized
         return self.render()
 

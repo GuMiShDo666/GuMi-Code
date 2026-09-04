@@ -1,9 +1,9 @@
 # Gum Code 开发交接文档
 
-> 最后更新：2026-09-03
-> 当前实现检查点：Gum Code 完整改名、长上下文、文件权限与旧数据迁移
+> 最后更新：2026-09-04
+> 当前实现检查点：Gum Code 运行时策略与 Agent Loop 真实进度反馈
 > 当前源码验证：见本文第 7 节的最新验证记录
-> 当前下一步：完成外部安装、目录/仓库改名和标准 Git PR 流程
+> 当前下一步：审查并发布 `feat/agent-loop-progress-feedback`
 
 ## 1. 新对话如何续接
 
@@ -62,7 +62,7 @@ GuMiShDo 正在从零编写一个可长期使用的本地 CLI Vibe Coding Agent 
 - `.env.example` 只能包含占位符和公开配置名。
 - 不要在项目源码目录中做会修改文件的真实 E2E；应使用独立临时 workspace。
 - GitHub 仓库为私有仓库 `GuMiShDo666/Gum-Code`；功能更新使用分支、测试、Conventional Commit、push 和 PR，不直接提交到 `main`。
-- 当前工作分支为 `feat/gum-code-runtime-policy`。
+- 当前工作分支为 `feat/agent-loop-progress-feedback`。
 
 常用验证命令（源码测试继续使用外部 Python，并设置 `PYTHONPATH=src`）：
 
@@ -187,8 +187,11 @@ tests/
 
 - 正式 shell 入口为 `gum-code`；TTY 无任务时进入持久 REPL，位置参数 task 仍为 one-shot。
 - workspace 必须是已存在目录。
-- Agent 仍发送完整事件给回调，正式终端渲染只显示上下文、当前 step + 工具名、限长错误和最终回答。
-- 普通工具参数、成功结果和冗余模型请求提示不再输出；压缩事件不输出原始历史或摘要。
+- 交互模式在每轮请求准备时立即启动 Rich `dots` 动画：`准备中...`；模型请求前切换为 `思考中...`，历史摘要请求使用 `整理上下文中...`。Rich 自动检测 TTY，`NO_COLOR` 仍受尊重。
+- one-shot 使用带 `第 N 步` 的静态行并立即 flush；不输出 ANSI 动画帧。主 Agent、Subagent、上下文错误重试和步数耗尽后的最终请求均覆盖。
+- 交互模式的最终 Markdown 回答仅在渲染期间将行内代码设为 bold，前景与背景由终端决定；fenced code block、其他样式和 one-shot 保持不变。
+- `tool_call` / `subagent_tool` 只保留为内部观测事件，不再误报正在执行。只有完成允许集、JSON、策略、preflight、`PreToolUse` 和必要审批后，才发送 `tool_execution` 并显示 `执行中：正在调用<工具名>`。Session in-flight 快照仍位于事件之前。
+- 普通工具参数、成功结果和 reasoning 始终隐藏；进度负载只含有界 step 和经终端控制字符清理的工具名。
 - CLI 统一捕获已知运行错误，写入 stderr 并返回 1。
 - 写 stderr 错误前先 flush stdout，错误行不再因缓冲出现在已有日志之前。
 
@@ -360,7 +363,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 - 共享 `git_status`/`git_diff` 使用最小隔离环境，禁用仓库 fsmonitor/Hook、
   global/system 配置和可选索引锁；READ 调用不继承模型凭据，也不刷新索引。
 - 中断的父 `task` 被恢复为匹配 ID 的 `task_interrupted` 结果，不自动重启旧子 Agent。
-- 终端仅显示子 Agent 开始/结束、步数和工具名，不显示 description、参数、结果、报告或 reasoning。
+- 终端对子 Agent 也统一显示准备、思考、上下文整理和真实执行状态，但不显示 description、参数、结果、报告或 reasoning。
 
 真实第三方网关 E2E 已通过：隔离临时 workspace 中完成根
 `task` → 子 Agent `read_file`/`git_status` → `submit_report` → 根回答，
@@ -393,7 +396,7 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 - 完全相同的已拒绝工具调用在同一运行中去重
 - CLI 异常前 flush stdout
 - s03 Permission 三道闸门：直接高危命令硬拒绝 → 风险规则 `ALLOW/ASK/DENY` → 终端审批
-- 终端精简显示：隐藏普通参数/成功结果，保留上下文、step + 工具名、限长错误、最终回答和审批预览
+- 终端进度反馈：交互 TTY 使用自动检测的 `dots` 动画，one-shot 使用 flush 的步数行；工具只在所有执行前门禁通过后显示
 - Todo 单项 `content` 最多 500 字符，Schema 与运行时双层校验，超限更新原子失败
 - `run_command` 在 preflight 拒绝 Shell 控制符和明确重定向；不弹审批、不执行 Handler，且保留 `find -exec ... ;` 与原生模式参数
 - `run_command` 容器 HOME/XDG 固定在受限 `/tmp`，不挂载宿主 HOME、
@@ -411,12 +414,14 @@ DeepSeekV4TokenCounter.count_request(messages, enabled_tools)
 PYTHONPATH=src PYTHONPYCACHEPREFIX=/Users/gumishdo/.local/share/gum-code/pycache \
   /Users/gumishdo/.local/share/gum-code/venv/bin/python \
   -m pytest -q -p no:cacheprovider
-# 803 passed, 3 skipped（2026-09-03，当前离线全量回归）
+# 811 passed, 3 skipped（2026-09-04，当前离线全量回归）
 ```
 
 另外，真实第三方网关 Subagent 链为 `1 passed in 12.41s`；本次
 交互运行时的真实回答、自动 Session、标题请求和 `0600` 探针也已通过。
 三个跳过项分别由 Docker 实机、真实网关和 tokenizer 金标外部门禁控制。
+本分支另用真实 PTY 确认 `准备中...` / `思考中...` 会在完成标记前动态刷新，
+并确认 `Ctrl+C` 后 Rich status 及时清理、进程正常退出。
 
 ## 8. 个人日常使用版发布验收（已完成）
 
@@ -518,5 +523,5 @@ Docker Sandbox 的历史验证为 `692 passed, 1 skipped in 40.58s`（2026-09-03
 模块导入和包内 CLI help 均通过。Docker Desktop Server 29.1.3 与用户授权
 手动拉取的 Docker 官方 `python:3.11-slim` 已用于真实边界测试。实现提交
 `f6a890f` 已通过 PR #5 合并到 `main`。当前分支为
-`feat/interactive-workspace-repl`，最新验证见第 7 节；本地详细记录见
+`feat/agent-loop-progress-feedback`，最新验证见第 7 节；本地详细记录见
 `TEST_REPORT.md`（该文件按用户要求不上传 GitHub）。

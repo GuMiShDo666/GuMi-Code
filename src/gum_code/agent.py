@@ -186,6 +186,7 @@ def _assistant_message_to_dict(message: object) -> dict[str, object]:
 def _execute_todo_write(
     manager: TodoManager,
     arguments_json: object,
+    before_execute_callback: Callable[[], None] | None = None,
 ) -> str:
     if not isinstance(arguments_json, str):
         return "Error: 无法解析参数 JSON"
@@ -200,7 +201,7 @@ def _execute_todo_write(
 
     todos = parsed.get("todos")
     try:
-        return manager.update(todos)
+        return manager.update(todos, before_execute_callback)
     except ValueError as error:
         return f"Error: {error}"
 
@@ -211,6 +212,18 @@ def _normalize_tool_arguments(arguments: str) -> str:
     except json.JSONDecodeError:
         return arguments
     return json.dumps(parsed, sort_keys=True, separators=(",", ":"))
+
+
+def _emit_tool_execution(
+    event_callback: AgentEventCallback | None,
+    step: int,
+    tool_name: str,
+) -> None:
+    if event_callback is not None:
+        event_callback(
+            "tool_execution",
+            {"step": step, "tool_name": tool_name},
+        )
 
 
 def _emit_provider_usage(
@@ -266,6 +279,9 @@ def _finalize_after_step_budget(
     event_callback: AgentEventCallback | None,
     message_snapshot_callback: MessageSnapshotCallback | None,
 ) -> str:
+    if event_callback is not None:
+        event_callback("request_prepare", {"step": final_step})
+
     prompt = {"role": "user", "content": STEP_BUDGET_FINALIZATION_PROMPT}
 
     final_messages = [*messages, prompt]
@@ -374,6 +390,9 @@ def _finalize_after_step_budget(
                     f"预算上限 {max_context_tokens} tokens"
                 )
 
+            if event_callback is not None:
+                event_callback("request_prepare", {"step": final_step})
+
     _emit_provider_usage(response, final_step, used_tokens, event_callback)
     message = response.choices[0].message
     answer = message.content or ""
@@ -406,6 +425,9 @@ def run_agent(
     command_sandbox: DockerSandboxConfig | None = None,
     allow_subagent: bool = True,
 ) -> str:
+    if event_callback is not None:
+        event_callback("request_prepare", {"step": 1})
+
     if (
         isinstance(max_context_tokens, bool)
         or not isinstance(max_context_tokens, int)
@@ -519,6 +541,9 @@ def run_agent(
     started_descriptions: set[str] = set()
 
     for step in range(1, max_steps + 1):
+        if step > 1 and event_callback is not None:
+            event_callback("request_prepare", {"step": step})
+
         used_tokens = token_counter.count_request(messages, agent_tool_schemas)
 
         messages, persisted = apply_tool_result_budget(messages, workspace)
@@ -720,6 +745,9 @@ def run_agent(
                         f"预算上限 {max_context_tokens} tokens"
                     )
 
+                if event_callback is not None:
+                    event_callback("request_prepare", {"step": step})
+
         _emit_provider_usage(response, step, used_tokens, event_callback)
         message = response.choices[0].message
         messages.append(_assistant_message_to_dict(message))
@@ -853,6 +881,7 @@ def run_agent(
                                 "The task was blocked by a PreToolUse hook.",
                             )
                         else:
+                            _emit_tool_execution(event_callback, step, "task")
                             delegations_started += 1
                             started_descriptions.add(normalized_description)
                             result = run_read_only_subagent(
@@ -892,11 +921,27 @@ def run_agent(
                 )
 
                 if tool_name == "compact":
-                    result = "Compaction requested after this tool batch."
-                    compact_requested = True
+                    try:
+                        compact_arguments = json.loads(
+                            tool_call.function.arguments
+                        )
+                    except (TypeError, json.JSONDecodeError):
+                        compact_arguments = None
+                    if compact_arguments == {}:
+                        _emit_tool_execution(
+                            event_callback, step, "compact"
+                        )
+                        result = "Compaction requested after this tool batch."
+                        compact_requested = True
+                    else:
+                        result = "Error: compact requires an empty JSON object."
                 elif tool_name == "todo_write":
                     result = _execute_todo_write(
-                        todo_manager, tool_call.function.arguments
+                        todo_manager,
+                        tool_call.function.arguments,
+                        lambda: _emit_tool_execution(
+                            event_callback, step, "todo_write"
+                        ),
                     )
                 else:
                     fingerprint = (
@@ -916,6 +961,9 @@ def run_agent(
                             approval_callback=approval_callback,
                             pre_tool_use_callback=pre_tool_use_callback,
                             post_tool_use_callback=post_tool_use_callback,
+                            before_execute_callback=lambda: _emit_tool_execution(
+                                event_callback, step, tool_name
+                            ),
                             command_sandbox=command_sandbox,
                         )
                         if isinstance(result, ToolExecutionDenied):
