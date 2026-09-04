@@ -1237,26 +1237,33 @@ def build_interrupted_turn_messages(
         call_id = call.get("id") if isinstance(call, dict) else None
         if call_id in completed:
             continue
-        if call_id == state.in_flight_call_id:
-            code = "interrupted_unknown_state"
-            message = (
-                "The tool turn was interrupted and may have changed state; "
-                "inspect current state and do not replay it automatically."
-            )
+
+        function = call.get("function") if isinstance(call, dict) else None
+        tool_name = function.get("name") if isinstance(function, dict) else None
+        if tool_name == "task":
+            content = TASK_INTERRUPTED_RESULT
         else:
-            code = "interrupted_not_run"
-            message = (
-                "The tool call was not run because the turn was interrupted; "
-                "re-plan it from current state."
+            if call_id == state.in_flight_call_id:
+                code = "interrupted_unknown_state"
+                message = (
+                    "The tool turn was interrupted and may have changed state; "
+                    "inspect current state and do not replay it automatically."
+                )
+            else:
+                code = "interrupted_not_run"
+                message = (
+                    "The tool call was not run because the turn was interrupted; "
+                    "re-plan it from current state."
+                )
+            content = json.dumps(
+                {"status": "error", "code": code, "message": message},
+                separators=(",", ":"),
             )
         result.append(
             {
                 "role": "tool",
                 "tool_call_id": call_id,
-                "content": json.dumps(
-                    {"status": "error", "code": code, "message": message},
-                    separators=(",", ":"),
-                ),
+                "content": content,
             }
         )
     return result
