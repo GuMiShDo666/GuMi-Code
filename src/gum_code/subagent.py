@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 from threading import Event
+from typing import TYPE_CHECKING
 
 from gum_code.context import (
     CONTEXT_TARGET_RATIO,
@@ -24,6 +25,9 @@ from gum_code.tools.registry import (
     execute_tool,
     get_read_only_tool_schemas,
 )
+
+if TYPE_CHECKING:
+    from gum_code.vision import VisionRuntime
 
 MAX_TASK_DESCRIPTION_CHARS = 4_000
 MAX_DELEGATIONS_PER_RUN = 4
@@ -144,7 +148,10 @@ SUBAGENT_SYSTEM_PROMPT = (
     "tool call in that response. Evidence paths must be workspace-relative. "
     "If no findings or evidence exist, state the searched scope and absence in "
     "summary. Use the main language of the task description while preserving "
-    "code, paths, and identifiers exactly."
+    "code, paths, and identifiers exactly. "
+    "For PDF/DOCX/image evidence, omit text line ranges and state the source "
+    "version and page/block/image reference in the claim. Visual tools share "
+    "the parent's consent and call limit; report unread content honestly."
 )
 
 _REPORT_KEYS = frozenset({"summary", "findings", "evidence", "risks"})
@@ -298,6 +305,12 @@ def _validate_evidence(workspace: Path, value: object) -> list[dict[str, object]
         if not target.exists() or not target.is_file():
             raise ValueError("evidence path must be a file")
 
+        if target.suffix.lower() in {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".webp"}:
+            if has_start:
+                raise ValueError("document evidence has pages or image references, not text lines")
+            validated.append(item)
+            continue
+
         line_count = 0
         saw_text = False
         last_character = ""
@@ -403,6 +416,7 @@ def run_read_only_subagent(
     pre_tool_use_callback: PreToolUseCallback | None = None,
     post_tool_use_callback: PostToolUseCallback | None = None,
     cancel_event: Event | None = None,
+    vision_runtime: "VisionRuntime | None" = None,
 ) -> str:
     """Run one read-only child that completes only through a validated report.
 
@@ -783,6 +797,8 @@ def run_read_only_subagent(
                                 main_step,
                                 tool_name,
                             ),
+                            **({"vision_runtime": vision_runtime} if vision_runtime is not None else {}),
+                            **({"cancel_event": cancel_event} if tool_name in {"read_document", "analyze_image"} else {}),
                         )
                     else:
                         result = (

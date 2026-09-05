@@ -2,7 +2,10 @@
 
 import copy
 import re
-from dataclasses import dataclass, replace
+import sys
+import uuid
+from dataclasses import dataclass, field, replace
+from threading import RLock
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -20,15 +23,21 @@ from rich.text import Text
 from gum_code.agent import build_agent_tool_schemas, run_agent
 from gum_code.context import compact_history, latest_user_request
 from gum_code.config import (
+    DEFAULT_VISION_CALL_LIMIT,
     Settings,
+    VisionSettings,
     default_user_config_path,
+    default_vision_config_path,
     has_complete_legacy_settings,
     legacy_public_defaults,
     load_settings,
+    load_vision_settings,
     resolve_context_budget,
     resolve_context_window,
     save_user_settings,
+    save_vision_settings,
     validate_provider_settings,
+    validate_vision_settings,
 )
 from gum_code.events import (
     RichEventRenderer,
@@ -60,6 +69,7 @@ from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.verification import VerificationRuntime, validate_task_state
+from gum_code.vision import VisionRuntime
 from gum_code.user_state import (
     SessionEntry,
     UserState,
@@ -88,6 +98,7 @@ KNOWN_COMMANDS = {
     "/status",
     "/revoke-verification",
     "/verbose",
+    "/vision",
     "/exit",
 }
 _SESSION_CANCELLED = object()
@@ -423,12 +434,14 @@ def ensure_interactive_settings(
         settings = load_settings(target, startup_directory / ".env")
     except RuntimeError:
         base_url, model = legacy_public_defaults(startup_directory / ".env")
-        return _configuration_wizard(
+        settings = _configuration_wizard(
             console,
             config_file=target,
             default_base_url=base_url,
             default_model=model,
         )
+        _offer_vision_configuration(console)
+        return settings
 
     state = load_user_state(state_file)
     legacy = startup_directory / ".env"
@@ -445,13 +458,126 @@ def ensure_interactive_settings(
         save_user_state(state, state_file)
         if migrate:
             base_url, model = legacy_public_defaults(legacy)
-            return _configuration_wizard(
+            settings = _configuration_wizard(
                 console,
                 config_file=target,
                 default_base_url=base_url,
                 default_model=model,
             )
+            _offer_vision_configuration(console)
+            return settings
     return settings
+
+
+def _vision_consent(settings: VisionSettings, chooser: Callable[..., object]) -> bool:
+    recipient = _safe_terminal_text(settings.base_url).replace(settings.api_key, "***")
+    model = _safe_terminal_text(settings.model).replace(settings.api_key, "***")
+    warning = " HTTP 未加密，图片可能被截获。" if settings.base_url.lower().startswith("http:") else ""
+    return _confirm(
+        f"接收方：{recipient}；模型：{model}。将发送当前任务相关图片/PDF 页面，"
+        f"调用可能收费；次数上限不是费用上限。{warning} 确认启用？", chooser,
+    )
+
+
+def _vision_configuration_wizard(
+    console: Console, *, config_file: Path | None = None,
+    text_prompt: Callable[..., str] | None = None,
+    chooser: Callable[..., object] | None = None,
+) -> bool:
+    """Save local consent only; never probe an endpoint or echo a credential."""
+    target = default_vision_config_path() if config_file is None else config_file
+    ask, choose = text_prompt or prompt, chooser or choice
+    previous = load_vision_settings(target)
+    try:
+        key = ask("视觉 API key（不显示）：", is_password=True).strip()
+        base = ask("视觉 base URL：", default=(
+            previous.base_url.replace(previous.api_key, "***") if previous else ""
+        )).strip()
+        model = ask("视觉 model：", default=(
+            previous.model.replace(previous.api_key, "***") if previous else ""
+        )).strip()
+        candidate = VisionSettings(key, base, model, default_call_limit=(
+            previous.default_call_limit if previous else DEFAULT_VISION_CALL_LIMIT
+        ))
+        validate_vision_settings(candidate)
+        if not _vision_consent(candidate, choose):
+            return False
+        save_vision_settings(target, replace(candidate, enabled=True))
+    except (Exception, KeyboardInterrupt, EOFError):
+        console.print(Text("图片解析配置未保存。", style="yellow"))
+        return False
+    console.print(Text("图片解析配置已保存；尚未验证服务的图片理解能力。"))
+    return True
+
+
+def _offer_vision_configuration(console: Console) -> None:
+    if _confirm("主模型配置已保存。现在配置可选的图片解析功能？", choice):
+        _vision_configuration_wizard(console)
+
+
+def manage_vision_settings(console: Console) -> None:
+    """A host-only no-argument menu; updates apply to subsequent requests."""
+    target = default_vision_config_path()
+    while True:
+        settings = load_vision_settings(target)
+        state = "未配置" if settings is None else "已启用" if settings.enabled else "已关闭"
+        console.print(Text(f"图片解析：{state}"))
+        if settings is not None:
+            for label, value in (("接收方", settings.base_url), ("模型", settings.model)):
+                console.print(Text(f"{label}：{_safe_terminal_text(value).replace(settings.api_key, '***')}"))
+            console.print(Text(f"后续新请求默认次数：{settings.default_call_limit}"))
+        try:
+            action = choice("图片解析设置", options=[
+                ("back", "返回"), ("configure", "配置/修改"),
+                ("toggle", "启用/关闭"), ("limit", "修改后续新请求默认次数"),
+            ], default="back")
+            if action == "back" or action not in {"configure", "toggle", "limit"}:
+                return
+            if action == "configure":
+                _vision_configuration_wizard(console, config_file=target)
+            elif settings is None:
+                console.print(Text("请先配置图片解析服务。", style="yellow"))
+            elif action == "toggle":
+                if settings.enabled:
+                    save_vision_settings(target, replace(settings, enabled=False))
+                    console.print(Text("已关闭后续图片发送；已经发送或在途的数据无法撤回。"))
+                elif _vision_consent(settings, choice):
+                    save_vision_settings(target, replace(settings, enabled=True))
+            else:
+                count = int(prompt("后续新请求默认次数（正整数；取消不更改）：").strip())
+                if count <= 0:
+                    raise ValueError
+                save_vision_settings(target, replace(settings, default_call_limit=count))
+        except (KeyboardInterrupt, EOFError):
+            return
+        except Exception:
+            console.print(Text("图片解析设置未更改。", style="yellow"))
+
+
+def request_extra_vision_calls(
+    runtime: VisionRuntime, *, console: Console | None = None,
+    interactive: bool | None = None, text_prompt: Callable[..., str] | None = None,
+) -> None:
+    """Ask only from the host's completed root batch; denial never grants calls."""
+    if interactive is None:
+        interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
+    if not interactive:
+        runtime.decline_extra()
+        return
+    try:
+        state = runtime.export_state()
+        (console or create_console()).print(Text(
+            f"本轮图片解析已使用 {state['used']}/{state['limit']} 次。"
+            "追加调用可能产生费用，次数不是金额上限。"
+        ))
+        count = int((text_prompt or prompt)("追加次数（正整数；留空拒绝）：").strip())
+        if count <= 0:
+            raise ValueError
+    except (Exception, KeyboardInterrupt, EOFError):
+        runtime.decline_extra()
+        return
+    if not runtime.add_credits(count):
+        runtime.decline_extra()
 
 
 def _prompt_context_window(
@@ -625,8 +751,13 @@ class InteractiveRuntime:
     verification_runtime: VerificationRuntime | None = None
     task_type_consumed: bool = False
     last_task_state: dict[str, object] | None = None
+    vision_runtime: VisionRuntime | None = None
+    session_write_lock: object = field(default_factory=RLock, repr=False)
 
     def close(self) -> None:
+        if self.vision_runtime is not None:
+            self.vision_runtime.cancel()
+        self.vision_runtime = None
         self.verification_runtime = None
         if self.lease is not None:
             self.lease.release()
@@ -638,30 +769,50 @@ class InteractiveRuntime:
         if self.lease is None:
             self.lease = SessionLease(self.session_path).acquire()
 
-    def _save(self, messages: list[dict[str, object]]) -> None:
-        self._ensure_session()
-        candidate = copy.deepcopy(messages)
-        save_session(
-            self.session_path,
-            self.workspace,
-            self.settings.model,
-            candidate,
-            self.title,
-            (
-                self.skill_runtime.sticky_names
-                if self.skill_runtime is not None
-                else self.sticky_skills
-            ),
+    def _save(
+        self, messages: list[dict[str, object]], *, user_request_id: str | None = None,
+    ) -> None:
+        with self.session_write_lock:
+            self._ensure_session()
+            candidate = copy.deepcopy(messages)
+            kwargs = {"user_request_id": user_request_id} if user_request_id is not None else {}
+            save_session(
+                self.session_path, self.workspace, self.settings.model, candidate, self.title,
+                self.skill_runtime.sticky_names if self.skill_runtime is not None else self.sticky_skills,
+                **kwargs,
+            )
+            self.messages = candidate
+            self._flush_skill_activations()
+
+    def _append_event(self, event_type: str, data: dict[str, object]) -> None:
+        with self.session_write_lock:
+            if self.session_path is None:
+                raise RuntimeError("Session 尚未建立")
+            append_session_event(self.session_path, event_type, data)
+
+    def _persist_vision(self, state: dict[str, object]) -> None:
+        # Called under the budget lock: never read runtime state or render here.
+        self._append_event("vision.state", state)
+
+    def _restore_vision(self, data: SessionData) -> None:
+        if self.vision_runtime is not None:
+            self.vision_runtime.cancel()
+        self.vision_runtime = (
+            VisionRuntime(
+                load_vision_settings(), request_id=data.user_request_id,
+                initial_state=data.vision_state, persist_callback=self._persist_vision,
+                settings_loader=lambda: load_vision_settings(),
+            )
+            if data.user_request_id is not None and data.vision_state is not None else None
         )
-        self.messages = candidate
-        self._flush_skill_activations()
 
     def _record_skill_activation(self, snapshot: SkillSnapshot) -> None:
-        if self.pending_skill_activations is None:
-            self.pending_skill_activations = []
-        self.pending_skill_activations.append(snapshot)
-        if self.session_path is not None and self.session_path.exists():
-            self._flush_skill_activations()
+        with self.session_write_lock:
+            if self.pending_skill_activations is None:
+                self.pending_skill_activations = []
+            self.pending_skill_activations.append(snapshot)
+            if self.session_path is not None and self.session_path.exists():
+                self._flush_skill_activations()
 
     def _flush_skill_activations(self) -> None:
         if self.session_path is None or not self.session_path.exists():
@@ -669,8 +820,7 @@ class InteractiveRuntime:
         pending = self.pending_skill_activations or []
         while pending:
             snapshot = pending[0]
-            append_session_event(
-                self.session_path,
+            self._append_event(
                 "skill.activated",
                 {
                     "name": snapshot.name,
@@ -686,6 +836,13 @@ class InteractiveRuntime:
         """Validate and lock a destination before releasing the current Session."""
         destination = Path(path).resolve()
         if self.session_path is not None and destination == self.session_path.resolve():
+            if destination.exists():
+                self._restore_vision(load_session(
+                    destination, allow_incomplete_tool_batch=True, allow_pending_user_tail=True,
+                ))
+            elif self.vision_runtime is not None:
+                self.vision_runtime.cancel()
+                self.vision_runtime = None
             if self.verification_runtime is not None:
                 previous = self.verification_runtime.export_state()
                 self.verification_runtime = (
@@ -733,6 +890,7 @@ class InteractiveRuntime:
         self.title = data.title
         self.sticky_skills = data.sticky_skills
         self.last_task_state = data.task_state
+        self._restore_vision(data)
         self.verification_runtime = (
             VerificationRuntime(
                 self.workspace, initial_state=data.task_state,
@@ -769,8 +927,7 @@ class InteractiveRuntime:
                 )
             self._save(recovered)
             assert self.session_path is not None
-            append_session_event(
-                self.session_path,
+            self._append_event(
                 "session.recovered",
                 {"kind": "interrupted_turn"},
             )
@@ -780,8 +937,7 @@ class InteractiveRuntime:
             if completed is not None:
                 self._save(completed)
                 assert self.session_path is not None
-                append_session_event(
-                    self.session_path,
+                self._append_event(
                     "session.recovered",
                     {"kind": "last_completed_projection"},
                 )
@@ -798,42 +954,25 @@ class InteractiveRuntime:
             base = copy.deepcopy(data.messages[:-1])
             if resend:
                 assert self.session_path is not None
-                append_session_event(
-                    self.session_path,
+                self._append_event(
                     "session.recovered",
                     {"kind": "pending_user_resend"},
                 )
                 self.messages = base
-                self.run_turn(data.pending_user_message)
+                self.run_turn(data.pending_user_message, resume_data=data)
                 return self.messages or base
-            save_session(
-                self.session_path,
-                data.workspace,
-                data.model,
-                base,
-                data.title,
-                data.sticky_skills,
-            )
+            self._save(base)
             assert self.session_path is not None
-            append_session_event(
-                self.session_path,
+            self._append_event(
                 "session.recovered",
                 {"kind": "pending_user_discarded"},
             )
             return base
         if data.tool_batch_state is not None:
             recovered = build_tool_batch_recovery_messages(data.messages)
-            save_session(
-                self.session_path,
-                data.workspace,
-                data.model,
-                recovered,
-                data.title,
-                data.sticky_skills,
-            )
+            self._save(recovered)
             assert self.session_path is not None
-            append_session_event(
-                self.session_path,
+            self._append_event(
                 "session.recovered",
                 {"kind": "tool_batch_closed"},
             )
@@ -843,9 +982,22 @@ class InteractiveRuntime:
             return recovered
         return copy.deepcopy(data.messages)
 
-    def run_turn(self, task: str) -> None:
+    def run_turn(self, task: str, *, resume_data: SessionData | None = None) -> None:
         """Run one turn with durable snapshots and safe interruption recovery."""
         self._ensure_session()
+        if resume_data is not None:
+            self._restore_vision(resume_data)
+            request_id = None
+        else:
+            if self.vision_runtime is not None:
+                self.vision_runtime.cancel()
+            request_id = str(uuid.uuid4())
+            self.vision_runtime = VisionRuntime(
+                load_vision_settings(), request_id=request_id,
+                persist_callback=self._persist_vision,
+                settings_loader=lambda: load_vision_settings(),
+            )
+        first_snapshot = True
         if self.first_task is None:
             self.first_task = task
         completed = copy.deepcopy(self.messages)
@@ -891,10 +1043,20 @@ class InteractiveRuntime:
         self.last_task_state = None
 
         def snapshot(messages: list[dict[str, object]]) -> None:
-            nonlocal latest
+            nonlocal latest, first_snapshot
             latest = copy.deepcopy(messages)
             # Persist boundaries so recovery can close unfinished calls without replay.
-            self._save(messages)
+            self._save(messages, user_request_id=request_id if first_snapshot else None)
+            if first_snapshot:
+                first_snapshot = False
+                if request_id is not None and self.vision_runtime is not None:
+                    with self.session_write_lock:
+                        saved = load_session(self.session_path, allow_incomplete_tool_batch=True,
+                                             allow_pending_user_tail=True)
+                    if saved.user_request_id != request_id or saved.source_event_seq is None:
+                        raise RuntimeError("图片解析缺少原始用户请求来源")
+                    # Budget -> Session lock ordering; do not bind while saving.
+                    self.vision_runtime.bind_source(saved.source_event_seq)
 
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
         render_event = deduplicate_tool_execution(renderer)
@@ -903,7 +1065,7 @@ class InteractiveRuntime:
             if event_type == "task_state":
                 state = validate_task_state(payload)
                 assert self.session_path is not None
-                append_session_event(self.session_path, "task.state", state)
+                self._append_event("task.state", state)
                 self.last_task_state = state
             render_event(event_type, payload)
         kwargs: dict[str, object] = {}
@@ -929,9 +1091,16 @@ class InteractiveRuntime:
                 token_counter=self.token_counter,
                 skill_runtime=self.skill_runtime,
                 verification_runtime=self.verification_runtime,
+                vision_runtime=self.vision_runtime,
+                on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
+                    runtime, console=self.console,
+                    interactive=bool(getattr(self.args, "interactive_terminal", False)),
+                ),
                 **kwargs,
             )
         except KeyboardInterrupt:
+            if self.vision_runtime is not None:
+                self.vision_runtime.cancel()
             renderer.close()
             self._recover_failed_turn(latest, completed)
             self.console.print(
@@ -942,6 +1111,8 @@ class InteractiveRuntime:
             )
             return
         except Exception:
+            if self.vision_runtime is not None:
+                self.vision_runtime.cancel()
             renderer.close()
             self._recover_failed_turn(latest, completed)
             raise
@@ -1308,6 +1479,8 @@ def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
         _manage_sessions(runtime)
     elif command == "/skills":
         _manage_skills(runtime)
+    elif command == "/vision":
+        manage_vision_settings(runtime.console)
     elif command == "/workspace":
         selected = select_workspace(runtime.console)
         if selected is not None:
@@ -1484,6 +1657,7 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
         )
         initial_lease = None
         if data is not None:
+            runtime._restore_vision(data)
             runtime.messages = runtime._recover_loaded_data(data)
         try:
             return run_repl(runtime)

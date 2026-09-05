@@ -19,6 +19,7 @@ except ImportError:  # pragma: no cover - POSIX is the supported runtime.
 from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 from gum_code.context import LARGE_RESULT_CHAR_LIMIT, persist_tool_result
 from gum_code.verification import validate_task_state
+from gum_code.vision import validate_vision_state
 
 SESSION_VERSION = 3
 LEGACY_SESSION_VERSION = 1
@@ -65,6 +66,9 @@ class SessionData:
     parent_seq: int | None = None
     last_seq: int = -1
     task_state: dict[str, object] | None = None
+    vision_state: dict[str, object] | None = None
+    user_request_id: str | None = None
+    source_event_seq: int | None = None
 
 
 @dataclass(frozen=True)
@@ -101,11 +105,20 @@ _EVENT_TYPES = {
     "skill.activated",
     "context.compacted",
     "task.state",
+    "vision.state",
 }
 
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _validate_request_id(value: object) -> None:
+    try:
+        if not isinstance(value, str) or str(uuid.UUID(value)) != value:
+            raise ValueError
+    except (ValueError, TypeError, AttributeError):
+        raise ValueError("原始用户请求 id 无效") from None
 
 
 def _validate_title(title: str) -> None:
@@ -145,7 +158,7 @@ def _encode_events(events: list[dict[str, object]]) -> bytes:
         (
             json.dumps(
                 event,
-                ensure_ascii=event["type"] == "task.state",
+                ensure_ascii=event["type"] in {"task.state", "vision.state"},
                 separators=(",", ":"),
             ) + "\n"
         ).encode("utf-8")
@@ -174,6 +187,11 @@ def _validate_event(event: object, expected_seq: int) -> dict[str, object]:
     assert isinstance(data, dict)
     if event_type == "task.state":
         validate_task_state(data)
+    elif event_type == "vision.state":
+        if validate_vision_state(data)["source_event_seq"] is None:
+            raise ValueError("vision.state 缺少原始用户请求来源")
+    elif event_type == "turn.started" and "request_id" in data:
+        _validate_request_id(data["request_id"])
     elif event_type == "skill.activated":
         if (
             not isinstance(data.get("name"), str)
@@ -252,6 +270,8 @@ def _read_event_log(
     assert isinstance(data, dict)
     if data.get("version") != SESSION_VERSION:
         raise ValueError(f"不支持的 Session 版本：{data.get('version')!r}")
+    if {"vision_state", "user_request_id", "source_event_seq"} & data.keys():
+        raise ValueError("Session header 不允许包含视觉预算派生状态")
     try:
         uuid.UUID(str(data.get("id")))
     except (ValueError, TypeError, AttributeError) as error:
@@ -309,12 +329,29 @@ def _replay_events(
     assert isinstance(header, dict)
     state = copy.deepcopy(header)
     messages: list[dict[str, object]] = []
+    request_ids: set[str] = set()
     for event in events[1:]:
         event_type = event["type"]
         data = event["data"]
         assert isinstance(data, dict)
         if event_type == "task.state":
             state["task_state"] = validate_task_state(data)
+            continue
+        if event_type == "vision.state":
+            budget = validate_vision_state(data)
+            if (
+                budget["request_id"] != state.get("user_request_id")
+                or budget["source_event_seq"] != state.get("source_event_seq")
+            ):
+                raise ValueError("vision.state 与原始用户请求不匹配")
+            previous = state.get("vision_state")
+            if isinstance(previous, dict) and (
+                budget["used"] < previous["used"]
+                or budget["limit"] < previous["limit"]
+                or (previous["declined_extra"] and not budget["declined_extra"])
+            ):
+                raise ValueError("vision.state 不允许回退本轮预算")
+            state["vision_state"] = budget
             continue
         if event_type == "session.metadata_updated":
             if "title" in data:
@@ -370,6 +407,13 @@ def _replay_events(
             )
         ):
             raise ValueError(f"{event_type} 事件 message 类型不匹配")
+        if event_type == "turn.started" and "request_id" in data:
+            if data["request_id"] in request_ids:
+                raise ValueError("原始用户请求 id 不允许重复开启")
+            request_ids.add(data["request_id"])
+            state["user_request_id"] = data["request_id"]
+            state["source_event_seq"] = event["seq"]
+            state["vision_state"] = None
         if event_type == "tool.result" and messages and _has_in_flight_marker(messages[-1]):
             if messages[-1].get("tool_call_id") != message.get("tool_call_id"):
                 raise ValueError("tool.result 与 in-flight 调用不匹配")
@@ -492,6 +536,8 @@ def save_session(
     messages: list[dict[str, object]],
     title: str = "",
     sticky_skills: tuple[str, ...] | list[str] = (),
+    *,
+    user_request_id: str | None = None,
 ) -> None:
     """Append the semantic difference from a message projection to Session v3."""
     target = Path(path)
@@ -512,6 +558,13 @@ def save_session(
     fitted = _fit_messages_for_session(Path(workspace), messages)
     if not fitted:
         raise ValueError("Session messages 不能为空")
+    request_index = None
+    if user_request_id is not None:
+        _validate_request_id(user_request_id)
+        request_index = next((index for index in range(len(fitted) - 1, -1, -1)
+                              if fitted[index].get("role") == "user"), None)
+        if request_index is None:
+            raise ValueError("原始用户请求快照缺少 user message")
     _session_data_from_messages(
         workspace=Path(workspace),
         model=model,
@@ -537,9 +590,11 @@ def save_session(
         )
         events = [header]
         history: list[dict[str, object]] = []
-        for message in fitted:
+        for index, message in enumerate(fitted):
             event_type = _message_event_type(message)
             data: dict[str, object] = {"message": message}
+            if index == request_index:
+                data["request_id"] = user_request_id
             if event_type in {"tool.execution_started", "tool.result"}:
                 name = _tool_name(history, message.get("tool_call_id"))
                 if name is not None:
@@ -568,6 +623,38 @@ def save_session(
     if metadata:
         additions.append(_event(next_seq, "session.metadata_updated", metadata))
         next_seq += 1
+
+    # A new host request remains an explicit event even after recovery replaced
+    # the projection; compaction and internal user-role notices never bind it.
+    if request_index is not None:
+        if any(event["type"] == "turn.started" and event["data"].get("request_id") == user_request_id
+               for event in events):
+            raise ValueError("原始用户请求 id 不允许重复开启")
+        base = fitted[:request_index]
+        if current != base:
+            additions.append(_event(next_seq, "context.compacted", {
+                "messages": base, "source_seq": [0, len(events) - 1],
+            }))
+            next_seq += 1
+        history = copy.deepcopy(base)
+        for index, message in enumerate(fitted[request_index:], request_index):
+            event_type = _message_event_type(message)
+            data = {"message": message}
+            if index == request_index:
+                data["request_id"] = user_request_id
+            if event_type in {"tool.execution_started", "tool.result"}:
+                name = _tool_name(history, message.get("tool_call_id"))
+                if name is not None:
+                    data["tool_name"] = name
+            additions.append(_event(next_seq, event_type, data))
+            next_seq += 1
+            history.append(message)
+        content = _encode_events(additions)
+        needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
+        if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
+            raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
+        _append_bytes(target, content)
+        return
 
     prefix = len(fitted) >= len(current) and fitted[: len(current)] == current
     replaces_in_flight = (
@@ -706,6 +793,9 @@ def load_session(
             ),
             last_seq=len(events) - 1,
             task_state=state.get("task_state"),
+            vision_state=state.get("vision_state"),
+            user_request_id=state.get("user_request_id"),
+            source_event_seq=state.get("source_event_seq"),
         )
 
     if not isinstance(data, dict):
@@ -778,6 +868,9 @@ def _session_data_from_messages(
     parent_seq: int | None = None,
     last_seq: int = -1,
     task_state: dict[str, object] | None = None,
+    vision_state: dict[str, object] | None = None,
+    user_request_id: str | None = None,
+    source_event_seq: int | None = None,
 ) -> SessionData:
     if messages[0].get("role") != "system":
         raise ValueError("Session 第一条消息必须是 system message")
@@ -813,17 +906,22 @@ def _session_data_from_messages(
         parent_seq=parent_seq,
         last_seq=last_seq,
         task_state=validate_task_state(task_state) if task_state is not None else None,
+        vision_state=validate_vision_state(vision_state) if vision_state is not None else None,
+        user_request_id=user_request_id,
+        source_event_seq=source_event_seq,
     )
 
 
 def append_session_event(path: Path, event_type: str, data: dict[str, object]) -> int:
     """Append one validated non-projection Session event."""
-    if event_type not in {"skill.activated", "session.recovered", "task.state"}:
+    if event_type not in {"skill.activated", "session.recovered", "task.state", "vision.state"}:
         raise ValueError(f"不允许直接追加 Session 事件：{event_type}")
     target = Path(path)
     events = _read_event_log(target, repair_tail=True)
     addition = _event(len(events), event_type, copy.deepcopy(data))
     _validate_event(addition, len(events))
+    if event_type == "vision.state":
+        _replay_events([*events, addition])
     content = _encode_events([addition])
     needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
     if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
@@ -957,13 +1055,33 @@ def fork_session(source: Path, boundary_seq: int, destination: Path) -> Path:
     )
     child_events = [header]
     for message in messages:
+        data = {"message": message, "provenance": "fork_import"}
         child_events.append(
             _event(
                 len(child_events),
                 _message_event_type(message),
-                {"message": message, "provenance": "fork_import"},
+                data,
             )
         )
+    if state.get("vision_state") is not None:
+        # Preserve source identity through compaction/repeated text; copied
+        # budgets are history, never configuration or verification permission.
+        child_events = [header]
+        sequence_map = {0: 0}
+        for original in events[1:boundary_seq + 1]:
+            if original["type"] == "task.state":
+                sequence_map[original["seq"]] = len(child_events) - 1
+                continue
+            copied = copy.deepcopy(original)
+            copied["seq"] = len(child_events)
+            data = copied["data"]
+            if copied["type"] == "vision.state":
+                data["source_event_seq"] = sequence_map[data["source_event_seq"]]
+            elif copied["type"] == "context.compacted":
+                data["source_seq"] = [sequence_map.get(value, value) for value in data["source_seq"]]
+            sequence_map[original["seq"]] = copied["seq"]
+            child_events.append(copied)
+        _replay_events(child_events)
     content = _encode_events(child_events)
     if len(content) > MAX_SESSION_FILE_BYTES:
         raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
