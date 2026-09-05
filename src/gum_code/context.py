@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from gum_code.token_counting import RequestTokenCounter
+from gum_code.tools.command_logs import compact_command_output
 
 # Kept for direct library callers; CLI requests derive their budget per model.
 DEFAULT_MAX_CONTEXT_TOKENS = 800_000
@@ -151,6 +152,9 @@ def persist_tool_result(
     content: str,
 ) -> str:
     """Persist one complete Tool Result and return its bounded placeholder."""
+    command_marker = compact_command_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
+    if command_marker is not None:
+        return command_marker
     filename = f"{_safe_tool_call_id(tool_call_id)}.txt"
     _write_tool_result(_safe_tool_results_directory(workspace), filename, content)
     relative_path = f"{TOOL_RESULTS_DIR}/{filename}"
@@ -207,6 +211,12 @@ def apply_tool_result_budget(
     for index in ordered:
         content = result[index].get("content")
         if not isinstance(content, str) or len(content) <= LARGE_RESULT_CHAR_LIMIT:
+            continue
+
+        command_marker = compact_command_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
+        if command_marker is not None:
+            result[index]["content"] = command_marker
+            persisted += 1
             continue
 
         tool_call_id = result[index].get("tool_call_id", "")
@@ -368,6 +378,13 @@ def apply_micro_compact(
         if len(content) <= MICRO_COMPACT_MIN_CONTENT_CHARS:
             continue
 
+        command_marker = compact_command_output(content, workspace, 0)
+        if command_marker is not None:
+            result[index]["content"] = command_marker
+            if len(command_marker) < len(content):
+                shortened += 1
+            continue
+
         existing = _extract_trusted_tool_result_path(content, workspace)
         if existing is not None:
             marker = _micro_result_marker(existing)
@@ -425,6 +442,13 @@ def apply_fit_tool_results(
 
         content = result[index].get("content")
         if not isinstance(content, str):
+            continue
+
+        command_marker = compact_command_output(content, workspace, FIT_RESULT_PREVIEW_CHARS)
+        if command_marker is not None:
+            result[index]["content"] = command_marker
+            if len(command_marker) < len(content):
+                fitted += 1
             continue
 
         trusted_path = _extract_trusted_tool_result_path(content, workspace)

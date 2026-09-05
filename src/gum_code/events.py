@@ -1,5 +1,6 @@
 """Render structured Agent events with bounded, sanitized terminal text."""
 
+import json
 import os
 import re
 from collections.abc import Callable
@@ -77,6 +78,35 @@ def _safe_multiline(value: object) -> str:
 def _bounded_inline(value: object) -> str:
     text = _safe_inline(value)
     return text if len(text) <= MAX_PREVIEW else text[:MAX_PREVIEW] + "…"
+
+
+def _command_failure(payload: dict[str, object]) -> str | None:
+    """Show fixed failure notices without printing private command previews."""
+    content = payload.get("result")
+    if payload.get("tool_name") != "run_command" or not isinstance(content, str):
+        return None
+    if not content.startswith("<command-output>\n") or "\n</command-output>" not in content:
+        return None
+    header = content.partition("\n")[2].partition("\n")[0]
+    if len(header) > 1_024:
+        return None
+    try:
+        metadata = json.loads(header)
+    except ValueError:
+        return None
+    if not isinstance(metadata, dict) or not isinstance(metadata.get("reason"), str):
+        return None
+    reason = metadata["reason"]
+    if reason == "exited":
+        code = metadata.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+            return "命令非零退出；尚未通过检查。"
+        return None
+    return {
+        "timeout": "命令超时；请检查 Sandbox 是否已清理。",
+        "interrupted": "命令已中断；请检查 Sandbox 是否已清理。",
+        "unknown": "命令执行状态未确认；请检查 Sandbox。",
+    }.get(reason)
 
 
 def create_console() -> Console:
@@ -171,7 +201,7 @@ class RichEventRenderer:
             return
         if event_type == "tool_result":
             result = str(payload.get("result", ""))
-            if result.startswith("Error:"):
+            if result.startswith("Error:") or _command_failure(payload) is not None:
                 self.console.print(
                     Text(
                         "工具失败："
@@ -311,7 +341,11 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
 
     if event_type == "tool_result":
         result = str(payload.get("result", ""))
-        if result.startswith("Error:"):
+        command_failure = _command_failure(payload)
+        if command_failure is not None:
+            print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──")
+            print(command_failure)
+        elif result.startswith("Error:"):
             print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──")
             print(_truncate(_safe_multiline(result)))
         elif (

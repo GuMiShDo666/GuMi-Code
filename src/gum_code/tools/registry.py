@@ -348,7 +348,9 @@ READ_TOOL_OUTPUT_SCHEMA = {
         "name": "read_tool_output",
         "description": (
             "Read a persisted tool result whose exact path was provided by the Harness. "
-            "Only .task_outputs/tool-results/*.txt is accepted."
+            "Accepts .task_outputs/tool-results/*.txt and exact Harness-provided "
+            "command-logs/*.txt paths. Command logs can expire or retain only head/tail; "
+            "complete means this retained file's pagination is finished, not that omitted output exists."
         ),
         "parameters": {
             "type": "object",
@@ -357,7 +359,7 @@ READ_TOOL_OUTPUT_SCHEMA = {
                     "type": "string",
                     "description": (
                         "Exact persisted result path, such as "
-                        ".task_outputs/tool-results/<id>.txt."
+                        ".task_outputs/tool-results/<id>.txt or the provided command-logs path."
                     ),
                 },
                 "offset": {

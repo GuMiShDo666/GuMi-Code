@@ -28,7 +28,7 @@ MAX_SCAN_SECONDS = 5.0
 _STATUSES = {"running", "completed", "incomplete", "failed", "interrupted"}
 _CHECK_STATUSES = {"pending", "passed", "failed", "stale", "not_started"}
 _DEFINITION_KEYS = {
-    "id", "purpose", "argv", "cwd", "timeout_seconds", "definition_files", "output_dirs"
+    "id", "purpose", "argv", "cwd", "timeout_seconds", "definition_files", "output_dirs", "dependency_dirs"
 }
 _STATE_KEYS = {
     "version", "task_id", "goal", "requires_verification", "status", "stop_reason",
@@ -40,6 +40,23 @@ _SECRET = re.compile(
 )
 
 VerificationApprovalCallback = Callable[[dict[str, object]], bool]
+
+_SCAN_MESSAGES = {
+    "scan_limit": "扫描超过目录项、字节或时间预算；请明确批准依赖/产物目录排除，纳入源码仍受原预算限制。",
+    "scan_path": "扫描路径、链接或文件类型不安全；请检查入口和排除根，纳入输入不支持链接。",
+    "scan_read": "扫描输入无法读取；请检查普通输入的存在性和读取权限。",
+    "scan_changed": "扫描期间输入发生变化；请停止并发写入后重试。",
+    "scope_approval": "扫描排除范围尚未批准或许可已失效；请重新提交计划并批准范围。",
+    "version_unavailable": "工作版本无法确认；请检查输入及扫描条件后重试。",
+}
+
+
+class _ScanError(ValueError):
+    """Expose only fixed diagnostics, never filesystem exception details."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(f"{code}: {_SCAN_MESSAGES[code]}")
 
 
 def _text(value: object, *, maximum: int = MAX_TEXT_CHARS, empty: bool = False) -> str:
@@ -95,6 +112,7 @@ def _definition(value: object) -> dict[str, object]:
     result.update(normalize_command({key: value[key] for key in ("argv", "cwd", "timeout_seconds") if key in value}))
     result["definition_files"] = _paths(value.get("definition_files", []), MAX_DEFINITION_FILES)
     result["output_dirs"] = _paths(value.get("output_dirs", []), MAX_OUTPUT_DIRS)
+    result["dependency_dirs"] = _paths(value.get("dependency_dirs", []), MAX_OUTPUT_DIRS)
     return result
 
 
@@ -119,10 +137,14 @@ def validate_task_state(value: object) -> dict[str, object]:
     checks = value["checks"]
     if not isinstance(checks, list) or len(checks) > MAX_CHECKS:
         raise ValueError("验证清单超过限制")
+    value = copy.deepcopy(value)
+    checks = value["checks"]
     ids = set()
     for check in checks:
-        if not isinstance(check, dict) or set(check) != _DEFINITION_KEYS | {"status", "evidence"}:
+        required = (_DEFINITION_KEYS - {"dependency_dirs"}) | {"status", "evidence"}
+        if not isinstance(check, dict) or not required <= set(check) <= _DEFINITION_KEYS | {"status", "evidence"}:
             raise ValueError("验证项状态无效")
+        check.setdefault("dependency_dirs", [])
         definition = _definition({key: check[key] for key in _DEFINITION_KEYS})
         if definition["id"] in ids or not isinstance(check["status"], str) or check["status"] not in _CHECK_STATUSES:
             raise ValueError("验证项标识或状态无效")
@@ -152,7 +174,7 @@ def validate_task_state(value: object) -> dict[str, object]:
             raise ValueError("自查版本无效")
     if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) > MAX_TASK_STATE_BYTES:
         raise ValueError("任务验证状态超过限制")
-    return copy.deepcopy(value)
+    return value
 
 
 def _signature(info: os.stat_result) -> tuple[int, ...]:
@@ -162,26 +184,44 @@ def _signature(info: os.stat_result) -> tuple[int, ...]:
 def _file_hash(root: Path, name: str, charge: Callable[[int], None]) -> tuple[str, int]:
     name = _relative(name)
     target = root / name
-    _reject_symlinks(root, name)
+    try:
+        _reject_symlinks(root, name)
+    except ValueError:
+        raise _ScanError("scan_path") from None
     if not target.resolve().is_relative_to(root):
-        raise ValueError("验证输入路径越界")
+        raise _ScanError("scan_path")
     info = target.lstat()
     if not stat.S_ISREG(info.st_mode):
-        raise ValueError("验证输入必须为普通文件")
+        raise _ScanError("scan_path")
     descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as source:
         if _signature(os.fstat(source.fileno())) != _signature(info):
-            raise ValueError("验证输入读取时发生变化")
+            raise _ScanError("scan_changed")
         digest = hashlib.sha256()
         while chunk := source.read(65536):
             charge(len(chunk))
             digest.update(chunk)
         if _signature(os.fstat(source.fileno())) != _signature(info):
-            raise ValueError("验证输入读取时发生变化")
-    _reject_symlinks(root, name)
+            raise _ScanError("scan_changed")
+    try:
+        _reject_symlinks(root, name)
+    except ValueError:
+        raise _ScanError("scan_path") from None
     if _signature(target.lstat()) != _signature(info):
-        raise ValueError("验证输入读取时发生变化")
+        raise _ScanError("scan_changed")
     return digest.hexdigest(), info.st_mode & 0o111
+
+
+def _validate_excluded_dirs(root: Path, paths: tuple[str, ...]) -> None:
+    for path in paths:
+        try:
+            path = _relative(path)
+            _reject_symlinks(root, path)
+            target = root / path
+            if target.exists() and not target.is_dir():
+                raise ValueError("not a directory")
+        except (ValueError, RuntimeError):
+            raise _ScanError("scan_path") from None
 
 
 def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
@@ -194,7 +234,7 @@ def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
 
     def check_limits() -> None:
         if count > MAX_SCAN_FILES or total > MAX_SCAN_BYTES or time.monotonic() - started > MAX_SCAN_SECONDS:
-            raise ValueError("工作版本扫描超过限制")
+            raise _ScanError("scan_limit")
 
     def charge(size: int) -> None:
         nonlocal total
@@ -221,13 +261,13 @@ def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
             info = target.lstat()
             if target in internal_paths:
                 if not stat.S_ISREG(info.st_mode):
-                    raise ValueError("内部状态排除必须是普通文件")
+                    raise _ScanError("scan_path")
                 continue
             if stat.S_ISLNK(info.st_mode):
-                raise ValueError("工作版本不能覆盖链接输入")
+                raise _ScanError("scan_path")
             _reject_symlinks(root, relative.as_posix())
             if not target.resolve().is_relative_to(root):
-                raise ValueError("工作版本路径越界")
+                raise _ScanError("scan_path")
             digest.update(json.dumps([relative.as_posix(), stat.S_IFMT(info.st_mode), info.st_mode & 0o111]).encode())
             if stat.S_ISDIR(info.st_mode):
                 visit(target)
@@ -235,14 +275,20 @@ def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
                 file_hash, _ = _file_hash(root, relative.as_posix(), charge)
                 digest.update(file_hash.encode())
             else:
-                raise ValueError("工作版本不能覆盖特殊文件")
+                raise _ScanError("scan_path")
         if _signature(directory.stat()) != _signature(before):
-            raise ValueError("工作版本扫描时发生变化")
+            raise _ScanError("scan_changed")
 
     try:
+        _validate_excluded_dirs(root, output_dirs)
         visit(root)
-    except (OSError, RuntimeError):
-        raise ValueError("工作版本无法确认") from None
+        _validate_excluded_dirs(root, output_dirs)
+    except OSError:
+        raise _ScanError("scan_read") from None
+    except _ScanError:
+        raise
+    except (ValueError, RuntimeError):
+        raise _ScanError("scan_path") from None
     return digest.hexdigest()
 
 
@@ -258,6 +304,7 @@ class VerificationRuntime:
         self._grants: set[str] = set()
         self._denied: set[str] = set()
         self._approved_outputs: tuple[str, ...] = ()
+        self._approval_sandbox: object = None
         self._before_command: str | None = None
         self._finished = False
         self._internal_paths: tuple[Path, ...] = ()
@@ -324,16 +371,36 @@ class VerificationRuntime:
         self._state["requires_verification"] = True
 
     def _version(self) -> str:
-        return workspace_fingerprint(self.workspace, self._approved_outputs, self._internal_paths)
+        try:
+            checks = self._definitions()
+            if self._exclusions(checks):
+                if not self._approved_outputs:
+                    raise _ScanError("scope_approval")
+                if self._identity(checks, self._approval_sandbox)[0] not in self._grants:
+                    self.revoke_grants()
+                    raise _ScanError("scope_approval")
+            version = workspace_fingerprint(self.workspace, self._approved_outputs, self._internal_paths)
+        except (ValueError, OSError, RuntimeError) as error:
+            code = error.code if isinstance(error, _ScanError) else (
+                "scan_read" if isinstance(error, OSError) else "version_unavailable"
+            )
+            self._state["stop_reason"] = code
+            raise _ScanError(code) from None
+        if self._state["stop_reason"] in _SCAN_MESSAGES:
+            self._state["stop_reason"] = ""
+        return version
 
     def _definitions(self) -> list[dict[str, object]]:
         return [{key: check[key] for key in _DEFINITION_KEYS} for check in self._state["checks"]]
 
     def _protect_entries(self, check: dict[str, object]) -> None:
         cwd = self.workspace / check["cwd"]
-        _reject_symlinks(self.workspace, check["cwd"])
+        try:
+            _reject_symlinks(self.workspace, check["cwd"])
+        except ValueError:
+            raise _ScanError("scan_path") from None
         if not cwd.is_dir():
-            raise ValueError("验证工作目录不存在")
+            raise _ScanError("scan_path")
         definitions = set(check["definition_files"])
         program = Path(check["argv"][0]).name
         config_flags = {"-c", "--config", "--config-file", "--configuration", "--manifest-path", "-f", "--file", "--project"}
@@ -348,13 +415,16 @@ class VerificationRuntime:
             direct_script = index == 1 and (program.startswith("python") or program in {"node", "nodejs"})
             if target.is_file() and (index == 0 or explicit_config or direct_script or Path(candidate).suffix or "/" in candidate):
                 if not target.resolve().is_relative_to(self.workspace):
-                    raise ValueError("验证入口必须位于工作区内")
+                    raise _ScanError("scan_path")
                 definitions.add(_relative(target.relative_to(self.workspace).as_posix()))
         conventional = {
-            "npm": ("package.json",), "pnpm": ("package.json",), "yarn": ("package.json",),
-            "bun": ("package.json",), "pytest": ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"),
-            "cargo": ("Cargo.toml",), "make": ("Makefile", "GNUmakefile"),
-            "go": ("go.mod", "go.work"),
+            "npm": ("package.json", "package-lock.json", "npm-shrinkwrap.json"),
+            "pnpm": ("package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"),
+            "yarn": ("package.json", "yarn.lock", ".yarnrc.yml"),
+            "bun": ("package.json", "bun.lock", "bun.lockb"),
+            "pytest": ("pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini", "uv.lock", "poetry.lock", "Pipfile.lock"),
+            "cargo": ("Cargo.toml", "Cargo.lock"), "make": ("Makefile", "GNUmakefile"),
+            "go": ("go.mod", "go.work", "go.sum", "go.work.sum"),
         }
         names = conventional.get(program, ())
         if program.startswith("python") and "pytest" in check["argv"]:
@@ -367,9 +437,12 @@ class VerificationRuntime:
                     definitions.add((directory / name).relative_to(self.workspace).as_posix())
         check["definition_files"] = _paths(sorted(definitions), MAX_DEFINITION_FILES)
         for name in check["definition_files"]:
-            _reject_symlinks(self.workspace, name)
+            try:
+                _reject_symlinks(self.workspace, name)
+            except ValueError:
+                raise _ScanError("scan_path") from None
             if not (self.workspace / name).is_file():
-                raise ValueError("验证定义或入口文件不存在")
+                raise _ScanError("scan_read")
 
     def _identity(self, checks: list[dict[str, object]], sandbox: object) -> tuple[str, dict[str, object]]:
         image_id = getattr(sandbox, "image_id", None)
@@ -382,7 +455,7 @@ class VerificationRuntime:
             nonlocal total
             total += size
             if total > MAX_SCAN_BYTES or time.monotonic() - started > MAX_SCAN_SECONDS:
-                raise ValueError("验证定义读取超过限制")
+                raise _ScanError("scan_limit")
         for check in checks:
             self._protect_entries(check)
             for name in check["definition_files"]:
@@ -413,7 +486,8 @@ class VerificationRuntime:
         if self._identity(copy.deepcopy(checks), sandbox)[0] != key:
             raise ValueError("验证定义在批准期间发生变化")
         self._grants = {key}
-        self._approved_outputs = tuple(sorted({path for check in checks for path in check["output_dirs"]}))
+        self._approved_outputs = self._exclusions(checks)
+        self._approval_sandbox = sandbox
         return True
 
     @staticmethod
@@ -439,15 +513,16 @@ class VerificationRuntime:
             "/" in argv[0] and (Path(check["cwd"]) / argv[0]).as_posix() in check["definition_files"]
         )
 
+    @staticmethod
+    def _exclusions(checks: list[dict[str, object]]) -> tuple[str, ...]:
+        return tuple(sorted({path for check in checks for field in ("output_dirs", "dependency_dirs") for path in check[field]}))
+
     def _validate_outputs(self, checks: list[dict[str, object]]) -> None:
-        outputs = {path for check in checks for path in check["output_dirs"]}
+        outputs = self._exclusions(checks)
         protected = {path for check in checks for path in check["definition_files"]}
         if any(Path(output) == Path(path) or Path(output) in Path(path).parents for output in outputs for path in protected):
             raise ValueError("输出排除不得覆盖验证定义或入口")
-        for output in outputs:
-            _reject_symlinks(self.workspace, output)
-            if (self.workspace / output).exists() and not (self.workspace / output).is_dir():
-                raise ValueError("输出排除必须为目录")
+        _validate_excluded_dirs(self.workspace, outputs)
 
     def plan(self, arguments: dict[str, object], sandbox: object = None,
              before_execute: Callable[[], None] | None = None) -> None:
@@ -463,21 +538,29 @@ class VerificationRuntime:
         for check in checks:
             self._protect_entries(check)
         self._validate_outputs(checks)
-        if self._definitions() == checks and self._state["goal"] == goal:
-            if before_execute is not None:
-                before_execute()
-            return
+        unchanged = self._definitions() == checks and self._state["goal"] == goal
         previous_goal = self._state["goal"]
         previous_grants = self._grants.copy()
         previous_outputs = self._approved_outputs
+        previous_sandbox = self._approval_sandbox
         self._state["goal"] = goal
         try:
+            if unchanged:
+                if self._exclusions(checks) and not self._approve(checks, sandbox):
+                    raise _ScanError("scope_approval")
+                if before_execute is not None:
+                    before_execute()
+                return
             if self._state["checks"] and not self._approve(checks, sandbox):
                 raise ValueError("改变验证清单需要重新批准")
-            if not self._state["checks"] and sandbox is not None and self.approval_callback is not None and all(self._repeatable(check) for check in checks):
+            if not self._state["checks"] and sandbox is not None and self.approval_callback is not None and (
+                self._exclusions(checks) or all(self._repeatable(check) for check in checks)
+            ):
                 self._approve(checks, sandbox)
             candidate = {**self._state, "requires_verification": True, "review": None,
-                         "stop_reason": "no_checks" if not checks else "",
+                         "stop_reason": "no_checks" if not checks else (
+                             "scope_approval" if self._exclusions(checks) and not self._approved_outputs else ""
+                         ),
                          "checks": [{**check, "status": "pending", "evidence": None} for check in checks]}
             candidate = validate_task_state(candidate)
             if before_execute is not None:
@@ -487,15 +570,21 @@ class VerificationRuntime:
             self._state["goal"] = previous_goal
             self._grants = previous_grants
             self._approved_outputs = previous_outputs
+            self._approval_sandbox = previous_sandbox
             raise
 
     def wrap_approval(self, callback: Callable | None, sandbox: object) -> Callable:
         def approve(tool_name: str, arguments: dict[str, object], reason: str) -> bool:
             matched = self._match(arguments) if tool_name == "run_command" else None
-            if matched is not None and self._repeatable(matched):
+            if matched is not None:
                 if self.approval_callback is not None:
                     try:
-                        return self._approve(self._definitions(), sandbox)
+                        repeatable = self._repeatable(matched)
+                        if repeatable or self._exclusions(self._definitions()):
+                            if not self._approve(self._definitions(), sandbox):
+                                return False
+                        if repeatable:
+                            return True
                     except (ValueError, OSError):
                         return False
             return bool(callback and callback(tool_name, arguments, reason))
@@ -585,7 +674,17 @@ class VerificationRuntime:
                 # history; the model can recover exact commands after compaction.
                 return json.dumps(self.export_state(), ensure_ascii=False)
             return self.summary()
-        except (ValueError, TypeError, OSError):
+        except _ScanError as error:
+            if callback_failed:
+                raise
+            self._state["stop_reason"] = error.code
+            return f"Error: {error}"
+        except OSError:
+            if callback_failed:
+                raise
+            self._state["stop_reason"] = "scan_read"
+            return f"Error: {_ScanError('scan_read')}"
+        except (ValueError, TypeError):
             if callback_failed:
                 raise
             return "Error: 验证参数、入口、批准或工作版本无法确认；请检查清单与定义。"
@@ -604,9 +703,9 @@ class VerificationRuntime:
             return False, True, "missing_plan"
         try:
             version = self._version()
-        except ValueError:
+        except _ScanError as error:
             self.invalidate()
-            return False, False, "version_unavailable"
+            return False, False, error.code
         for check in self._state["checks"]:
             if check["evidence"] and check["evidence"]["version"] != version:
                 check["status"] = "stale"
@@ -625,28 +724,37 @@ class VerificationRuntime:
         if self._finished:
             return False
         self._state.update(status=status, stop_reason=reason)
-        if status in {"completed", "interrupted"}:
+        if status in {"completed", "failed", "interrupted"}:
+            if status != "completed" and self._approved_outputs:
+                self.invalidate()
             self._grants.clear()
             self._denied.clear()
+            self._approved_outputs = ()
+            self._approval_sandbox = None
         self._finished = True
         return True
 
     def persistence_failed(self) -> None:
         self._state.update(status="failed", stop_reason="persistence_error")
-        self._grants.clear()
-        self._denied.clear()
+        self.revoke_grants()
 
     def revoke_grants(self) -> None:
         """Host-only revocation; history survives but future execution must ask."""
         self._grants.clear()
         self._denied.clear()
+        if self._approved_outputs:
+            self.invalidate()
+        self._approved_outputs = ()
+        self._approval_sandbox = None
 
     def set_step(self, step: int) -> None:
         self._state["steps"] = step
 
     def summary(self, *, status: str | None = None, reason: str | None = None) -> str:
         checks = ", ".join(f"{check['id']}={check['status']}" for check in self._state["checks"])
-        return f"验收状态：{status or self._state['status']}；原因：{reason or self._state['stop_reason'] or '尚未结束'}；检查：{checks or '未登记'}。"
+        reason = reason or self._state["stop_reason"] or "尚未结束"
+        scope = "仅针对批准输入范围；排除目录未逐文件核验，锁文件不证明其内容未变。" if self._exclusions(self._definitions()) else ""
+        return f"验收状态：{status or self._state['status']}；原因：{reason}；检查：{checks or '未登记'}。{_SCAN_MESSAGES.get(reason, '')}{scope}"
 
 
 VERIFICATION_TOOL_SCHEMA = {
@@ -668,6 +776,9 @@ VERIFICATION_TOOL_SCHEMA = {
                                          "items": {"type": "string", "maxLength": MAX_ARGUMENT_CHARS}},
                     "output_dirs": {"type": "array", "maxItems": MAX_OUTPUT_DIRS,
                                     "items": {"type": "string", "maxLength": MAX_ARGUMENT_CHARS}},
+                    "dependency_dirs": {"type": "array", "maxItems": MAX_OUTPUT_DIRS,
+                                        "description": "Concrete installed-dependency directories to exclude only after explicit scope approval; source, config and lock files must remain checked.",
+                                        "items": {"type": "string", "maxLength": MAX_ARGUMENT_CHARS}},
                 }, "required": ["id", "purpose", "argv"], "additionalProperties": False,
             }},
             "summary": {"type": "string", "maxLength": MAX_TEXT_CHARS},
@@ -679,6 +790,7 @@ VERIFICATION_TOOL_SCHEMA = {
 
 VERIFICATION_INSTRUCTION = (
     "开发阶段必须先用 verification plan 登记必要构建/测试与覆盖目的，再用 run_command 实测。"
+    "大型依赖/生成目录可分别用 dependency_dirs/output_dirs 提议明确排除，用户批准前不生效；源码、配置和锁文件不得排除。"
     "失败后在已授权范围修复并重测；不得删除检查、降低断言或屏蔽错误骗取通过。"
     "完成前用 verification review 提交需求覆盖、改动自查及 unresolved 列表。"
     "普通工具输出、Todo 和你的完成声明不能替代宿主验收。无法验证时说明阻塞，不声称完成。"

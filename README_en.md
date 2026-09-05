@@ -120,6 +120,18 @@ Repeat permission applies only to the current process, workspace, and stage. Ord
 
 A one-shot development task exits with `0` after verified completion and `1` if incomplete or verification fails. A completed read-only answer still exits with `0`. A failed REPL turn leaves the conversation open for follow-up. Passing checks does not establish complete business coverage or production readiness. Bounded content scans may be blocked by workspace size, symbolic-link inputs, or concurrent changes; they are not atomic filesystem snapshots.
 
+### Large-workspace verification scopes
+
+In addition to generated `output_dirs`, verification plans can propose concrete installed-dependency directories, such as `node_modules`, through `dependency_dirs`. Exclusions require explicit scope approval; neither directory names nor `.gitignore` activate them automatically. Source, required configuration, and lockfiles remain checked. Unknown wrapper commands still need per-call execution approval even after their scan scope is approved.
+
+Excluded directories are not checked file by file, and an unchanged lockfile does not prove their contents unchanged. Resuming a Session or revoking permission requires fresh scope approval. Included inputs retain the per-scan limits of 20,000 entries, 128 MiB, and 5 seconds. Oversized source trees, symbolic links, or concurrent changes produce a diagnostic, not a verification pass.
+
+### Build logs
+
+`run_command` keeps draining stdout/stderr; exceeding the preview or saved-log budget alone does not stop a command. Bounded head/tail buffers are kept in memory, then private logs are saved on completion when possible: at most 5 MiB per file and 100 MiB per workspace for new command logs. Only the oldest completed logs owned by this mechanism are reclaimed; other tool artifacts are untouched. Temporary containers use `--log-driver=none` to avoid a second Docker container log.
+
+The model can page through retained content with `read_tool_output`. Omitted middle output cannot be recovered, and old references may become unavailable after cleanup. The `complete` pagination field means the saved file has been read, not that the original output is complete. Ordinary write, quota, or lock failures allow execution to continue with an explicit unsaved-log status; path and sandbox safety failures still reject execution. A genuine zero exit with unchanged inputs is not failed solely for truncated or unsaved logs, while timeouts and pipe read errors cannot pass. The terminal still does not stream log bodies.
+
 ## Skills and Sessions
 
 Use `$skill-name` in a task to load a Codex user Skill before the first model request. Gum Code scans only direct children of `$CODEX_HOME/skills` (or `~/.codex/skills` when unset). Explicit Skills stay sticky in the current Session, with a maximum of three active Skills per task and three sticky names per Session. The root Agent can also use `find_skills`, `load_skill`, and `read_skill_resource`; automatic loads last only for the current task. `/skills` lists, disables, or clears sticky names without printing Skill content.
