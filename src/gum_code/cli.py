@@ -1,3 +1,5 @@
+"""Wire explicit task intent, durable outcomes, and process-level exit status."""
+
 import argparse
 import sys
 from pathlib import Path
@@ -16,11 +18,15 @@ from gum_code.events import (
     print_terminal_event,
 )
 from gum_code.interactive import (
+    resolve_task_type,
     run_interactive,
     select_workspace,
     trust_workspace,
 )
-from gum_code.permissions.terminal import request_terminal_approval
+from gum_code.permissions.terminal import (
+    request_terminal_approval,
+    request_verification_approval,
+)
 from gum_code.session import (
     SESSION_VERSION,
     SessionLease,
@@ -34,6 +40,7 @@ from gum_code.skills import SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
+from gum_code.verification import VerificationRuntime, validate_task_state
 
 
 def _positive_int(value: str) -> int:
@@ -58,6 +65,10 @@ def parse_args(
     parser = argparse.ArgumentParser(prog="gum-code")
     parser.add_argument("--workspace", help="工作区目录路径")
     parser.add_argument(
+        "--task-type", choices=("development", "read-only"),
+        help="确认当前阶段类型；非交互未声明且无可恢复类型时只能报告未验证",
+    )
+    parser.add_argument(
         "--max-steps", type=_positive_int, default=MAX_STEPS,
         help=f"最多执行的正模型步骤数（默认 {MAX_STEPS}）",
     )
@@ -68,7 +79,7 @@ def parse_args(
     )
     parser.add_argument(
         "--allow-run-command", action="store_true",
-        help="允许模型请求在 Docker Sandbox 中执行命令，每次仍需审批",
+        help="允许模型请求在 Docker Sandbox 中执行命令；固定验收可另行批准阶段内重跑",
     )
     parser.add_argument(
         "--no-subagent", dest="allow_subagent", action="store_false",
@@ -174,7 +185,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             command_sandbox = load_docker_sandbox(args.sandbox_image)
             print(
                 "警告：run_command 已启用；命令将在断网 Docker Sandbox 中运行，"
-                "但仍可修改未遮蔽的 workspace 文件且每次需审批。"
+                "但仍可修改未遮蔽的 workspace 文件；固定验收重跑需单独批准。"
             )
 
         settings = load_settings()
@@ -248,6 +259,43 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             activation_callback=record_activation if session_file is not None else None,
         )
 
+        previous_state = resumed.task_state if resumed is not None else None
+        if previous_state is not None and previous_state.get("status") == "completed":
+            previous_state = None
+        verification_runtime = VerificationRuntime(
+            args.workspace,
+            requires_verification=resolve_task_type(
+                args.task_type,
+                previous=previous_state,
+                interactive=args.interactive_terminal,
+            ),
+            initial_state=previous_state,
+            approval_callback=request_verification_approval,
+            internal_paths=(
+                (Path(session_file), lease.lock_path)
+                if session_file is not None and lease is not None
+                else ()
+            ),
+        )
+        last_task_state: dict[str, object] | None = None
+        render_event = deduplicate_tool_execution(print_terminal_event)
+
+        def event_callback(event_type: str, payload: dict[str, object]) -> None:
+            nonlocal last_task_state
+            if event_type == "task_state":
+                state = validate_task_state(payload)
+                if session_file is not None:
+                    append_session_event(session_file, "task.state", state)
+                last_task_state = state
+            elif event_type == "final_answer" and (
+                last_task_state is None
+                or last_task_state.get("status") not in {
+                    "completed", "incomplete", "failed", "interrupted",
+                }
+            ):
+                raise RuntimeError("缺少可信任务终态，不能展示完成结果")
+            render_event(event_type, payload)
+
         message_snapshot_callback = None
         if session_file is not None:
             workspace = args.workspace
@@ -278,14 +326,17 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             max_context_tokens=max_context_tokens,
             allow_run_command=args.allow_run_command,
             approval_callback=request_terminal_approval,
-            event_callback=deduplicate_tool_execution(print_terminal_event),
+            event_callback=event_callback,
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
             token_counter=token_counter,
             skill_runtime=skill_runtime,
+            verification_runtime=verification_runtime,
             **kwargs,
         )
-        return 0
+        if last_task_state is not None and last_task_state.get("status") == "completed":
+            return 0
+        return 1
     finally:
         if lease is not None:
             lease.release()

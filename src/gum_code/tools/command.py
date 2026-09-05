@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO
@@ -41,6 +42,19 @@ _DOCKER_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 class DockerSandboxConfig:
     docker_path: Path
     image_id: str
+
+
+@dataclass(frozen=True)
+class CommandExecutionResult:
+    """Host evidence; unknown startup is never evidence of successful execution."""
+
+    started: bool | None
+    exit_code: int | None
+    reason: str
+    output: str = ""
+
+
+CommandResultCallback = Callable[[CommandExecutionResult], None]
 
 
 class _OutputLimitExceeded(Exception):
@@ -614,15 +628,15 @@ def _abort_container(
     return removed
 
 
-def run_command(
+def _run_command(
     workspace: Path,
     argv: list[str],
     cwd: str = ".",
     timeout_seconds: int = 120,
     *,
     sandbox: DockerSandboxConfig | None = None,
-) -> str:
-    """Run validated argv in Docker and return bounded output.
+) -> CommandExecutionResult:
+    """Run validated argv in Docker and return bounded host execution evidence.
 
     Error cleanup targets only this invocation's randomized container.
     """
@@ -656,7 +670,9 @@ def run_command(
                 stderr=subprocess.PIPE,
             )
         except OSError:
-            return "Error: 无法启动 Docker Sandbox"
+            return CommandExecutionResult(
+                False, None, "not_started", "Error: 无法启动 Docker Sandbox"
+            )
 
         # Abnormal paths remove only this invocation's randomized container.
         try:
@@ -667,31 +683,45 @@ def run_command(
         except subprocess.TimeoutExpired:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return f"Error: 命令超时{suffix}"
+            return CommandExecutionResult(
+                None, None, "timeout", f"Error: 命令超时{suffix}"
+            )
         except _OutputLimitExceeded:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return f"Error: 命令输出超过限制{suffix}"
+            return CommandExecutionResult(
+                None, None, "output_limit", f"Error: 命令输出超过限制{suffix}"
+            )
         except KeyboardInterrupt:
             _abort_container(process, sandbox, container_name)
             raise
         except OSError:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return f"Error: Docker Sandbox 执行失败{suffix}"
+            return CommandExecutionResult(
+                None, None, "unknown", f"Error: Docker Sandbox 执行失败{suffix}"
+            )
 
         if process.returncode == 125:
             cleaned = _remove_container(sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return f"Error: Docker Sandbox 启动失败{suffix}"
+            return CommandExecutionResult(
+                False, 125, "not_started", f"Error: Docker Sandbox 启动失败{suffix}"
+            )
 
         if process.returncode is None or process.returncode < 0:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return f"Error: Docker Sandbox 执行失败{suffix}"
+            return CommandExecutionResult(
+                None, process.returncode, "unknown",
+                f"Error: Docker Sandbox 执行失败{suffix}",
+            )
 
     if process.returncode in (126, 127):
-        return "Error: Sandbox 内命令不存在或无法执行"
+        return CommandExecutionResult(
+            False, process.returncode, "not_started",
+            "Error: Sandbox 内命令不存在或无法执行",
+        )
 
     stdout = stdout_bytes.decode("utf-8", errors="replace")
     stderr = stderr_bytes.decode("utf-8", errors="replace")
@@ -702,4 +732,44 @@ def run_command(
         f"stderr:\n{stderr}"
     )
 
-    return _truncate_output(output, MAX_COMMAND_OUTPUT_CHARS)
+    return CommandExecutionResult(
+        True, process.returncode, "exited",
+        _truncate_output(output, MAX_COMMAND_OUTPUT_CHARS),
+    )
+
+
+def run_command(
+    workspace: Path,
+    argv: list[str],
+    cwd: str = ".",
+    timeout_seconds: int = 120,
+    *,
+    sandbox: DockerSandboxConfig | None = None,
+    result_callback: CommandResultCallback | None = None,
+) -> str:
+    """Keep model text separate from optional host-owned execution evidence.
+
+    Observer failures propagate even after a side effect; no successful-looking
+    Tool Result is returned when recording execution evidence fails.
+    """
+    try:
+        result = _run_command(
+            workspace, argv, cwd, timeout_seconds, sandbox=sandbox
+        )
+    except KeyboardInterrupt:
+        if result_callback is not None:
+            result_callback(CommandExecutionResult(None, None, "interrupted"))
+        raise
+    except (TypeError, ValueError, OSError):
+        if result_callback is not None:
+            result_callback(CommandExecutionResult(False, None, "not_started"))
+        raise
+    except Exception:
+        if result_callback is not None:
+            result_callback(CommandExecutionResult(None, None, "unknown"))
+        raise
+
+    # Outside the runner's error handlers: callback ValueError is not a tool error.
+    if result_callback is not None:
+        result_callback(result)
+    return result.output

@@ -83,6 +83,38 @@ def create_console() -> Console:
     return Console(no_color=os.getenv("NO_COLOR") is not None)
 
 
+def task_state_text(payload: dict[str, object]) -> str | None:
+    """Render bounded check identities and status, never arguments or logs."""
+    status = payload.get("status")
+    if not isinstance(status, str):
+        return None
+    if status == "completed" and payload.get("requires_verification") is False:
+        return "任务已完成（问答/只读，无构建验收）。"
+    if status == "completed":
+        checks = payload.get("checks")
+        labels = {
+            "passed": "通过", "failed": "失败", "pending": "待执行",
+            "stale": "需重测", "not_started": "未启动",
+        }
+        summary = []
+        for check in checks[:8] if isinstance(checks, list) else []:
+            if not isinstance(check, dict):
+                continue
+            check_id, check_status = check.get("id"), check.get("status")
+            if (
+                isinstance(check_id, str)
+                and re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", check_id)
+                and isinstance(check_status, str) and check_status in labels
+            ):
+                summary.append(f"{check_id}：{labels[check_status]}")
+        return "阶段验收通过。" + (" 检查：" + "；".join(summary) if summary else "")
+    return {
+        "incomplete": "阶段未完成，尚未满足验收条件。",
+        "failed": "阶段失败，尚未满足验收条件。",
+        "interrupted": "阶段已中断，尚未完成验收。",
+    }.get(status)
+
+
 class RichEventRenderer:
     """Render bounded progress without exposing raw arguments or results."""
 
@@ -131,6 +163,11 @@ class RichEventRenderer:
 
         self._stop_status()
         if event_type == "final_answer":
+            return
+        if event_type == "task_state":
+            text = task_state_text(payload)
+            if text is not None:
+                self.console.print(Text(text))
             return
         if event_type == "tool_result":
             result = str(payload.get("result", ""))
@@ -191,6 +228,11 @@ def _truncate(text: str) -> str:
 
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
     """Render one event while sanitizing model-derived terminal text."""
+    if event_type == "task_state":
+        text = task_state_text(payload)
+        if text is not None:
+            print(text, flush=True)
+        return
     progress_text = {
         "request_prepare": "准备中...",
         "subagent_prepare": "准备中...",

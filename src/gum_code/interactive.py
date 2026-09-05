@@ -35,8 +35,12 @@ from gum_code.events import (
     context_percentage,
     create_console,
     deduplicate_tool_execution,
+    task_state_text,
 )
-from gum_code.permissions.terminal import make_interactive_approval
+from gum_code.permissions.terminal import (
+    make_interactive_approval,
+    make_verification_approval,
+)
 from gum_code.session import (
     MAX_SESSION_TITLE_CHARS,
     SESSION_VERSION,
@@ -55,6 +59,7 @@ from gum_code.session import (
 from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
+from gum_code.verification import VerificationRuntime, validate_task_state
 from gum_code.user_state import (
     SessionEntry,
     UserState,
@@ -81,6 +86,7 @@ KNOWN_COMMANDS = {
     "/sessions",
     "/skills",
     "/status",
+    "/revoke-verification",
     "/verbose",
     "/exit",
 }
@@ -138,6 +144,46 @@ def _confirm(message: str, chooser: Callable[..., object] = choice) -> bool:
         ) is True
     except (Exception, KeyboardInterrupt, EOFError):
         return False
+
+
+def resolve_task_type(
+    requested: str | None,
+    *,
+    previous: dict[str, object] | None = None,
+    interactive: bool = False,
+    chooser: Callable[..., object] | None = None,
+) -> bool | None:
+    """Confirm stage intent without treating model text as user authority."""
+    if requested not in {None, "development", "read-only"}:
+        raise ValueError("task-type 必须是 development 或 read-only")
+    requirement = None
+    if previous is not None and previous.get("status") != "completed":
+        requirement = previous.get("requires_verification")
+    if requirement is True and requested == "read-only":
+        raise ValueError("当前开发阶段尚未完成，不能降为只读；请继续验收或新建 Session")
+    if requirement is True:
+        return True
+    if requested is not None:
+        return requested == "development"
+    if requirement is False:
+        return False
+    if not interactive:
+        return None
+    try:
+        selected = (chooser or choice)(
+            "确认本阶段任务类型（不会批准命令执行）",
+            options=[
+                (None, "暂不确认（不能报告已验证完成）"),
+                ("development", "开发：实现、修复或修改代码，完成前必须验收"),
+                ("read-only", "问答/只读：不交付代码修改，无需构建验收"),
+            ],
+            default=None,
+        )
+    except (Exception, KeyboardInterrupt, EOFError):
+        return None
+    if selected not in {"development", "read-only"}:
+        return None
+    return selected == "development"
 
 
 def _choose_directory(
@@ -576,8 +622,12 @@ class InteractiveRuntime:
     sticky_skills: tuple[str, ...] = ()
     skill_runtime: SkillRuntime | None = None
     pending_skill_activations: list[SkillSnapshot] | None = None
+    verification_runtime: VerificationRuntime | None = None
+    task_type_consumed: bool = False
+    last_task_state: dict[str, object] | None = None
 
     def close(self) -> None:
+        self.verification_runtime = None
         if self.lease is not None:
             self.lease.release()
             self.lease = None
@@ -636,6 +686,23 @@ class InteractiveRuntime:
         """Validate and lock a destination before releasing the current Session."""
         destination = Path(path).resolve()
         if self.session_path is not None and destination == self.session_path.resolve():
+            if self.verification_runtime is not None:
+                previous = self.verification_runtime.export_state()
+                self.verification_runtime = (
+                    VerificationRuntime(
+                        self.workspace,
+                        initial_state=previous,
+                        internal_paths=(
+                            (destination, self.lease.lock_path) if self.lease is not None else ()
+                        ),
+                    )
+                    if previous.get("status") != "completed"
+                    else None
+                )
+                self.last_task_state = (
+                    self.verification_runtime.export_state()
+                    if self.verification_runtime is not None else previous
+                )
             return
         lease = SessionLease(destination).acquire()
         try:
@@ -665,6 +732,15 @@ class InteractiveRuntime:
         self.lease = lease
         self.title = data.title
         self.sticky_skills = data.sticky_skills
+        self.last_task_state = data.task_state
+        self.verification_runtime = (
+            VerificationRuntime(
+                self.workspace, initial_state=data.task_state,
+                internal_paths=(self.session_path, lease.lock_path),
+            )
+            if data.task_state is not None and data.task_state.get("status") != "completed"
+            else None
+        )
         self.first_task = next(
             (
                 str(message.get("content"))
@@ -778,6 +854,41 @@ class InteractiveRuntime:
             sticky_names=self.sticky_skills,
             activation_callback=self._record_skill_activation,
         )
+        previous = (
+            self.verification_runtime.export_state()
+            if self.verification_runtime is not None
+            else None
+        )
+        requested = (
+            None if self.task_type_consumed else getattr(self.args, "task_type", None)
+        )
+        requirement = resolve_task_type(
+            requested,
+            previous=previous,
+            interactive=bool(getattr(self.args, "interactive_terminal", False)),
+        )
+        self.task_type_consumed = True
+        if (
+            self.verification_runtime is None
+            or (previous is not None and previous.get("status") == "completed")
+            or (previous is not None and previous.get("requires_verification") is not requirement)
+        ):
+            self.verification_runtime = VerificationRuntime(
+                self.workspace,
+                requires_verification=requirement,
+                initial_state=(
+                    previous if previous and previous.get("status") != "completed"
+                    else None
+                ),
+                approval_callback=make_verification_approval(self.workspace, self.console),
+            )
+        else:
+            self.verification_runtime.approval_callback = make_verification_approval(
+                self.workspace, self.console
+            )
+        assert self.session_path is not None and self.lease is not None
+        self.verification_runtime.set_internal_paths((self.session_path, self.lease.lock_path))
+        self.last_task_state = None
 
         def snapshot(messages: list[dict[str, object]]) -> None:
             nonlocal latest
@@ -786,7 +897,15 @@ class InteractiveRuntime:
             self._save(messages)
 
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
-        event_callback = deduplicate_tool_execution(renderer)
+        render_event = deduplicate_tool_execution(renderer)
+
+        def event_callback(event_type: str, payload: dict[str, object]) -> None:
+            if event_type == "task_state":
+                state = validate_task_state(payload)
+                assert self.session_path is not None
+                append_session_event(self.session_path, "task.state", state)
+                self.last_task_state = state
+            render_event(event_type, payload)
         kwargs: dict[str, object] = {}
         if self.command_sandbox is not None:
             kwargs["command_sandbox"] = self.command_sandbox
@@ -809,6 +928,7 @@ class InteractiveRuntime:
                 initial_messages=self.messages,
                 token_counter=self.token_counter,
                 skill_runtime=self.skill_runtime,
+                verification_runtime=self.verification_runtime,
                 **kwargs,
             )
         except KeyboardInterrupt:
@@ -830,8 +950,17 @@ class InteractiveRuntime:
                 self.sticky_skills = self.skill_runtime.sticky_names
             renderer.close()
 
+        if self.last_task_state is None or self.last_task_state.get("status") not in {
+            "completed", "incomplete", "failed", "interrupted",
+        }:
+            raise RuntimeError("缺少可信任务终态，不能展示完成结果")
         renderer.render_answer(answer)
-        if not self.title and self.first_task is not None:
+        if (
+            not self.title
+            and self.first_task is not None
+            and self.last_task_state is not None
+            and self.last_task_state.get("status") == "completed"
+        ):
             with self.console.status("正在生成 Session 标题…"):
                 self.title = generate_title(
                     self.client, self.settings.model, self.first_task
@@ -848,6 +977,7 @@ class InteractiveRuntime:
         self.sticky_skills = ()
         self.skill_runtime = None
         self.pending_skill_activations = None
+        self.last_task_state = None
 
     def compact_context(self) -> bool:
         if not self.messages:
@@ -864,6 +994,7 @@ class InteractiveRuntime:
         tools = build_agent_tool_schemas(
             allow_run_command=bool(getattr(self.args, "allow_run_command", False)),
             allow_subagent=bool(getattr(self.args, "allow_subagent", True)),
+            allow_verification=True,
         )
         before_tokens = self.token_counter.count_request(self.messages, tools)
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
@@ -908,10 +1039,18 @@ class InteractiveRuntime:
         table.add_row("Session", Text(_safe_terminal_text(session)))
         table.add_row("Sandbox", "on" if self.args.allow_run_command else "off")
         table.add_row("Subagent", "on" if self.args.allow_subagent else "off")
+        if self.last_task_state is not None:
+            state_text = task_state_text(self.last_task_state) or "尚未完成验收"
+            if self.verification_runtime is None or (
+                self.verification_runtime.export_state().get("stop_reason") == "restored"
+            ):
+                state_text = "历史记录（继续交付须复核）：" + state_text
+            table.add_row("验收", state_text)
         if self.messages:
             tools = build_agent_tool_schemas(
                 allow_run_command=self.args.allow_run_command,
                 allow_subagent=self.args.allow_subagent,
+                allow_verification=True,
             )
             used_tokens = self.token_counter.count_request(self.messages, tools)
             percent = context_percentage(used_tokens, self.args.max_context_tokens)
@@ -1140,6 +1279,10 @@ def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
         runtime.compact_context()
     elif command == "/status":
         runtime.show_status()
+    elif command == "/revoke-verification":
+        if runtime.verification_runtime is not None:
+            runtime.verification_runtime.revoke_grants()
+        runtime.console.print(Text("已撤销当前阶段的验收重跑许可；后续执行须重新批准。"))
     elif command == "/verbose":
         runtime.verbose = not runtime.verbose
         runtime.console.print(Text(f"verbose: {'on' if runtime.verbose else 'off'}"))
@@ -1316,6 +1459,19 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
             lease=initial_lease,
             title=data.title if data else "",
             sticky_skills=data.sticky_skills if data else (),
+            last_task_state=data.task_state if data else None,
+            verification_runtime=(
+                VerificationRuntime(
+                    workspace, initial_state=data.task_state,
+                    internal_paths=(
+                        (session_path, initial_lease.lock_path)
+                        if session_path is not None and initial_lease is not None else ()
+                    ),
+                )
+                if data is not None and data.task_state is not None
+                and data.task_state.get("status") != "completed"
+                else None
+            ),
             first_task=next(
                 (
                     str(message.get("content"))

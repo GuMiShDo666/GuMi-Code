@@ -13,6 +13,8 @@ from gum_code.permissions import (
 from gum_code.permissions.policy import ToolRisk
 from gum_code.tools.artifacts import read_tool_output
 from gum_code.tools.command import (
+    CommandExecutionResult,
+    CommandResultCallback,
     DockerSandboxConfig,
     _validate_run_command,
     run_command,
@@ -495,6 +497,7 @@ def execute_tool(
     post_tool_use_callback: PostToolUseCallback | None = None,
     command_sandbox: DockerSandboxConfig | None = None,
     before_execute_callback: BeforeExecuteCallback | None = None,
+    command_result_callback: CommandResultCallback | None = None,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
@@ -511,6 +514,11 @@ def execute_tool(
 
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
+
+    if tool_name == "run_command" and arguments.keys() - {
+        "argv", "cwd", "timeout_seconds"
+    }:
+        return "Error: Invalid tool arguments"
 
     # Hard denials run before approval and cannot be overridden by it.
     if check_hard_deny(tool_name, arguments) is not None:
@@ -549,7 +557,7 @@ def execute_tool(
 
         approved = approval_callback(
             tool_name,
-            arguments,
+            copy.deepcopy(arguments),
             permission.reason,
         )
 
@@ -560,12 +568,17 @@ def execute_tool(
     if before_execute_callback is not None:
         before_execute_callback()
 
+    command_results: list[CommandExecutionResult] = []
     try:
         if tool_name == "run_command":
+            command_kwargs: dict[str, object] = {}
+            if command_result_callback is not None:
+                command_kwargs["result_callback"] = command_results.append
             result = handler(
                 workspace=workspace,
                 **arguments,
                 sandbox=command_sandbox,
+                **command_kwargs,
             )
         else:
             result = handler(workspace=workspace, **arguments)
@@ -577,6 +590,14 @@ def execute_tool(
             tool_name,
             copy.deepcopy(arguments),
             result,
+        )
+
+    # A completed process is not accepted evidence until the post-Hook succeeds.
+    # Keep the external callback outside handler error conversion as well.
+    if tool_name == "run_command" and command_result_callback is not None:
+        command_result_callback(
+            command_results[-1] if command_results
+            else CommandExecutionResult(None, None, "unknown")
         )
 
     return result
