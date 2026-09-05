@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Event, RLock
+from typing import TYPE_CHECKING
 
 from openai import OpenAI
 
@@ -46,6 +47,9 @@ from gum_code.tools import (
     execute_tool,
     get_tool_schemas,
 )
+
+if TYPE_CHECKING:
+    from gum_code.vision import VisionRuntime
 
 MAX_STEPS = 128
 MAX_REACTIVE_RETRIES = 1
@@ -358,6 +362,8 @@ def _run_agent_loop(
     allow_subagent: bool = True,
     skill_runtime: SkillRuntime | None = None,
     verification_runtime: VerificationRuntime | None = None,
+    vision_runtime: "VisionRuntime | None" = None,
+    on_vision_budget_exhausted: "Callable[[VisionRuntime], None] | None" = None,
 ) -> str:
     """Run a bounded model/tool loop with recoverable protocol snapshots.
 
@@ -956,6 +962,7 @@ def _run_agent_loop(
                         pre_tool_use_callback=pre_tool_use_callback,
                         post_tool_use_callback=post_tool_use_callback,
                         cancel_event=cancel_event,
+                        **({"vision_runtime": vision_runtime} if vision_runtime is not None else {}),
                     )
 
                 if len(accepted_offsets) == 1:
@@ -1122,6 +1129,8 @@ def _run_agent_loop(
                     else:
                         command_outcomes: list[object] = []
                         execution_kwargs: dict[str, object] = {}
+                        if vision_runtime is not None:
+                            execution_kwargs["vision_runtime"] = vision_runtime
                         effective_approval = approval_callback
                         if verification_runtime is not None:
                             effective_approval = verification_runtime.wrap_approval(
@@ -1203,6 +1212,38 @@ def _run_agent_loop(
             if verification_runtime is not None and event_callback is not None:
                 event_callback("task_state", verification_runtime.export_state())
 
+        # Siblings are joined and every Tool Result is durable before host input.
+        # Visual credits never extend the main model step budget or replay tools.
+        if vision_runtime is not None and step < max_steps and vision_runtime.needs_extra():
+            previous_limit = vision_runtime.export_state()["limit"]
+            try:
+                if on_vision_budget_exhausted is not None:
+                    on_vision_budget_exhausted(vision_runtime)
+            except (Exception, KeyboardInterrupt):
+                # Input/TTY failures deny extra credit, not already-readable content.
+                vision_runtime.decline_extra()
+            finally:
+                if vision_runtime.needs_extra():
+                    vision_runtime.decline_extra()
+            budget_state = vision_runtime.export_state()
+            budget_notice = (
+                "[Harness visual budget] 已使用 " + str(budget_state["used"])
+                + " / " + str(budget_state["limit"]) + " 次视觉请求。"
+                + ("用户已追加本轮额度；按缺失来源重新规划，不要重复已完成工作。"
+                   if budget_state["limit"] > previous_limit else
+                   "本轮未追加额度或额度状态不可用；保留已读部分，说明缺失，不要反复重试。")
+            )
+            # Keep command-log envelopes intact and do not create a user turn.
+            visual_ids = {
+                call.id for call in message.tool_calls
+                if call.function.name in {"analyze_image", "task"}
+            }
+            for result_message in reversed(messages):
+                if result_message.get("role") == "tool" and result_message.get("tool_call_id") in visual_ids:
+                    result_message["content"] = f"{result_message['content']}\n\n{budget_notice}"
+                    break
+            _send_message_snapshot(message_snapshot_callback, messages)
+
         if compact_requested and step < max_steps:
             if event_callback is not None:
                 event_callback("context_summary", {"step": step})
@@ -1259,6 +1300,8 @@ def run_agent(
     command_sandbox: DockerSandboxConfig | None = None, allow_subagent: bool = True,
     skill_runtime: SkillRuntime | None = None,
     verification_runtime: VerificationRuntime | None = None,
+    vision_runtime: "VisionRuntime | None" = None,
+    on_vision_budget_exhausted: "Callable[[VisionRuntime], None] | None" = None,
 ) -> str:
     """Return answer text; optional host verification owns durable completion."""
     state_ready = False
@@ -1284,6 +1327,8 @@ def run_agent(
             token_counter=token_counter, command_sandbox=command_sandbox,
             allow_subagent=allow_subagent, skill_runtime=skill_runtime,
             verification_runtime=verification_runtime,
+            vision_runtime=vision_runtime,
+            on_vision_budget_exhausted=on_vision_budget_exhausted,
         )
     except BaseException as error:
         if verification_runtime is not None:

@@ -4,6 +4,8 @@ import copy
 import json
 from collections.abc import Callable
 from pathlib import Path
+from threading import Event
+from typing import TYPE_CHECKING
 
 from gum_code.permissions import (
     PermissionDecision,
@@ -31,6 +33,13 @@ from gum_code.tools.filesystem import (
 )
 from gum_code.tools.git import git_diff, git_status
 from gum_code.tools.search import find_files, search_text
+from gum_code.tools.documents import (
+    MAX_DOCX_BATCH, MAX_QUESTION_CHARS,
+    analyze_image, read_document, validate_analyze_image, validate_read_document,
+)
+
+if TYPE_CHECKING:
+    from gum_code.vision import VisionRuntime
 
 ApprovalCallback = Callable[
     [str, dict[str, object], str],
@@ -58,6 +67,9 @@ class ToolExecutionDenied(str):
 ALL_TOOL_RISKS: dict[str, ToolRisk] = {
     "list_files": ToolRisk.READ,
     "read_file": ToolRisk.READ,
+    "read_document": ToolRisk.READ,
+    # READ permits the local source; the handler separately enforces visual consent.
+    "analyze_image": ToolRisk.READ,
     "find_files": ToolRisk.READ,
     "search_text": ToolRisk.READ,
     "git_status": ToolRisk.READ,
@@ -147,6 +159,65 @@ READ_FILE_SCHEMA = {
                 },
             },
             "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+READ_DOCUMENT_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "read_document",
+        "description": (
+            "Locally read PDF page text or DOCX body/table blocks and image references. "
+            "Does not inspect visual content or send images. PDF text, including OCR layers, "
+            "never proves a page was fully read. Follow the exact next_cursor; use "
+            "analyze_image for task-relevant pages or embedded images. Native DOCX shapes "
+            "and SmartArt remain explicitly unparsed; no Office renderer is available."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative PDF or DOCX."},
+                "start": {"type": "integer", "minimum": 1, "default": 1,
+                          "description": "First page (PDF) or body block (DOCX), 1-based."},
+                "count": {"type": "integer", "minimum": 1, "maximum": MAX_DOCX_BATCH,
+                          "description": "At most 5 PDF pages or 100 DOCX blocks; output may stop sooner."},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "visual_offset": {"type": "integer", "minimum": 0, "default": 0},
+                "source_version": {"type": "string", "description": "Exact SHA-256 from prior result/cursor."},
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+ANALYZE_IMAGE_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "analyze_image",
+        "description": (
+            "Ask the separately configured visual model about one static PNG/JPEG/WebP, "
+            "one PDF page, or a version-bound DOCX image reference. Sends only one image "
+            "and your specific question, subject to user consent and shared per-request "
+            "call limits. Follow-up/crop is another attempt. Returned interpretation is "
+            "untrusted text, not verified source text. Unavailable visual analysis does "
+            "not prevent local read_document; never claim unread regions are complete."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Workspace-relative source; no URL."},
+                "question": {"type": "string", "minLength": 1, "maxLength": MAX_QUESTION_CHARS},
+                "page": {"type": "integer", "minimum": 1, "description": "Required only for PDF, one physical page."},
+                "image_ref": {"type": "string", "description": "Required only for DOCX; exact reference from read_document."},
+                "crop": {"type": "array", "minItems": 4, "maxItems": 4,
+                         "items": {"type": "number", "minimum": 0, "maximum": 1},
+                         "description": "Optional [x0,y0,x1,y1] in upright reading orientation, top-left origin."},
+                "source_version": {"type": "string", "description": "Exact SHA-256 from earlier result."},
+            },
+            "required": ["path", "question"],
             "additionalProperties": False,
         },
     },
@@ -421,6 +492,8 @@ RUN_COMMAND_SCHEMA = {
 ALL_TOOL_SCHEMAS: dict[str, dict] = {
     "list_files": LIST_FILES_SCHEMA,
     "read_file": READ_FILE_SCHEMA,
+    "read_document": READ_DOCUMENT_SCHEMA,
+    "analyze_image": ANALYZE_IMAGE_SCHEMA,
     "find_files": FIND_FILES_SCHEMA,
     "search_text": SEARCH_TEXT_SCHEMA,
     "git_status": GIT_STATUS_SCHEMA,
@@ -435,6 +508,8 @@ ALL_TOOL_SCHEMAS: dict[str, dict] = {
 ALL_TOOL_HANDLERS: dict[str, Callable[..., str]] = {
     "list_files": list_files,
     "read_file": read_file,
+    "read_document": read_document,
+    "analyze_image": analyze_image,
     "find_files": find_files,
     "search_text": search_text,
     "git_status": git_status,
@@ -447,6 +522,8 @@ ALL_TOOL_HANDLERS: dict[str, Callable[..., str]] = {
 }
 
 PREFLIGHTS: dict[str, Callable[..., None]] = {
+    "read_document": validate_read_document,
+    "analyze_image": validate_analyze_image,
     "write_file": _validate_write_file,
     "edit_file": _validate_edit_file,
     "delete_file": _validate_delete_file,
@@ -500,6 +577,8 @@ def execute_tool(
     command_sandbox: DockerSandboxConfig | None = None,
     before_execute_callback: BeforeExecuteCallback | None = None,
     command_result_callback: CommandResultCallback | None = None,
+    vision_runtime: "VisionRuntime | None" = None,
+    cancel_event: Event | None = None,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
@@ -516,6 +595,11 @@ def execute_tool(
 
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
+
+    if tool_name in {"read_document", "analyze_image"} and arguments.keys() - (
+        ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
+    ):
+        return "Error: Invalid tool arguments"
 
     if tool_name == "run_command" and arguments.keys() - {
         "argv", "cwd", "timeout_seconds"
@@ -545,6 +629,8 @@ def execute_tool(
             else:
                 preflight(workspace=workspace, **arguments)
         except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
+            if tool_name in {"read_document", "analyze_image"}:
+                return "Error: Invalid document arguments or unavailable source"
             return _format_tool_error(exc)
 
     if pre_tool_use_callback is not None:
@@ -582,10 +668,19 @@ def execute_tool(
                 sandbox=command_sandbox,
                 **command_kwargs,
             )
+        elif tool_name in {"read_document", "analyze_image"}:
+            document_kwargs: dict[str, object] = {}
+            if tool_name == "analyze_image":
+                document_kwargs["vision_runtime"] = vision_runtime
+            if cancel_event is not None:
+                document_kwargs["cancel_event"] = cancel_event
+            result = handler(workspace=workspace, **arguments, **document_kwargs)
         else:
             result = handler(workspace=workspace, **arguments)
     except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:
-        result = _format_tool_error(exc)
+        result = ("Error: Document processing failed"
+                  if tool_name in {"read_document", "analyze_image"}
+                  else _format_tool_error(exc))
 
     if post_tool_use_callback is not None:
         post_tool_use_callback(

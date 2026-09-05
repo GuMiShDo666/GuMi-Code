@@ -2,13 +2,16 @@
 
 import argparse
 import sys
+import uuid
 from pathlib import Path
+from threading import RLock
 
 from openai import OpenAI, OpenAIError
 
 from gum_code.agent import MAX_STEPS, run_agent
 from gum_code.config import (
     load_settings,
+    load_vision_settings,
     resolve_context_budget,
     resolve_context_window,
 )
@@ -19,6 +22,7 @@ from gum_code.events import (
 )
 from gum_code.interactive import (
     resolve_task_type,
+    request_extra_vision_calls,
     run_interactive,
     select_workspace,
     trust_workspace,
@@ -41,6 +45,7 @@ from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
 from gum_code.verification import VerificationRuntime, validate_task_state
+from gum_code.vision import VisionRuntime
 
 
 def _positive_int(value: str) -> int:
@@ -137,6 +142,8 @@ def parse_args(
 
 def _run_one_shot(args: argparse.Namespace) -> int:
     lease: SessionLease | None = None
+    vision_runtime: VisionRuntime | None = None
+    session_write_lock = RLock()
     try:
         session_file = args.session_file or args.resume_session
         if session_file is not None:
@@ -232,13 +239,17 @@ def _run_one_shot(args: argparse.Namespace) -> int:
 
         pending_activations: list[SkillSnapshot] = []
 
+        def append_event(event_type: str, payload: dict[str, object]) -> None:
+            with session_write_lock:
+                if session_file is not None:
+                    append_session_event(session_file, event_type, payload)
+
         def flush_activations() -> None:
             if session_file is None or not Path(session_file).exists():
                 return
             while pending_activations:
                 snapshot = pending_activations[0]
-                append_session_event(
-                    session_file,
+                append_event(
                     "skill.activated",
                     {
                         "name": snapshot.name,
@@ -251,8 +262,9 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 pending_activations.pop(0)
 
         def record_activation(snapshot: SkillSnapshot) -> None:
-            pending_activations.append(snapshot)
-            flush_activations()
+            with session_write_lock:
+                pending_activations.append(snapshot)
+                flush_activations()
 
         skill_runtime = SkillRuntime(
             sticky_names=sticky_skills,
@@ -277,6 +289,14 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 else ()
             ),
         )
+        # A one-shot task is always new explicit user input, even with --resume.
+        request_id = str(uuid.uuid4())
+        vision_runtime = VisionRuntime(
+            load_vision_settings(), request_id=request_id,
+            persist_callback=(lambda state: append_event("vision.state", state))
+            if session_file is not None else None,
+            settings_loader=lambda: load_vision_settings(),
+        )
         last_task_state: dict[str, object] | None = None
         render_event = deduplicate_tool_execution(print_terminal_event)
 
@@ -285,7 +305,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             if event_type == "task_state":
                 state = validate_task_state(payload)
                 if session_file is not None:
-                    append_session_event(session_file, "task.state", state)
+                    append_event("task.state", state)
                 last_task_state = state
             elif event_type == "final_answer" and (
                 last_task_state is None
@@ -300,17 +320,27 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         if session_file is not None:
             workspace = args.workspace
             model = settings.model
+            first_snapshot = True
 
             def message_snapshot_callback(messages: list[dict[str, object]]) -> None:
-                save_session(
-                    session_file,
-                    workspace,
-                    model,
-                    messages,
-                    title,
-                    skill_runtime.sticky_names,
-                )
-                flush_activations()
+                nonlocal first_snapshot
+                source_event_seq = None
+                with session_write_lock:
+                    save_session(
+                        session_file, workspace, model, messages, title, skill_runtime.sticky_names,
+                        **({"user_request_id": request_id} if first_snapshot else {}),
+                    )
+                    flush_activations()
+                    if first_snapshot:
+                        saved = load_session(session_file, allow_incomplete_tool_batch=True,
+                                             allow_pending_user_tail=True)
+                        if saved.user_request_id != request_id or saved.source_event_seq is None:
+                            raise RuntimeError("图片解析缺少原始用户请求来源")
+                        source_event_seq = saved.source_event_seq
+                        first_snapshot = False
+                # Never acquire the budget lock while holding the Session lock.
+                if source_event_seq is not None:
+                    vision_runtime.bind_source(source_event_seq)
 
         kwargs: dict[str, object] = {}
         if command_sandbox is not None:
@@ -332,12 +362,18 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             token_counter=token_counter,
             skill_runtime=skill_runtime,
             verification_runtime=verification_runtime,
+            vision_runtime=vision_runtime,
+            on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
+                runtime, interactive=args.interactive_terminal,
+            ),
             **kwargs,
         )
         if last_task_state is not None and last_task_state.get("status") == "completed":
             return 0
         return 1
     finally:
+        if vision_runtime is not None:
+            vision_runtime.cancel()
         if lease is not None:
             lease.release()
 

@@ -113,6 +113,42 @@ def create_console() -> Console:
     return Console(no_color=os.getenv("NO_COLOR") is not None)
 
 
+def _document_notice(payload: dict[str, object]) -> str | None:
+    """Only fixed status text reaches progress, even for malformed/private results."""
+    result = payload.get("result")
+    if not isinstance(result, str) or len(result) > 21_000:
+        return "文档处理状态未确认。"
+    if result.startswith("Error:"):
+        return "文档处理失败，请检查输入或可用权限。"
+    try:
+        # Agent can append its Todo reminder after the bounded JSON object.
+        state, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        return "文档处理状态未确认。"
+    if not isinstance(state, dict):
+        return "文档处理状态未确认。"
+    status = state.get("status")
+    if status == "ok":
+        return None
+    reason = state.get("reason")
+    if isinstance(reason, str):
+        message = {
+            "vision_budget_exhausted": "本轮视觉调用额度已用完，保留已读取部分。",
+            "vision_unavailable": "视觉功能未配置或未启用，可继续读取文字。",
+            "vision_disabled": "视觉功能已关闭，可继续读取文字。",
+            "vision_configuration_changed": "视觉配置已变更，请在下一轮重新使用。",
+            "source_changed": "源文件已变化，请重新读取。",
+            "timeout": "文档或视觉处理超时，保留已读取部分。",
+            "vision_timeout": "视觉处理超时，保留已读取部分。",
+            "cancelled": "文档或视觉处理已取消。",
+            "vision_state_unavailable": "视觉额度状态不可用，本轮停止外发。",
+        }.get(reason)
+        if message is not None:
+            return message
+    return ("已读取可用部分，仍有内容未解析。" if status == "partial"
+            else "文档或视觉处理不可用，请查看缺失说明。")
+
+
 def task_state_text(payload: dict[str, object]) -> str | None:
     """Render bounded check identities and status, never arguments or logs."""
     status = payload.get("status")
@@ -200,6 +236,11 @@ class RichEventRenderer:
                 self.console.print(Text(text))
             return
         if event_type == "tool_result":
+            if payload.get("tool_name") in {"read_document", "analyze_image"}:
+                notice = _document_notice(payload)
+                if notice is not None:
+                    self.console.print(Text(notice, style="yellow"))
+                return
             result = str(payload.get("result", ""))
             if result.startswith("Error:") or _command_failure(payload) is not None:
                 self.console.print(
@@ -340,6 +381,11 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         return
 
     if event_type == "tool_result":
+        if payload.get("tool_name") in {"read_document", "analyze_image"}:
+            notice = _document_notice(payload)
+            if notice is not None:
+                print(notice, flush=True)
+            return
         result = str(payload.get("result", ""))
         command_failure = _command_failure(payload)
         if command_failure is not None:

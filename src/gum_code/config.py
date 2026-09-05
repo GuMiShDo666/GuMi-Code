@@ -1,10 +1,12 @@
 """Load, validate, and privately persist provider configuration."""
 
 import json
+import io
 import os
+import stat
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -21,6 +23,8 @@ CONTEXT_WINDOW_FIELDS = (
     "max_model_len",
 )
 DEFAULT_CONTEXT_BUDGET_RATIO = 0.8
+DEFAULT_VISION_CALL_LIMIT = 32
+MAX_VISION_CONFIG_BYTES = 32_768
 
 
 @dataclass(frozen=True)
@@ -31,10 +35,116 @@ class Settings:
     context_window: int | None = None
 
 
+@dataclass(frozen=True)
+class VisionSettings:
+    api_key: str = field(repr=False)
+    base_url: str
+    model: str
+    enabled: bool = False
+    default_call_limit: int = DEFAULT_VISION_CALL_LIMIT
+
+
 def default_user_config_path() -> Path:
     base = os.getenv("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".config"
     return root / "gum-code" / ".env"
+
+
+def default_vision_config_path() -> Path:
+    return default_user_config_path().with_name(".env.vision")
+
+
+def validate_vision_settings(settings: VisionSettings) -> None:
+    """Validate local input without probing a provider or displaying its values."""
+    if not isinstance(settings, VisionSettings):
+        raise ValueError("图片解析配置无效")
+    for value, maximum in (
+        (settings.api_key, 4096), (settings.base_url, 2048), (settings.model, 256),
+    ):
+        if (
+            not isinstance(value, str) or not value.strip() or len(value) > maximum
+            or value != value.strip()
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        ):
+            raise ValueError("图片解析配置字段无效")
+    try:
+        parsed = urlparse(settings.base_url)
+        if (
+            parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or "?" in settings.base_url or "#" in settings.base_url
+            or "\\" in settings.base_url or any(char.isspace() for char in settings.base_url)
+        ):
+            raise ValueError
+        parsed.port
+    except ValueError:
+        raise ValueError("图片解析服务地址必须是无认证信息及查询参数的 HTTP(S) URL") from None
+    if type(settings.enabled) is not bool:
+        raise ValueError("图片解析启用状态无效")
+    if type(settings.default_call_limit) is not int or settings.default_call_limit <= 0:
+        raise ValueError("图片解析每轮上限必须是正整数")
+
+
+def load_vision_settings(path: Path | None = None) -> VisionSettings | None:
+    """Load only the private visual config; absent/invalid data disables vision."""
+    target = default_vision_config_path() if path is None else Path(path)
+    try:
+        if any(part.is_symlink() for part in (target, *target.parents)):
+            return None
+        getuid = getattr(os, "getuid", None)
+        if getuid is None:
+            return None
+        owner = getuid()
+        directory = target.parent.stat(follow_symlinks=False)
+        if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != owner
+                or stat.S_IMODE(directory.st_mode) != 0o700):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        descriptor = os.open(target, flags)
+        with os.fdopen(descriptor, "rb") as file:
+            info = os.fstat(file.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_VISION_CONFIG_BYTES
+                    or info.st_uid != owner or info.st_nlink != 1
+                    or stat.S_IMODE(info.st_mode) != 0o600):
+                return None
+            data = file.read(MAX_VISION_CONFIG_BYTES + 1)
+        if len(data) > MAX_VISION_CONFIG_BYTES:
+            return None
+        # No environment interpolation: persisted user consent cannot depend on .env.
+        values = dotenv_values(stream=io.StringIO(data.decode("utf-8")), interpolate=False)
+        enabled = values.get("VISION_ENABLED")
+        if enabled not in {"true", "false"}:
+            return None
+        settings = VisionSettings(
+            api_key=values.get("VISION_API_KEY"),
+            base_url=values.get("VISION_BASE_URL"),
+            model=values.get("VISION_MODEL"),
+            enabled=enabled == "true",
+            default_call_limit=int(values.get("VISION_DEFAULT_CALL_LIMIT", "")),
+        )
+        validate_vision_settings(settings)
+        return settings
+    except (OSError, UnicodeError, TypeError, ValueError):
+        return None
+
+
+def save_vision_settings(path: Path, settings: VisionSettings) -> None:
+    """Save a host-confirmed configuration separately from the main provider."""
+    validate_vision_settings(settings)
+    target = Path(path)
+    if any(part.is_symlink() for part in (target, *target.parents)):
+        raise ValueError("图片解析配置路径无效")
+    content = "".join(
+        f"{name}={json.dumps(value, ensure_ascii=False)}\n"
+        for name, value in (
+            ("VISION_API_KEY", settings.api_key), ("VISION_BASE_URL", settings.base_url),
+            ("VISION_MODEL", settings.model), ("VISION_ENABLED", str(settings.enabled).lower()),
+            ("VISION_DEFAULT_CALL_LIMIT", str(settings.default_call_limit)),
+        )
+    )
+    if len(content.encode("utf-8")) > MAX_VISION_CONFIG_BYTES:
+        raise ValueError("图片解析配置超过大小上限")
+    _save_private_config(target, content)
 
 
 def _read_values(path: Path) -> dict[str, str]:
@@ -144,11 +254,6 @@ def validate_settings(settings: Settings) -> None:
 def save_user_settings(path: Path, settings: Settings) -> None:
     """Validate and atomically replace a private provider settings file."""
     validate_settings(settings)
-    target = Path(path)
-    if target.is_symlink():
-        raise ValueError("配置文件不允许是符号链接")
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(target.parent, 0o700)
     content = "".join(
         (
             f"LLM_API_KEY={json.dumps(settings.api_key)}\n",
@@ -161,6 +266,14 @@ def save_user_settings(path: Path, settings: Settings) -> None:
             ),
         )
     )
+    _save_private_config(Path(path), content)
+
+
+def _save_private_config(target: Path, content: str) -> None:
+    if target.is_symlink():
+        raise ValueError("配置文件不允许是符号链接")
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(target.parent, 0o700)
     descriptor, temporary = tempfile.mkstemp(
         dir=str(target.parent), prefix=".tmp-config-"
     )

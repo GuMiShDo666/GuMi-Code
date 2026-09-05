@@ -13,6 +13,9 @@ dependencies = [
     "python-dotenv>=1",
     "prompt-toolkit>=3.0.52,<4",
     "rich>=14,<15",
+    "pypdfium2>=5.13,<6",
+    "Pillow>=12.3,<13",
+    "defusedxml>=0.7.1,<0.8",
 ]
 
 
