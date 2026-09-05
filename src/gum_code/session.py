@@ -18,6 +18,7 @@ except ImportError:  # pragma: no cover - POSIX is the supported runtime.
 
 from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 from gum_code.context import LARGE_RESULT_CHAR_LIMIT, persist_tool_result
+from gum_code.verification import validate_task_state
 
 SESSION_VERSION = 3
 LEGACY_SESSION_VERSION = 1
@@ -63,6 +64,7 @@ class SessionData:
     parent_session_id: str | None = None
     parent_seq: int | None = None
     last_seq: int = -1
+    task_state: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -98,6 +100,7 @@ _EVENT_TYPES = {
     "tool.result",
     "skill.activated",
     "context.compacted",
+    "task.state",
 }
 
 
@@ -140,7 +143,11 @@ def _event(seq: int, event_type: str, data: dict[str, object]) -> dict[str, obje
 def _encode_events(events: list[dict[str, object]]) -> bytes:
     return b"".join(
         (
-            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            json.dumps(
+                event,
+                ensure_ascii=event["type"] == "task.state",
+                separators=(",", ":"),
+            ) + "\n"
         ).encode("utf-8")
         for event in events
     )
@@ -165,7 +172,9 @@ def _validate_event(event: object, expected_seq: int) -> dict[str, object]:
         raise ValueError("Session 事件 data 必须是对象")
     data = event["data"]
     assert isinstance(data, dict)
-    if event_type == "skill.activated":
+    if event_type == "task.state":
+        validate_task_state(data)
+    elif event_type == "skill.activated":
         if (
             not isinstance(data.get("name"), str)
             or data.get("source") not in {"explicit", "automatic"}
@@ -220,6 +229,7 @@ def _read_event_log(
     lines = text.splitlines(keepends=True)
     events: list[dict[str, object]] = []
     valid_bytes = 0
+    needs_tail_repair = False
     for index, line in enumerate(lines):
         complete = line.endswith("\n")
         payload = line[:-1] if complete else line
@@ -227,11 +237,7 @@ def _read_event_log(
             parsed = json.loads(payload)
         except json.JSONDecodeError as error:
             if index == len(lines) - 1 and not complete:
-                if repair_tail:
-                    with target.open("r+b") as file:
-                        file.truncate(valid_bytes)
-                        file.flush()
-                        os.fsync(file.fileno())
+                needs_tail_repair = repair_tail
                 break
             raise ValueError(f"Session JSONL 第 {index + 1} 行损坏") from error
         events.append(_validate_event(parsed, index))
@@ -276,6 +282,12 @@ def _read_event_log(
             or parent_seq < 0
         ):
             raise ValueError("Session parent_seq 无效")
+    # Never truncate arbitrary files or invalid headers while rejecting a Session.
+    if needs_tail_repair:
+        with target.open("r+b") as file:
+            file.truncate(valid_bytes)
+            file.flush()
+            os.fsync(file.fileno())
     return events
 
 
@@ -301,6 +313,9 @@ def _replay_events(
         event_type = event["type"]
         data = event["data"]
         assert isinstance(data, dict)
+        if event_type == "task.state":
+            state["task_state"] = validate_task_state(data)
+            continue
         if event_type == "session.metadata_updated":
             if "title" in data:
                 _validate_title(data["title"])
@@ -690,6 +705,7 @@ def load_session(
                 else None
             ),
             last_seq=len(events) - 1,
+            task_state=state.get("task_state"),
         )
 
     if not isinstance(data, dict):
@@ -761,6 +777,7 @@ def _session_data_from_messages(
     parent_session_id: str | None = None,
     parent_seq: int | None = None,
     last_seq: int = -1,
+    task_state: dict[str, object] | None = None,
 ) -> SessionData:
     if messages[0].get("role") != "system":
         raise ValueError("Session 第一条消息必须是 system message")
@@ -795,19 +812,21 @@ def _session_data_from_messages(
         parent_session_id=parent_session_id,
         parent_seq=parent_seq,
         last_seq=last_seq,
+        task_state=validate_task_state(task_state) if task_state is not None else None,
     )
 
 
 def append_session_event(path: Path, event_type: str, data: dict[str, object]) -> int:
     """Append one validated non-projection Session event."""
-    if event_type not in {"skill.activated", "session.recovered"}:
+    if event_type not in {"skill.activated", "session.recovered", "task.state"}:
         raise ValueError(f"不允许直接追加 Session 事件：{event_type}")
     target = Path(path)
-    events = _read_event_log(target)
+    events = _read_event_log(target, repair_tail=True)
     addition = _event(len(events), event_type, copy.deepcopy(data))
     _validate_event(addition, len(events))
     content = _encode_events([addition])
-    if target.stat().st_size + len(content) > MAX_SESSION_FILE_BYTES:
+    needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
+    if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
         raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
     _append_bytes(target, content)
     return len(events)
@@ -884,7 +903,9 @@ def session_audit_entries(path: Path) -> list[dict[str, object]]:
                 "time": event["time"],
                 "type": event_type,
                 "status": (
-                    "synthetic"
+                    str(data["status"])
+                    if event_type == "task.state"
+                    else "synthetic"
                     if data.get("synthetic_boundary") is True
                     else "completed"
                     if event_type == "turn.completed"
