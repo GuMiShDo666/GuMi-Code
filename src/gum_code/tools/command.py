@@ -14,15 +14,21 @@ from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
 from typing import BinaryIO
 
+from gum_code.tools.command_logs import (
+    COMMAND_PREVIEW_BYTES,
+    MAX_COMMAND_LOG_BYTES,
+    CommandCapture,
+    command_output_marker,
+    prepare_command_logs,
+    publish_command_log,
+)
 from gum_code.tools.common import (
     _is_sensitive_path,
     _reject_symlinks,
     _resolve_workspace_path,
-    _truncate_output,
 )
 
-MAX_COMMAND_OUTPUT_CHARS = 50_000
-MAX_COMMAND_CAPTURE_BYTES = 64_000
+MAX_COMMAND_OUTPUT_CHARS = COMMAND_PREVIEW_BYTES + 1024
 MAX_SANDBOX_MASKS = 256
 
 SANDBOX_MEMORY = "512m"
@@ -57,8 +63,13 @@ class CommandExecutionResult:
 CommandResultCallback = Callable[[CommandExecutionResult], None]
 
 
-class _OutputLimitExceeded(Exception):
-    pass
+class _CommandInterrupted(KeyboardInterrupt):
+    def __init__(self, result: CommandExecutionResult) -> None:
+        self.result = result
+
+
+class _CommandLogFailure(ValueError):
+    """A post-execution security failure must not claim execution never started."""
 
 
 _CONTROL_OPERATORS = frozenset({";", "&&", "||", "|"})
@@ -442,6 +453,7 @@ def _build_docker_argv(
         "--name",
         container_name,
         "--pull=never",
+        "--log-driver=none",
         "--network=none",
         "--read-only",
         "--cap-drop=ALL",
@@ -498,15 +510,16 @@ def _build_docker_argv(
 def _read_pipe(
     name: str,
     stream: BinaryIO,
-    events: queue.Queue[tuple[str, bytes | None]],
+    events: queue.Queue[tuple[str, bytes | OSError | None]],
     stop: threading.Event,
 ) -> None:
+    read = getattr(stream, "read1", stream.read)
     try:
         while not stop.is_set():
             try:
-                chunk = stream.read(_READ_CHUNK_BYTES)
+                chunk = read(_READ_CHUNK_BYTES)
             except (OSError, ValueError):
-                break
+                chunk = OSError("Docker output pipe read failed")
             if not chunk:
                 break
             while not stop.is_set():
@@ -515,6 +528,8 @@ def _read_pipe(
                     break
                 except queue.Full:
                     continue
+            if isinstance(chunk, OSError):
+                break
     finally:
         while not stop.is_set():
             try:
@@ -522,16 +537,21 @@ def _read_pipe(
                 break
             except queue.Full:
                 continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
 
 
 def _communicate_bounded(
     process: subprocess.Popen[bytes],
     timeout_seconds: int,
-) -> tuple[bytes, bytes]:
+    captured: CommandCapture,
+) -> None:
     if process.stdout is None or process.stderr is None:
         raise OSError("Docker output pipes are unavailable")
 
-    events: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=8)
+    events: queue.Queue[tuple[str, bytes | OSError | None]] = queue.Queue(maxsize=8)
     stop = threading.Event()
     # Drain both pipes concurrently to avoid child-process capture deadlocks.
     threads = [
@@ -548,8 +568,6 @@ def _communicate_bounded(
     for thread in threads:
         thread.start()
 
-    captured = {"stdout": bytearray(), "stderr": bytearray()}
-    total_bytes = 0
     finished: set[str] = set()
     deadline = time.monotonic() + timeout_seconds
 
@@ -565,25 +583,43 @@ def _communicate_bounded(
                 continue
 
             if chunk is None:
+                getattr(captured, name).add(b"", final=True)
                 finished.add(name)
                 continue
-
-            total_bytes += len(chunk)
-            if total_bytes > MAX_COMMAND_CAPTURE_BYTES:
-                raise _OutputLimitExceeded
-            captured[name].extend(chunk)
+            if isinstance(chunk, OSError):
+                raise chunk
+            getattr(captured, name).add(chunk)
 
         process.wait(timeout=max(0.1, deadline - time.monotonic()))
-        return bytes(captured["stdout"]), bytes(captured["stderr"])
-    finally:
+    except BaseException:
+        # Stop the pipe writer before closing buffered readers (which may block).
+        _stop_process(process)
         stop.set()
-        for stream in (process.stdout, process.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
         for thread in threads:
             thread.join(timeout=0.2)
+        while True:
+            try:
+                name, chunk = events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(chunk, bytes) and name not in finished:
+                getattr(captured, name).add(chunk)
+        for name in ("stdout", "stderr"):
+            if name not in finished:
+                getattr(captured, name).add(b"", final=True)
+        raise
+    finally:
+        stop.set()
+        for thread in threads:
+            thread.join(timeout=0.2)
+        for thread, stream in zip(threads, (process.stdout, process.stderr)):
+            # If termination failed, a blocked reader owns its buffered lock.
+            # It will close the stream itself when the writer finally releases it.
+            if not thread.is_alive():
+                try:
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
 
 
 def _remove_container(
@@ -649,7 +685,33 @@ def _run_command(
     )
     assert sandbox is not None
 
+    prepared_logs = prepare_command_logs(workspace)
     container_name = f"gum-code-{secrets.token_hex(8)}"
+    captured = CommandCapture()
+
+    def finish(
+        started: bool | None, exit_code: int | None, reason: str, status: str,
+    ) -> CommandExecutionResult:
+        incomplete = reason != "exited"
+        if incomplete:
+            status += "\n[output capture incomplete]"
+        saved, truncated = captured.render(status, MAX_COMMAND_LOG_BYTES - 128)
+        truncated = truncated or incomplete
+        try:
+            path = publish_command_log(workspace, prepared_logs, saved, truncated)
+        except ValueError:
+            raise _CommandLogFailure("命令日志安全检查失败；执行结果未被采纳") from None
+        preview, preview_truncated = captured.render(status, COMMAND_PREVIEW_BYTES)
+        metadata = {
+            "path": path,
+            "log_status": ("truncated" if truncated else "complete") if path else "unavailable",
+            "exit_code": exit_code,
+            "reason": reason,
+            "preview_truncated": preview_truncated or incomplete,
+        }
+        return CommandExecutionResult(
+            started, exit_code, reason, command_output_marker(metadata, preview),
+        )
 
     with tempfile.TemporaryDirectory(prefix="gum-code-masks-") as tmpdir:
         masks = _prepare_sensitive_masks(workspace, Path(tmpdir))
@@ -676,29 +738,30 @@ def _run_command(
 
         # Abnormal paths remove only this invocation's randomized container.
         try:
-            stdout_bytes, stderr_bytes = _communicate_bounded(
+            _communicate_bounded(
                 process,
                 timeout_seconds,
+                captured,
             )
         except subprocess.TimeoutExpired:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return CommandExecutionResult(
-                None, None, "timeout", f"Error: 命令超时{suffix}"
-            )
-        except _OutputLimitExceeded:
+            return finish(None, None, "timeout", f"Error: 命令超时{suffix}")
+        except KeyboardInterrupt:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return CommandExecutionResult(
-                None, None, "output_limit", f"Error: 命令输出超过限制{suffix}"
-            )
-        except KeyboardInterrupt:
-            _abort_container(process, sandbox, container_name)
-            raise
+            try:
+                result = finish(None, None, "interrupted", f"Error: 命令已中断{suffix}")
+            except Exception:
+                # Diagnostic failures must never convert cancellation into continuation.
+                result = CommandExecutionResult(
+                    None, None, "interrupted", f"Error: 命令已中断；命令日志未保存{suffix}",
+                )
+            raise _CommandInterrupted(result) from None
         except OSError:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return CommandExecutionResult(
+            return finish(
                 None, None, "unknown", f"Error: Docker Sandbox 执行失败{suffix}"
             )
 
@@ -712,7 +775,7 @@ def _run_command(
         if process.returncode is None or process.returncode < 0:
             cleaned = _abort_container(process, sandbox, container_name)
             suffix = "" if cleaned else "；Sandbox 清理未确认，请手动检查 Docker"
-            return CommandExecutionResult(
+            return finish(
                 None, process.returncode, "unknown",
                 f"Error: Docker Sandbox 执行失败{suffix}",
             )
@@ -723,19 +786,7 @@ def _run_command(
             "Error: Sandbox 内命令不存在或无法执行",
         )
 
-    stdout = stdout_bytes.decode("utf-8", errors="replace")
-    stderr = stderr_bytes.decode("utf-8", errors="replace")
-
-    output = (
-        f"exit_code: {process.returncode}\n"
-        f"stdout:\n{stdout}\n"
-        f"stderr:\n{stderr}"
-    )
-
-    return CommandExecutionResult(
-        True, process.returncode, "exited",
-        _truncate_output(output, MAX_COMMAND_OUTPUT_CHARS),
-    )
+    return finish(True, process.returncode, "exited", f"exit_code: {process.returncode}")
 
 
 def run_command(
@@ -756,13 +807,20 @@ def run_command(
         result = _run_command(
             workspace, argv, cwd, timeout_seconds, sandbox=sandbox
         )
-    except KeyboardInterrupt:
+    except KeyboardInterrupt as exc:
         if result_callback is not None:
-            result_callback(CommandExecutionResult(None, None, "interrupted"))
+            result_callback(
+                exc.result if isinstance(exc, _CommandInterrupted)
+                else CommandExecutionResult(None, None, "interrupted")
+            )
         raise
-    except (TypeError, ValueError, OSError):
+    except (TypeError, ValueError, OSError) as exc:
         if result_callback is not None:
-            result_callback(CommandExecutionResult(False, None, "not_started"))
+            result_callback(
+                CommandExecutionResult(None, None, "unknown")
+                if isinstance(exc, _CommandLogFailure)
+                else CommandExecutionResult(False, None, "not_started")
+            )
         raise
     except Exception:
         if result_callback is not None:

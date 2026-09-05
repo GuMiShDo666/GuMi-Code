@@ -123,19 +123,20 @@ def _verification_preview(details: dict[str, object]) -> str:
 
 
 _VERIFICATION_APPROVAL_SCOPE = (
-    "仅批准当前进程、工作区和阶段内重复执行以下验证命令。\n"
+    "仅批准当前进程、工作区和阶段的扫描范围及可重复验证命令；未知命令仍须逐次批准。\n"
+    "dependency_dirs 为安装依赖，output_dirs 为生成产物；具体排除目录不逐文件核验，锁文件不证明其内容未变。\n"
     "修改命令、定义/入口、执行配置或排除范围后须重新批准；恢复会话不继承许可。\n"
     "命令在断网 Docker Sandbox 中执行，仍可修改工作区；通过不代表生产验收完成。"
 )
 
 
 def request_verification_approval(details: dict[str, object]) -> bool:
-    """Ask for explicitly scoped repeat permission, never truncate consent."""
+    """Approve explicit scan scope and eligible repeats, never truncate consent."""
     try:
         preview = _verification_preview(details)
         print(_VERIFICATION_APPROVAL_SCOPE, flush=True)
         print(preview, flush=True)
-        answer = input("是否批准本阶段重复验证？(y/N): ")
+        answer = input("是否批准本阶段扫描范围及可重复验证？(y/N): ")
         return answer.strip().lower() in {"y", "yes"}
     except (Exception, KeyboardInterrupt, EOFError):
         return False
@@ -160,8 +161,8 @@ def make_verification_approval(
                 Panel(body, title="Verification Permission", border_style="yellow")
             )
             decision = chooser(
-                "是否批准本阶段重复验证？",
-                options=[(False, "拒绝"), (True, "批准本阶段重复验证")],
+                "是否批准本阶段扫描范围及可重复验证？",
+                options=[(False, "拒绝"), (True, "批准本阶段范围及可重复验证")],
                 default=False,
             )
             return decision is True
