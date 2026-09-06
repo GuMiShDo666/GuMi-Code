@@ -21,6 +21,10 @@ from gum_code.context import (
     reactive_compact,
 )
 from gum_code.events import AgentEventCallback
+from gum_code.model_protocol import (
+    assistant_message_to_dict as _assistant_message_to_dict,
+    is_context_length_error as _is_context_length_error,
+)
 from gum_code.hooks import HookEvent, HookRegistry
 from gum_code.session import IN_FLIGHT_MARKER_KEY
 from gum_code.skills import SKILL_TOOL_NAMES, SKILL_TOOL_SCHEMAS, SkillRuntime
@@ -181,15 +185,6 @@ def build_agent_tool_schemas(
     return schemas
 
 
-def _is_context_length_error(error: object) -> bool:
-    text = str(error).lower()
-    return (
-        "prompt_too_long" in text
-        or "too many tokens" in text
-        or "context_length_exceeded" in text
-    )
-
-
 def _with_system_instructions(content: str) -> str:
     content = content.replace("\n\n" + VERIFICATION_INSTRUCTION, "")
     parts = [content]
@@ -198,35 +193,6 @@ def _with_system_instructions(content: str) -> str:
     if UNTRUSTED_TOOL_CONTENT_INSTRUCTION not in content:
         parts.append(UNTRUSTED_TOOL_CONTENT_INSTRUCTION)
     return "\n\n".join(parts)
-
-
-def _assistant_message_to_dict(message: object) -> dict[str, object]:
-    content = getattr(message, "content", None)
-    reasoning_content = getattr(message, "reasoning_content", None)
-
-    result: dict[str, object] = {
-        "role": "assistant",
-        "content": content,
-    }
-    if isinstance(reasoning_content, str):
-        result["reasoning_content"] = reasoning_content
-
-    tool_calls = getattr(message, "tool_calls", None)
-    if not tool_calls:
-        return result
-
-    result["tool_calls"] = [
-        {
-            "id": tool_call.id,
-            "type": getattr(tool_call, "type", "function"),
-            "function": {
-                "name": tool_call.function.name,
-                "arguments": tool_call.function.arguments,
-            },
-        }
-        for tool_call in tool_calls
-    ]
-    return result
 
 
 def _execute_todo_write(
@@ -352,6 +318,386 @@ def _finish_answer(
     if event_callback is not None:
         event_callback("final_answer", {"step": step, "answer": answer})
     return answer
+
+
+def _prepare_request_context(
+    *,
+    client: OpenAI,
+    model: str,
+    workspace: Path,
+    user_query: str,
+    messages: list[dict[str, object]],
+    agent_tool_schemas: list[dict[str, object]],
+    token_budget: TokenBudgetTracker,
+    max_context_tokens: int,
+    step: int,
+    event_callback: AgentEventCallback | None,
+    message_snapshot_callback: MessageSnapshotCallback | None,
+) -> tuple[list[dict[str, object]], int]:
+    """Prepare one request, preserving compaction, snapshot and event order."""
+    # Keep this degradation order so summaries see already-bounded Tool Results.
+    used_tokens = token_budget.count_request(messages, agent_tool_schemas)
+
+    messages, persisted = apply_tool_result_budget(messages, workspace)
+
+    if persisted > 0:
+        token_budget.reset()
+        after_tokens = token_budget.count_request(messages, agent_tool_schemas)
+        _send_message_snapshot(message_snapshot_callback, messages)
+        if event_callback is not None:
+            event_callback(
+                "context_compacted",
+                {
+                    "step": step,
+                    "stage": "tool_result_budget",
+                    "persisted_results": persisted,
+                    "before_tokens": used_tokens,
+                    "after_tokens": after_tokens,
+                    "max_tokens": max_context_tokens,
+                },
+            )
+        used_tokens = after_tokens
+
+    used_tokens = token_budget.count_request(messages, agent_tool_schemas)
+
+    if used_tokens >= max_context_tokens:
+        target_tokens = int(max_context_tokens * CONTEXT_TARGET_RATIO)
+
+        messages, shortened = apply_micro_compact(
+            messages,
+            workspace,
+            agent_tool_schemas,
+            token_budget,
+            target_tokens,
+        )
+
+        if shortened > 0:
+            token_budget.reset()
+            after_tokens = token_budget.count_request(messages, agent_tool_schemas)
+            _send_message_snapshot(message_snapshot_callback, messages)
+            if event_callback is not None:
+                event_callback(
+                    "context_compacted",
+                    {
+                        "step": step,
+                        "stage": "micro_compact",
+                        "shortened_results": shortened,
+                        "before_tokens": used_tokens,
+                        "after_tokens": after_tokens,
+                        "max_tokens": max_context_tokens,
+                    },
+                )
+            used_tokens = after_tokens
+
+        if used_tokens >= max_context_tokens:
+            messages, fitted = apply_fit_tool_results(
+                messages,
+                workspace,
+                agent_tool_schemas,
+                token_budget,
+                target_tokens,
+            )
+
+            if fitted > 0:
+                token_budget.reset()
+                after_tokens = token_budget.count_request(messages, agent_tool_schemas)
+                _send_message_snapshot(message_snapshot_callback, messages)
+                if event_callback is not None:
+                    event_callback(
+                        "context_compacted",
+                        {
+                            "step": step,
+                            "stage": "fit_tool_results",
+                            "fitted_results": fitted,
+                            "before_tokens": used_tokens,
+                            "after_tokens": after_tokens,
+                            "max_tokens": max_context_tokens,
+                        },
+                    )
+                used_tokens = after_tokens
+
+    if used_tokens >= max_context_tokens:
+        if event_callback is not None:
+            event_callback("context_summary", {"step": step})
+
+        before_tokens = used_tokens
+        token_budget.reset()
+        messages, summary_transcript = compact_history(
+            client,
+            model,
+            workspace,
+            messages,
+            user_query,
+            tools=agent_tool_schemas,
+            token_counter=token_budget,
+            max_context_tokens=max_context_tokens,
+            usage_callback=_summary_usage_callback(step, event_callback),
+        )
+        after_tokens = token_budget.count_request(messages, agent_tool_schemas)
+        _send_message_snapshot(message_snapshot_callback, messages)
+        if event_callback is not None:
+            event_callback(
+                "context_compacted",
+                {
+                    "step": step,
+                    "stage": "compact_history",
+                    "transcript": summary_transcript,
+                    "before_tokens": before_tokens,
+                    "after_tokens": after_tokens,
+                    "max_tokens": max_context_tokens,
+                },
+            )
+        used_tokens = after_tokens
+
+    used_tokens = token_budget.count_request(messages, agent_tool_schemas)
+
+    if used_tokens >= max_context_tokens:
+        raise RuntimeError("上下文超过当前预算")
+
+    return messages, used_tokens
+
+
+def _execute_task_batch(
+    *,
+    task_calls: list[object],
+    messages: list[dict[str, object]],
+    delegations_started: int,
+    started_descriptions: set[str],
+    client: OpenAI,
+    model: str,
+    workspace: Path,
+    base_token_counter: RequestTokenCounter,
+    max_context_tokens: int,
+    step: int,
+    allow_subagent: bool,
+    event_callback: AgentEventCallback | None,
+    message_snapshot_callback: MessageSnapshotCallback | None,
+    pre_tool_use_callback: Callable[[str, dict[str, object]], str | None] | None,
+    post_tool_use_callback: Callable[[str, dict[str, object], str], None] | None,
+    vision_runtime: "VisionRuntime | None",
+) -> int:
+    """Join and persist one adjacent task group before returning its count.
+
+    Messages and started descriptions are updated in place. Failures retain the
+    existing conservative snapshots and cancel/drain started sibling work.
+    """
+    if event_callback is not None:
+        for _ in task_calls:
+            event_callback(
+                "tool_call",
+                {"step": step, "tool_name": "task"},
+            )
+
+    task_results: list[str | None] = [None] * len(task_calls)
+    task_descriptions: dict[int, str] = {}
+    accepted_offsets: list[int] = []
+    committed_prefix = 0
+    marker_saved = False
+
+    for offset, task_call in enumerate(task_calls):
+        result: str | None = None
+        if not allow_subagent:
+            result = error_result(
+                "subagent_disabled",
+                "Subagent delegation is disabled for this run.",
+            )
+        else:
+            try:
+                description = parse_task_description(
+                    task_call.function.arguments
+                )
+            except ValueError:
+                result = error_result(
+                    "invalid_task",
+                    "task requires one non-blank description of at most 4000 characters.",
+                )
+            else:
+                normalized_description = normalize_task_description(
+                    description
+                )
+                if normalized_description in started_descriptions:
+                    result = error_result(
+                        "duplicate_task",
+                        "An equivalent task already started in this run.",
+                    )
+                elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
+                    result = error_result(
+                        "delegation_limit",
+                        "The per-run subagent delegation limit was reached.",
+                    )
+                else:
+                    if not marker_saved:
+                        in_flight_snapshot = copy.deepcopy(messages)
+                        in_flight_snapshot.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": task_call.id,
+                                "content": "",
+                                IN_FLIGHT_MARKER_KEY: True,
+                            }
+                        )
+                        _send_message_snapshot(
+                            message_snapshot_callback,
+                            in_flight_snapshot,
+                        )
+                        marker_saved = True
+
+                    parsed_arguments = {"description": description}
+                    blocked = None
+                    if pre_tool_use_callback is not None:
+                        blocked = pre_tool_use_callback(
+                            "task",
+                            copy.deepcopy(parsed_arguments),
+                        )
+
+                    if blocked is not None:
+                        result = error_result(
+                            "hook_blocked",
+                            "The task was blocked by a PreToolUse hook.",
+                        )
+                    else:
+                        delegations_started += 1
+                        started_descriptions.add(
+                            normalized_description
+                        )
+                        task_descriptions[offset] = description
+                        accepted_offsets.append(offset)
+
+        task_results[offset] = result
+        if result is not None and not marker_saved:
+            if event_callback is not None:
+                event_callback(
+                    "tool_result",
+                    {"step": step, "tool_name": "task"},
+                )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": task_call.id,
+                    "content": result,
+                }
+            )
+            _send_message_snapshot(
+                message_snapshot_callback,
+                messages,
+            )
+            committed_prefix += 1
+
+    cancel_event = Event()
+    start_barrier: Barrier | None = None
+
+    def execute_task(offset: int) -> str:
+        task_call = task_calls[offset]
+        try:
+            _emit_tool_execution(event_callback, step, "task")
+        except BaseException:
+            cancel_event.set()
+            if start_barrier is not None:
+                start_barrier.abort()
+            raise
+        if start_barrier is not None:
+            try:
+                # Keep sibling task events adjacent for terminal deduplication.
+                start_barrier.wait()
+            except BrokenBarrierError:
+                pass
+        return run_read_only_subagent(
+            client=client,
+            model=model,
+            workspace=workspace,
+            description=task_descriptions[offset],
+            parent_tool_call_id=task_call.id,
+            token_counter=base_token_counter,
+            max_context_tokens=max_context_tokens,
+            event_callback=event_callback,
+            pre_tool_use_callback=pre_tool_use_callback,
+            post_tool_use_callback=post_tool_use_callback,
+            cancel_event=cancel_event,
+            **({"vision_runtime": vision_runtime} if vision_runtime is not None else {}),
+        )
+
+    if len(accepted_offsets) == 1:
+        offset = accepted_offsets[0]
+        try:
+            task_results[offset] = execute_task(offset)
+        except KeyboardInterrupt:
+            cancel_event.set()
+            raise
+    elif len(accepted_offsets) > 1:
+        start_barrier = Barrier(len(accepted_offsets))
+        future_offsets = {}
+        with ThreadPoolExecutor(
+            max_workers=len(accepted_offsets)
+        ) as executor:
+            try:
+                for offset in accepted_offsets:
+                    future = executor.submit(
+                        execute_task,
+                        offset,
+                    )
+                    future_offsets[future] = offset
+                for future in as_completed(future_offsets):
+                    task_results[future_offsets[future]] = (
+                        future.result()
+                    )
+            except BaseException:
+                cancel_event.set()
+                start_barrier.abort()
+                for future in future_offsets:
+                    future.cancel()
+                raise
+
+    deferred_offsets = range(committed_prefix, len(task_calls))
+    for position, offset in enumerate(deferred_offsets):
+        result = task_results[offset]
+        if result is None:
+            raise RuntimeError("Subagent result is missing")
+
+        description = task_descriptions.get(offset)
+        if (
+            description is not None
+            and post_tool_use_callback is not None
+        ):
+            post_tool_use_callback(
+                "task",
+                {"description": description},
+                result,
+            )
+
+        if event_callback is not None:
+            event_callback(
+                "tool_result",
+                {"step": step, "tool_name": "task"},
+            )
+
+        task_call = task_calls[offset]
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": task_call.id,
+                "content": result,
+            }
+        )
+        _send_message_snapshot(
+            message_snapshot_callback,
+            messages,
+        )
+        if position + 1 < len(deferred_offsets):
+            next_call = task_calls[offset + 1]
+            in_flight_snapshot = copy.deepcopy(messages)
+            in_flight_snapshot.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": next_call.id,
+                    "content": "",
+                    IN_FLIGHT_MARKER_KEY: True,
+                }
+            )
+            _send_message_snapshot(
+                message_snapshot_callback,
+                in_flight_snapshot,
+            )
+    return delegations_started
 
 
 def _run_agent_loop(
@@ -587,124 +933,19 @@ def _run_agent_loop(
                 )
             continue
 
-        # Keep this degradation order so summaries see already-bounded Tool Results.
-        used_tokens = token_budget.count_request(messages, agent_tool_schemas)
-
-        messages, persisted = apply_tool_result_budget(messages, workspace)
-
-        if persisted > 0:
-            token_budget.reset()
-            after_tokens = token_budget.count_request(messages, agent_tool_schemas)
-            _send_message_snapshot(message_snapshot_callback, messages)
-            if event_callback is not None:
-                event_callback(
-                    "context_compacted",
-                    {
-                        "step": step,
-                        "stage": "tool_result_budget",
-                        "persisted_results": persisted,
-                        "before_tokens": used_tokens,
-                        "after_tokens": after_tokens,
-                        "max_tokens": max_context_tokens,
-                    },
-                )
-            used_tokens = after_tokens
-
-        used_tokens = token_budget.count_request(messages, agent_tool_schemas)
-
-        if used_tokens >= max_context_tokens:
-            target_tokens = int(max_context_tokens * CONTEXT_TARGET_RATIO)
-
-            messages, shortened = apply_micro_compact(
-                messages,
-                workspace,
-                agent_tool_schemas,
-                token_budget,
-                target_tokens,
-            )
-
-            if shortened > 0:
-                token_budget.reset()
-                after_tokens = token_budget.count_request(messages, agent_tool_schemas)
-                _send_message_snapshot(message_snapshot_callback, messages)
-                if event_callback is not None:
-                    event_callback(
-                        "context_compacted",
-                        {
-                            "step": step,
-                            "stage": "micro_compact",
-                            "shortened_results": shortened,
-                            "before_tokens": used_tokens,
-                            "after_tokens": after_tokens,
-                            "max_tokens": max_context_tokens,
-                        },
-                    )
-                used_tokens = after_tokens
-
-            if used_tokens >= max_context_tokens:
-                messages, fitted = apply_fit_tool_results(
-                    messages,
-                    workspace,
-                    agent_tool_schemas,
-                    token_budget,
-                    target_tokens,
-                )
-
-                if fitted > 0:
-                    token_budget.reset()
-                    after_tokens = token_budget.count_request(messages, agent_tool_schemas)
-                    _send_message_snapshot(message_snapshot_callback, messages)
-                    if event_callback is not None:
-                        event_callback(
-                            "context_compacted",
-                            {
-                                "step": step,
-                                "stage": "fit_tool_results",
-                                "fitted_results": fitted,
-                                "before_tokens": used_tokens,
-                                "after_tokens": after_tokens,
-                                "max_tokens": max_context_tokens,
-                            },
-                        )
-                    used_tokens = after_tokens
-
-        if used_tokens >= max_context_tokens:
-            if event_callback is not None:
-                event_callback("context_summary", {"step": step})
-
-            before_tokens = used_tokens
-            token_budget.reset()
-            messages, summary_transcript = compact_history(
-                client,
-                model,
-                workspace,
-                messages,
-                user_query,
-                tools=agent_tool_schemas,
-                token_counter=token_budget,
-                max_context_tokens=max_context_tokens,
-                usage_callback=_summary_usage_callback(step, event_callback),
-            )
-            after_tokens = token_budget.count_request(messages, agent_tool_schemas)
-            _send_message_snapshot(message_snapshot_callback, messages)
-            if event_callback is not None:
-                event_callback(
-                    "context_compacted",
-                    {
-                        "step": step,
-                        "stage": "compact_history",
-                        "transcript": summary_transcript,
-                        "before_tokens": before_tokens,
-                        "after_tokens": after_tokens,
-                        "max_tokens": max_context_tokens,
-                    },
-                )
-            used_tokens = after_tokens
-
-        used_tokens = token_budget.count_request(messages, agent_tool_schemas)
-
-        if used_tokens >= max_context_tokens:
-            raise RuntimeError("上下文超过当前预算")
+        messages, used_tokens = _prepare_request_context(
+            client=client,
+            model=model,
+            workspace=workspace,
+            user_query=user_query,
+            messages=messages,
+            agent_tool_schemas=agent_tool_schemas,
+            token_budget=token_budget,
+            max_context_tokens=max_context_tokens,
+            step=step,
+            event_callback=event_callback,
+            message_snapshot_callback=message_snapshot_callback,
+        )
 
         reactive_retries = 0
 
@@ -854,222 +1095,24 @@ def _run_agent_loop(
                     task_group_end += 1
                 task_calls = message.tool_calls[index:task_group_end]
 
-                if event_callback is not None:
-                    for _ in task_calls:
-                        event_callback(
-                            "tool_call",
-                            {"step": step, "tool_name": "task"},
-                        )
-
-                task_results: list[str | None] = [None] * len(task_calls)
-                task_descriptions: dict[int, str] = {}
-                accepted_offsets: list[int] = []
-                committed_prefix = 0
-                marker_saved = False
-
-                for offset, task_call in enumerate(task_calls):
-                    result: str | None = None
-                    if not allow_subagent:
-                        result = error_result(
-                            "subagent_disabled",
-                            "Subagent delegation is disabled for this run.",
-                        )
-                    else:
-                        try:
-                            description = parse_task_description(
-                                task_call.function.arguments
-                            )
-                        except ValueError:
-                            result = error_result(
-                                "invalid_task",
-                                "task requires one non-blank description of at most 4000 characters.",
-                            )
-                        else:
-                            normalized_description = normalize_task_description(
-                                description
-                            )
-                            if normalized_description in started_descriptions:
-                                result = error_result(
-                                    "duplicate_task",
-                                    "An equivalent task already started in this run.",
-                                )
-                            elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
-                                result = error_result(
-                                    "delegation_limit",
-                                    "The per-run subagent delegation limit was reached.",
-                                )
-                            else:
-                                if not marker_saved:
-                                    in_flight_snapshot = copy.deepcopy(messages)
-                                    in_flight_snapshot.append(
-                                        {
-                                            "role": "tool",
-                                            "tool_call_id": task_call.id,
-                                            "content": "",
-                                            IN_FLIGHT_MARKER_KEY: True,
-                                        }
-                                    )
-                                    _send_message_snapshot(
-                                        message_snapshot_callback,
-                                        in_flight_snapshot,
-                                    )
-                                    marker_saved = True
-
-                                parsed_arguments = {"description": description}
-                                blocked = None
-                                if pre_tool_use_callback is not None:
-                                    blocked = pre_tool_use_callback(
-                                        "task",
-                                        copy.deepcopy(parsed_arguments),
-                                    )
-
-                                if blocked is not None:
-                                    result = error_result(
-                                        "hook_blocked",
-                                        "The task was blocked by a PreToolUse hook.",
-                                    )
-                                else:
-                                    delegations_started += 1
-                                    started_descriptions.add(
-                                        normalized_description
-                                    )
-                                    task_descriptions[offset] = description
-                                    accepted_offsets.append(offset)
-
-                    task_results[offset] = result
-                    if result is not None and not marker_saved:
-                        if event_callback is not None:
-                            event_callback(
-                                "tool_result",
-                                {"step": step, "tool_name": "task"},
-                            )
-                        messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": task_call.id,
-                                "content": result,
-                            }
-                        )
-                        _send_message_snapshot(
-                            message_snapshot_callback,
-                            messages,
-                        )
-                        committed_prefix += 1
-
-                cancel_event = Event()
-                start_barrier: Barrier | None = None
-
-                def execute_task(offset: int) -> str:
-                    task_call = task_calls[offset]
-                    try:
-                        _emit_tool_execution(event_callback, step, "task")
-                    except BaseException:
-                        cancel_event.set()
-                        if start_barrier is not None:
-                            start_barrier.abort()
-                        raise
-                    if start_barrier is not None:
-                        try:
-                            # Keep sibling task events adjacent for terminal deduplication.
-                            start_barrier.wait()
-                        except BrokenBarrierError:
-                            pass
-                    return run_read_only_subagent(
-                        client=client,
-                        model=model,
-                        workspace=workspace,
-                        description=task_descriptions[offset],
-                        parent_tool_call_id=task_call.id,
-                        token_counter=base_token_counter,
-                        max_context_tokens=max_context_tokens,
-                        event_callback=event_callback,
-                        pre_tool_use_callback=pre_tool_use_callback,
-                        post_tool_use_callback=post_tool_use_callback,
-                        cancel_event=cancel_event,
-                        **({"vision_runtime": vision_runtime} if vision_runtime is not None else {}),
-                    )
-
-                if len(accepted_offsets) == 1:
-                    offset = accepted_offsets[0]
-                    try:
-                        task_results[offset] = execute_task(offset)
-                    except KeyboardInterrupt:
-                        cancel_event.set()
-                        raise
-                elif len(accepted_offsets) > 1:
-                    start_barrier = Barrier(len(accepted_offsets))
-                    future_offsets = {}
-                    with ThreadPoolExecutor(
-                        max_workers=len(accepted_offsets)
-                    ) as executor:
-                        try:
-                            for offset in accepted_offsets:
-                                future = executor.submit(
-                                    execute_task,
-                                    offset,
-                                )
-                                future_offsets[future] = offset
-                            for future in as_completed(future_offsets):
-                                task_results[future_offsets[future]] = (
-                                    future.result()
-                                )
-                        except BaseException:
-                            cancel_event.set()
-                            start_barrier.abort()
-                            for future in future_offsets:
-                                future.cancel()
-                            raise
-
-                deferred_offsets = range(committed_prefix, len(task_calls))
-                for position, offset in enumerate(deferred_offsets):
-                    result = task_results[offset]
-                    if result is None:
-                        raise RuntimeError("Subagent result is missing")
-
-                    description = task_descriptions.get(offset)
-                    if (
-                        description is not None
-                        and post_tool_use_callback is not None
-                    ):
-                        post_tool_use_callback(
-                            "task",
-                            {"description": description},
-                            result,
-                        )
-
-                    if event_callback is not None:
-                        event_callback(
-                            "tool_result",
-                            {"step": step, "tool_name": "task"},
-                        )
-
-                    task_call = task_calls[offset]
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": task_call.id,
-                            "content": result,
-                        }
-                    )
-                    _send_message_snapshot(
-                        message_snapshot_callback,
-                        messages,
-                    )
-                    if position + 1 < len(deferred_offsets):
-                        next_call = task_calls[offset + 1]
-                        in_flight_snapshot = copy.deepcopy(messages)
-                        in_flight_snapshot.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": next_call.id,
-                                "content": "",
-                                IN_FLIGHT_MARKER_KEY: True,
-                            }
-                        )
-                        _send_message_snapshot(
-                            message_snapshot_callback,
-                            in_flight_snapshot,
-                        )
+                delegations_started = _execute_task_batch(
+                    task_calls=task_calls,
+                    messages=messages,
+                    delegations_started=delegations_started,
+                    started_descriptions=started_descriptions,
+                    client=client,
+                    model=model,
+                    workspace=workspace,
+                    base_token_counter=base_token_counter,
+                    max_context_tokens=max_context_tokens,
+                    step=step,
+                    allow_subagent=allow_subagent,
+                    event_callback=event_callback,
+                    message_snapshot_callback=message_snapshot_callback,
+                    pre_tool_use_callback=pre_tool_use_callback,
+                    post_tool_use_callback=post_tool_use_callback,
+                    vision_runtime=vision_runtime,
+                )
                 continue
 
             if event_callback is not None:

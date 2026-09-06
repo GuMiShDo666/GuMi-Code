@@ -478,6 +478,24 @@ def _tool_name(messages: list[dict[str, object]], call_id: object) -> str | None
     return None
 
 
+def _message_event_data(
+    message: dict[str, object],
+    history: list[dict[str, object]],
+    *,
+    request_id: str | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Build ordered message fields; callers own sequence and history updates."""
+    event_type = _message_event_type(message)
+    data: dict[str, object] = {"message": message}
+    if request_id is not None:
+        data["request_id"] = request_id
+    if event_type in {"tool.execution_started", "tool.result"}:
+        name = _tool_name(history, message.get("tool_call_id"))
+        if name is not None:
+            data["tool_name"] = name
+    return event_type, data
+
+
 def _fit_messages_for_session(
     workspace: Path,
     messages: list[dict[str, object]],
@@ -617,14 +635,10 @@ def save_session(
         events = [header]
         history: list[dict[str, object]] = []
         for index, message in enumerate(fitted):
-            event_type = _message_event_type(message)
-            data: dict[str, object] = {"message": message}
-            if index == request_index:
-                data["request_id"] = user_request_id
-            if event_type in {"tool.execution_started", "tool.result"}:
-                name = _tool_name(history, message.get("tool_call_id"))
-                if name is not None:
-                    data["tool_name"] = name
+            event_type, data = _message_event_data(
+                message, history,
+                request_id=user_request_id if index == request_index else None,
+            )
             events.append(_event(len(events), event_type, data))
             history.append(message)
         content = _encode_events(events)
@@ -664,14 +678,10 @@ def save_session(
             next_seq += 1
         history = copy.deepcopy(base)
         for index, message in enumerate(fitted[request_index:], request_index):
-            event_type = _message_event_type(message)
-            data = {"message": message}
-            if index == request_index:
-                data["request_id"] = user_request_id
-            if event_type in {"tool.execution_started", "tool.result"}:
-                name = _tool_name(history, message.get("tool_call_id"))
-                if name is not None:
-                    data["tool_name"] = name
+            event_type, data = _message_event_data(
+                message, history,
+                request_id=user_request_id if index == request_index else None,
+            )
             additions.append(_event(next_seq, event_type, data))
             next_seq += 1
             history.append(message)
@@ -701,12 +711,7 @@ def save_session(
     elif prefix:
         history = copy.deepcopy(current)
         for message in fitted[len(current) :]:
-            event_type = _message_event_type(message)
-            data = {"message": message}
-            if event_type in {"tool.execution_started", "tool.result"}:
-                name = _tool_name(history, message.get("tool_call_id"))
-                if name is not None:
-                    data["tool_name"] = name
+            event_type, data = _message_event_data(message, history)
             additions.append(_event(next_seq, event_type, data))
             next_seq += 1
             history.append(message)
@@ -726,12 +731,7 @@ def save_session(
         next_seq += 1
         history = copy.deepcopy(projected)
         for message in fitted[len(current) :]:
-            event_type = _message_event_type(message)
-            data = {"message": message}
-            if event_type in {"tool.execution_started", "tool.result"}:
-                name = _tool_name(history, message.get("tool_call_id"))
-                if name is not None:
-                    data["tool_name"] = name
+            event_type, data = _message_event_data(message, history)
             additions.append(_event(next_seq, event_type, data))
             next_seq += 1
             history.append(message)

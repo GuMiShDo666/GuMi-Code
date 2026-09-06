@@ -561,47 +561,7 @@ class SelfCheckRuntime:
             package = self.workspace / root
             project_files = _project_files(self.workspace, package)
             if ecosystem == "python":
-                files = [str(Path(name).relative_to(root)) if root != "." else name for name in paths if (self.workspace / name).is_file() and (Path(name).suffix in {".py", ".pyi"} or not Path(name).suffix)]
-                if files:
-                    script = "import pathlib,sys; [compile(pathlib.Path(p).read_bytes(), p, 'exec') for p in sys.argv[1:]]"
-                    commands.append(("syntax", {"argv": ["python", "-c", script, *files], "cwd": root, "timeout_seconds": 60}))
-                candidates = [p for p in project_files if (p.name.startswith("test_") or p.name.startswith("check_")) and p.suffix == ".py"]
-                pytest_declared = (package / "pytest.ini").is_file()
-                for filename in ("requirements.txt", "pyproject.toml"):
-                    target = package / filename
-                    if target.is_file():
-                        pytest_declared = pytest_declared or bool(re.search(r"\bpytest\b", _read_text(self.workspace, target.relative_to(self.workspace).as_posix())))
-                unittest_files, direct_files = [], []
-                for candidate in candidates[:MAX_CHANGED_PATHS]:
-                    try:
-                        tree = ast.parse(_read_text(self.workspace, candidate.relative_to(self.workspace).as_posix()))
-                    except SyntaxError:
-                        pytest_declared = True
-                        continue
-                    has_unittest = any(isinstance(node, ast.ClassDef) and any(
-                        (isinstance(base, ast.Attribute) and base.attr == "TestCase") or (isinstance(base, ast.Name) and base.id == "TestCase") for base in node.bases) for node in ast.walk(tree))
-                    has_functions = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_") for node in ast.iter_child_nodes(tree))
-                    if has_functions:
-                        pytest_declared = True
-                    elif has_unittest:
-                        unittest_files.append(candidate)
-                    else:
-                        direct_files.append(candidate)
-                if len(candidates) > MAX_CHANGED_PATHS:
-                    uncovered.append("check_limit")
-                if pytest_declared:
-                    commands.append(("test", {"argv": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"], "cwd": root, "timeout_seconds": 300}))
-                elif unittest_files:
-                    # Explicit modules prevent a zero-test directory discovery from looking like coverage.
-                    for candidate in unittest_files[:MAX_CHECKS]:
-                        relative = candidate.relative_to(package).as_posix()
-                        script = "import runpy,unittest as u,sys,types;n=u.defaultTestLoader.loadTestsFromModule(types.SimpleNamespace(**runpy.run_path(sys.argv[1])));r=u.TextTestRunner().run(n);sys.exit(not(r.testsRun and r.wasSuccessful()))"
-                        commands.append(("test", {"argv": ["python", "-c", script, relative], "cwd": root, "timeout_seconds": 300}))
-                elif direct_files:
-                    for candidate in direct_files[:MAX_CHECKS]:
-                        commands.append(("test", {"argv": ["python", candidate.relative_to(package).as_posix()], "cwd": root, "timeout_seconds": 300}))
-                else:
-                    uncovered.append("no_tests")
+                commands = self._python_checks(root, package, paths, project_files, uncovered)
             else:
                 target = package / "package.json"
                 scripts = {}
@@ -642,6 +602,53 @@ class SelfCheckRuntime:
             if commands:
                 result.append((root, ecosystem, commands))
         return result, list(dict.fromkeys(uncovered))[:MAX_CHECKS]
+
+    def _python_checks(self, root: str, package: Path, paths: list[str],
+                       project_files: list[Path], uncovered: list[str]) -> list:
+        """Select Python commands and append coverage gaps in discovery order."""
+        commands = []
+        files = [str(Path(name).relative_to(root)) if root != "." else name for name in paths if (self.workspace / name).is_file() and (Path(name).suffix in {".py", ".pyi"} or not Path(name).suffix)]
+        if files:
+            script = "import pathlib,sys; [compile(pathlib.Path(p).read_bytes(), p, 'exec') for p in sys.argv[1:]]"
+            commands.append(("syntax", {"argv": ["python", "-c", script, *files], "cwd": root, "timeout_seconds": 60}))
+        candidates = [p for p in project_files if (p.name.startswith("test_") or p.name.startswith("check_")) and p.suffix == ".py"]
+        pytest_declared = (package / "pytest.ini").is_file()
+        for filename in ("requirements.txt", "pyproject.toml"):
+            target = package / filename
+            if target.is_file():
+                pytest_declared = pytest_declared or bool(re.search(r"\bpytest\b", _read_text(self.workspace, target.relative_to(self.workspace).as_posix())))
+        unittest_files, direct_files = [], []
+        for candidate in candidates[:MAX_CHANGED_PATHS]:
+            try:
+                tree = ast.parse(_read_text(self.workspace, candidate.relative_to(self.workspace).as_posix()))
+            except SyntaxError:
+                pytest_declared = True
+                continue
+            has_unittest = any(isinstance(node, ast.ClassDef) and any(
+                (isinstance(base, ast.Attribute) and base.attr == "TestCase") or (isinstance(base, ast.Name) and base.id == "TestCase") for base in node.bases) for node in ast.walk(tree))
+            has_functions = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_") for node in ast.iter_child_nodes(tree))
+            if has_functions:
+                pytest_declared = True
+            elif has_unittest:
+                unittest_files.append(candidate)
+            else:
+                direct_files.append(candidate)
+        if len(candidates) > MAX_CHANGED_PATHS:
+            uncovered.append("check_limit")
+        if pytest_declared:
+            commands.append(("test", {"argv": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"], "cwd": root, "timeout_seconds": 300}))
+        elif unittest_files:
+            # Explicit modules prevent a zero-test directory discovery from looking like coverage.
+            for candidate in unittest_files[:MAX_CHECKS]:
+                relative = candidate.relative_to(package).as_posix()
+                script = "import runpy,unittest as u,sys,types;n=u.defaultTestLoader.loadTestsFromModule(types.SimpleNamespace(**runpy.run_path(sys.argv[1])));r=u.TextTestRunner().run(n);sys.exit(not(r.testsRun and r.wasSuccessful()))"
+                commands.append(("test", {"argv": ["python", "-c", script, relative], "cwd": root, "timeout_seconds": 300}))
+        elif direct_files:
+            for candidate in direct_files[:MAX_CHECKS]:
+                commands.append(("test", {"argv": ["python", candidate.relative_to(package).as_posix()], "cwd": root, "timeout_seconds": 300}))
+        else:
+            uncovered.append("no_tests")
+        return commands
 
     def _typescript_outputs(self, package: Path, files: list[Path]) -> None:
         target = package / "tsconfig.json"

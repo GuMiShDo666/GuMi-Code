@@ -15,6 +15,10 @@ from gum_code.context import (
     reactive_compact,
 )
 from gum_code.events import AgentEventCallback
+from gum_code.model_protocol import (
+    assistant_message_to_dict as _assistant_message_to_dict,
+    is_context_length_error as _is_context_length_error,
+)
 from gum_code.session import TASK_INTERRUPTED_RESULT
 from gum_code.token_counting import RequestTokenCounter, TokenBudgetTracker
 from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
@@ -200,43 +204,6 @@ def parse_task_description(arguments_json: object) -> str:
 
 def normalize_task_description(description: str) -> str:
     return " ".join(description.split())
-
-
-def _assistant_message_to_dict(message: object) -> dict[str, object]:
-    result: dict[str, object] = {
-        "role": "assistant",
-        "content": getattr(message, "content", None),
-    }
-    reasoning_content = getattr(message, "reasoning_content", None)
-    if isinstance(reasoning_content, str):
-        result["reasoning_content"] = reasoning_content
-
-    tool_calls = getattr(message, "tool_calls", None)
-    if tool_calls:
-        result["tool_calls"] = [
-            {
-                "id": tool_call.id,
-                "type": getattr(tool_call, "type", "function"),
-                "function": {
-                    "name": tool_call.function.name,
-                    "arguments": tool_call.function.arguments,
-                },
-            }
-            for tool_call in tool_calls
-        ]
-    return result
-
-
-def _is_context_length_error(error: object) -> bool:
-    text = str(error).lower()
-    return any(
-        marker in text
-        for marker in (
-            "prompt_too_long",
-            "too many tokens",
-            "context_length_exceeded",
-        )
-    )
 
 
 def _validate_string_list(
