@@ -16,8 +16,8 @@ from gum_code.config import (
     resolve_context_window,
 )
 from gum_code.events import (
+    RichEventRenderer,
     create_console,
-    deduplicate_tool_execution,
     environment_cleanup_text,
     print_terminal_event,
 )
@@ -144,6 +144,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
     lease: SessionLease | None = None
     vision_runtime: VisionRuntime | None = None
     self_check_runtime: SelfCheckRuntime | None = None
+    renderer: RichEventRenderer | None = None
     session_write_lock = RLock()
     try:
         session_file = args.session_file or args.resume_session
@@ -276,9 +277,12 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         request_id = str(uuid.uuid4())
         if args.task_type is not None:
             print("提示：--task-type 已弃用；自检由本轮实际代码变化触发。", flush=True)
+        renderer = RichEventRenderer(
+            create_console(), persistent_callback=print_terminal_event,
+        )
         self_check_runtime = SelfCheckRuntime(
             args.workspace, request_id=request_id, command_sandbox=command_sandbox,
-            approval_callback=(lambda summary: request_environment_preparation(
+            approval_callback=renderer.paused(lambda summary: request_environment_preparation(
                 summary, interactive=args.interactive_terminal,
             )) if args.interactive_terminal else None,
             internal_paths=(
@@ -294,7 +298,6 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             settings_loader=lambda: load_vision_settings(),
         )
         last_task_outcome: dict[str, object] | None = None
-        render_event = deduplicate_tool_execution(print_terminal_event)
 
         def event_callback(event_type: str, payload: dict[str, object]) -> None:
             nonlocal last_task_outcome
@@ -310,7 +313,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 }
             ):
                 raise RuntimeError("缺少可信任务终态，不能展示完成结果")
-            render_event(event_type, payload)
+            renderer(event_type, payload)
 
         message_snapshot_callback = None
         if session_file is not None:
@@ -352,7 +355,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             max_steps=args.max_steps,
             max_context_tokens=max_context_tokens,
             allow_run_command=args.allow_run_command,
-            approval_callback=request_terminal_approval,
+            approval_callback=renderer.paused(request_terminal_approval),
             event_callback=event_callback,
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
@@ -360,15 +363,17 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             skill_runtime=skill_runtime,
             self_check_runtime=self_check_runtime,
             vision_runtime=vision_runtime,
-            on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
+            on_vision_budget_exhausted=renderer.paused(lambda runtime: request_extra_vision_calls(
                 runtime, interactive=args.interactive_terminal,
-            ),
+            )),
             **kwargs,
         )
         if last_task_outcome is not None and last_task_outcome.get("status") == "completed":
             return 0
         return 1
     finally:
+        if renderer is not None:
+            renderer.close()
         if vision_runtime is not None:
             vision_runtime.cancel()
         if self_check_runtime is not None:
