@@ -13,6 +13,9 @@ SKIP_NAMES = {
     ".task_outputs",
 }
 
+# Search noise is not necessarily private: compilers must be able to update caches.
+SENSITIVE_PATH_NAMES = SKIP_NAMES - {"__pycache__", ".pytest_cache"}
+
 SENSITIVE_FILE_NAMES = {
     ".netrc",
     ".npmrc",
@@ -65,7 +68,7 @@ def _is_sensitive_name(name: str) -> bool:
     if name in SAFE_ENV_TEMPLATE_NAMES:
         return False
 
-    if name in SKIP_NAMES or name in SENSITIVE_FILE_NAMES:
+    if name in SENSITIVE_PATH_NAMES or name in SENSITIVE_FILE_NAMES:
         return True
 
     if name.startswith(".env."):

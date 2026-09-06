@@ -20,6 +20,7 @@ from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 from gum_code.context import LARGE_RESULT_CHAR_LIMIT, persist_tool_result
 from gum_code.verification import validate_task_state
 from gum_code.vision import validate_vision_state
+from gum_code.self_check import validate_self_check_state
 
 SESSION_VERSION = 3
 LEGACY_SESSION_VERSION = 1
@@ -69,6 +70,7 @@ class SessionData:
     vision_state: dict[str, object] | None = None
     user_request_id: str | None = None
     source_event_seq: int | None = None
+    self_check_state: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +108,7 @@ _EVENT_TYPES = {
     "context.compacted",
     "task.state",
     "vision.state",
+    "self_check.state",
 }
 
 
@@ -158,7 +161,7 @@ def _encode_events(events: list[dict[str, object]]) -> bytes:
         (
             json.dumps(
                 event,
-                ensure_ascii=event["type"] in {"task.state", "vision.state"},
+                ensure_ascii=event["type"] in {"task.state", "vision.state", "self_check.state"},
                 separators=(",", ":"),
             ) + "\n"
         ).encode("utf-8")
@@ -190,6 +193,9 @@ def _validate_event(event: object, expected_seq: int) -> dict[str, object]:
     elif event_type == "vision.state":
         if validate_vision_state(data)["source_event_seq"] is None:
             raise ValueError("vision.state 缺少原始用户请求来源")
+    elif event_type == "self_check.state":
+        if validate_self_check_state(data)["source_event_seq"] is None:
+            raise ValueError("self_check.state 缺少原始用户请求来源")
     elif event_type == "turn.started" and "request_id" in data:
         _validate_request_id(data["request_id"])
     elif event_type == "skill.activated":
@@ -270,8 +276,8 @@ def _read_event_log(
     assert isinstance(data, dict)
     if data.get("version") != SESSION_VERSION:
         raise ValueError(f"不支持的 Session 版本：{data.get('version')!r}")
-    if {"vision_state", "user_request_id", "source_event_seq"} & data.keys():
-        raise ValueError("Session header 不允许包含视觉预算派生状态")
+    if {"vision_state", "self_check_state", "user_request_id", "source_event_seq"} & data.keys():
+        raise ValueError("Session header 不允许包含请求派生状态")
     try:
         uuid.UUID(str(data.get("id")))
     except (ValueError, TypeError, AttributeError) as error:
@@ -353,6 +359,25 @@ def _replay_events(
                 raise ValueError("vision.state 不允许回退本轮预算")
             state["vision_state"] = budget
             continue
+        if event_type == "self_check.state":
+            check_state = validate_self_check_state(data)
+            if (
+                check_state["request_id"] != state.get("user_request_id")
+                or check_state["source_event_seq"] != state.get("source_event_seq")
+            ):
+                raise ValueError("self_check.state 与原始用户请求不匹配")
+            previous = state.get("self_check_state")
+            if isinstance(previous, dict) and (
+                check_state["generation"] < previous["generation"]
+                or not set(previous["changed_paths"]) <= set(check_state["changed_paths"])
+                or not set(previous["ambiguous_paths"]) <= (
+                    set(check_state["ambiguous_paths"]) | set(check_state["changed_paths"])
+                )
+                or (previous["unknown"] is not None and check_state["unknown"] is None)
+            ):
+                raise ValueError("self_check.state 不允许丢失本轮变化事实")
+            state["self_check_state"] = check_state
+            continue
         if event_type == "session.metadata_updated":
             if "title" in data:
                 _validate_title(data["title"])
@@ -414,6 +439,7 @@ def _replay_events(
             state["user_request_id"] = data["request_id"]
             state["source_event_seq"] = event["seq"]
             state["vision_state"] = None
+            state["self_check_state"] = None
         if event_type == "tool.result" and messages and _has_in_flight_marker(messages[-1]):
             if messages[-1].get("tool_call_id") != message.get("tool_call_id"):
                 raise ValueError("tool.result 与 in-flight 调用不匹配")
@@ -796,6 +822,7 @@ def load_session(
             vision_state=state.get("vision_state"),
             user_request_id=state.get("user_request_id"),
             source_event_seq=state.get("source_event_seq"),
+            self_check_state=state.get("self_check_state"),
         )
 
     if not isinstance(data, dict):
@@ -871,6 +898,7 @@ def _session_data_from_messages(
     vision_state: dict[str, object] | None = None,
     user_request_id: str | None = None,
     source_event_seq: int | None = None,
+    self_check_state: dict[str, object] | None = None,
 ) -> SessionData:
     if messages[0].get("role") != "system":
         raise ValueError("Session 第一条消息必须是 system message")
@@ -909,18 +937,20 @@ def _session_data_from_messages(
         vision_state=validate_vision_state(vision_state) if vision_state is not None else None,
         user_request_id=user_request_id,
         source_event_seq=source_event_seq,
+        self_check_state=(validate_self_check_state(self_check_state)
+                          if self_check_state is not None else None),
     )
 
 
 def append_session_event(path: Path, event_type: str, data: dict[str, object]) -> int:
     """Append one validated non-projection Session event."""
-    if event_type not in {"skill.activated", "session.recovered", "task.state", "vision.state"}:
+    if event_type not in {"skill.activated", "session.recovered", "task.state", "vision.state", "self_check.state"}:
         raise ValueError(f"不允许直接追加 Session 事件：{event_type}")
     target = Path(path)
     events = _read_event_log(target, repair_tail=True)
     addition = _event(len(events), event_type, copy.deepcopy(data))
     _validate_event(addition, len(events))
-    if event_type == "vision.state":
+    if event_type in {"vision.state", "self_check.state"}:
         _replay_events([*events, addition])
     content = _encode_events([addition])
     needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
@@ -1063,7 +1093,7 @@ def fork_session(source: Path, boundary_seq: int, destination: Path) -> Path:
                 data,
             )
         )
-    if state.get("vision_state") is not None:
+    if state.get("user_request_id") is not None:
         # Preserve source identity through compaction/repeated text; copied
         # budgets are history, never configuration or verification permission.
         child_events = [header]
@@ -1075,7 +1105,7 @@ def fork_session(source: Path, boundary_seq: int, destination: Path) -> Path:
             copied = copy.deepcopy(original)
             copied["seq"] = len(child_events)
             data = copied["data"]
-            if copied["type"] == "vision.state":
+            if copied["type"] in {"vision.state", "self_check.state"}:
                 data["source_event_seq"] = sequence_map[data["source_event_seq"]]
             elif copied["type"] == "context.compacted":
                 data["source_seq"] = [sequence_map.get(value, value) for value in data["source_seq"]]

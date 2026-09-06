@@ -181,6 +181,51 @@ def task_state_text(payload: dict[str, object]) -> str | None:
     }.get(status)
 
 
+def task_outcome_text(payload: dict[str, object]) -> str | None:
+    """Render only fixed outcome labels, never persisted paths or model text."""
+    status = payload.get("status")
+    check_status = payload.get("self_check_status")
+    if not isinstance(status, str) or not isinstance(check_status, str):
+        return None
+    if status not in {"completed", "incomplete", "failed", "interrupted"}:
+        return None
+    if payload.get("status") == "interrupted":
+        return "本轮已中断，已发生的改动未回滚。"
+    return {
+        "not_needed": "本轮无代码变化，无需自检。",
+        "passed": "所运行的自检已通过；具体覆盖范围见结果。",
+        "failed": "自检失败，当前改动尚未通过检查。",
+        "not_run": "自检尚未执行，已保留本轮结果。",
+        "source_changed": "检查后代码已变化，当前版本仍需复测。",
+        "unknown": "当前变更或检查状态未确认，不能报告通过。",
+        "pending": "本轮改动尚未完成自检。",
+    }.get(check_status)
+
+
+def environment_cleanup_text(resources: object) -> str | None:
+    """Expose only bounded host-generated Docker resource identities."""
+    if not isinstance(resources, (list, tuple)):
+        return None
+    names = list(dict.fromkeys(
+        name for name in resources[:16]
+        if isinstance(name, str) and re.fullmatch(r"gum-code-(?:prepare|env)-[0-9a-f]{32}", name)
+    ))
+    if not names:
+        return None
+    return "准备资源清理未确认，请手动检查 Docker：\n" + "\n".join(names)
+
+
+def _self_check_cleanup_notice(payload: dict[str, object]) -> str | None:
+    result = payload.get("result")
+    if payload.get("tool_name") != "self_check" or not isinstance(result, str) or len(result) > 150_000:
+        return None
+    try:
+        state, _ = json.JSONDecoder().raw_decode(result)
+    except ValueError:
+        return None
+    return environment_cleanup_text(state.get("cleanup_required")) if isinstance(state, dict) else None
+
+
 class RichEventRenderer:
     """Render bounded progress without exposing raw arguments or results."""
 
@@ -235,7 +280,15 @@ class RichEventRenderer:
             if text is not None:
                 self.console.print(Text(text))
             return
+        if event_type == "task_outcome":
+            text = task_outcome_text(payload)
+            if text is not None:
+                self.console.print(Text(text))
+            return
         if event_type == "tool_result":
+            cleanup = _self_check_cleanup_notice(payload)
+            if cleanup is not None:
+                self.console.print(Text(cleanup, style="yellow"))
             if payload.get("tool_name") in {"read_document", "analyze_image"}:
                 notice = _document_notice(payload)
                 if notice is not None:
@@ -299,6 +352,11 @@ def _truncate(text: str) -> str:
 
 def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
     """Render one event while sanitizing model-derived terminal text."""
+    if event_type == "task_outcome":
+        text = task_outcome_text(payload)
+        if text is not None:
+            print(text, flush=True)
+        return
     if event_type == "task_state":
         text = task_state_text(payload)
         if text is not None:
@@ -381,6 +439,9 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         return
 
     if event_type == "tool_result":
+        cleanup = _self_check_cleanup_notice(payload)
+        if cleanup is not None:
+            print(cleanup, flush=True)
         if payload.get("tool_name") in {"read_document", "analyze_image"}:
             notice = _document_notice(payload)
             if notice is not None:

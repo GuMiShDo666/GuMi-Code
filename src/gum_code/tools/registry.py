@@ -40,6 +40,7 @@ from gum_code.tools.documents import (
 
 if TYPE_CHECKING:
     from gum_code.vision import VisionRuntime
+    from gum_code.self_check import SelfCheckRuntime
 
 ApprovalCallback = Callable[
     [str, dict[str, object], str],
@@ -79,6 +80,7 @@ ALL_TOOL_RISKS: dict[str, ToolRisk] = {
     "edit_file": ToolRisk.WRITE,
     "delete_file": ToolRisk.DESTRUCTIVE,
     "run_command": ToolRisk.EXECUTE,
+    "self_check": ToolRisk.EXECUTE,
 }
 
 READ_ONLY_TOOL_NAMES = frozenset(
@@ -105,7 +107,7 @@ EXECUTION_TOOL_NAMES = frozenset(
     if risk is ToolRisk.EXECUTE
 )
 
-MODEL_VISIBLE_TOOL_NAMES = frozenset(ALL_TOOL_RISKS) - EXECUTION_TOOL_NAMES
+MODEL_VISIBLE_TOOL_NAMES = (frozenset(ALL_TOOL_RISKS) - EXECUTION_TOOL_NAMES) | {"self_check"}
 
 LIST_FILES_SCHEMA = {
     "type": "function",
@@ -489,6 +491,33 @@ RUN_COMMAND_SCHEMA = {
     },
 }
 
+SELF_CHECK_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "self_check",
+        "description": (
+            "Check actual code changes in the current request using relevant project "
+            "syntax, build and test commands. Reports real results for repair and retest; "
+            "does nothing when no code changed. The host selects commands and asks "
+            "the user before preparing a missing environment. No check registration needed."
+        ),
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+}
+
+
+def _validate_self_check(workspace: Path, *, runtime=None) -> None:
+    if runtime is None or not callable(getattr(runtime, "execute", None)):
+        raise ValueError("自检运行状态不可用")
+    if Path(runtime.workspace).resolve() != workspace.resolve():
+        raise ValueError("自检工作区不匹配")
+
+
+def _run_self_check(workspace: Path, *, runtime, command_runner, cancel_event=None) -> str:
+    _validate_self_check(workspace, runtime=runtime)
+    return runtime.execute(command_runner=command_runner, cancel_event=cancel_event)
+
+
 ALL_TOOL_SCHEMAS: dict[str, dict] = {
     "list_files": LIST_FILES_SCHEMA,
     "read_file": READ_FILE_SCHEMA,
@@ -503,6 +532,7 @@ ALL_TOOL_SCHEMAS: dict[str, dict] = {
     "edit_file": EDIT_FILE_SCHEMA,
     "delete_file": DELETE_FILE_SCHEMA,
     "run_command": RUN_COMMAND_SCHEMA,
+    "self_check": SELF_CHECK_SCHEMA,
 }
 
 ALL_TOOL_HANDLERS: dict[str, Callable[..., str]] = {
@@ -519,6 +549,7 @@ ALL_TOOL_HANDLERS: dict[str, Callable[..., str]] = {
     "edit_file": edit_file,
     "delete_file": delete_file,
     "run_command": run_command,
+    "self_check": _run_self_check,
 }
 
 PREFLIGHTS: dict[str, Callable[..., None]] = {
@@ -528,6 +559,7 @@ PREFLIGHTS: dict[str, Callable[..., None]] = {
     "edit_file": _validate_edit_file,
     "delete_file": _validate_delete_file,
     "run_command": _validate_run_command,
+    "self_check": _validate_self_check,
 }
 
 def get_tool_schemas(
@@ -579,6 +611,8 @@ def execute_tool(
     command_result_callback: CommandResultCallback | None = None,
     vision_runtime: "VisionRuntime | None" = None,
     cancel_event: Event | None = None,
+    self_check_runtime: "SelfCheckRuntime | None" = None,
+    file_change_callback: Callable | None = None,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
@@ -595,6 +629,14 @@ def execute_tool(
 
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
+
+    if tool_name == "self_check" and arguments:
+        return "Error: self_check requires an empty JSON object"
+
+    if tool_name in {"write_file", "edit_file", "delete_file"} and arguments.keys() - (
+        ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
+    ):
+        return "Error: Invalid tool arguments"
 
     if tool_name in {"read_document", "analyze_image"} and arguments.keys() - (
         ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
@@ -620,7 +662,9 @@ def execute_tool(
     preflight = PREFLIGHTS.get(tool_name)
     if preflight is not None:
         try:
-            if tool_name == "run_command":
+            if tool_name == "self_check":
+                preflight(workspace=workspace, runtime=self_check_runtime)
+            elif tool_name == "run_command":
                 preflight(
                     workspace=workspace,
                     **arguments,
@@ -656,12 +700,37 @@ def execute_tool(
     if before_execute_callback is not None:
         before_execute_callback()
 
+    if tool_name == "self_check":
+        def run_check(check_arguments, sandbox):
+            outcomes: list[CommandExecutionResult] = []
+            # Only host-discovered commands enter this closure; model JSON has no argv.
+            checked = copy.deepcopy(check_arguments)
+            output = execute_tool(
+                workspace, "run_command", json.dumps(checked),
+                approval_callback=lambda name, values, reason: name == "run_command" and values == checked,
+                pre_tool_use_callback=pre_tool_use_callback,
+                post_tool_use_callback=post_tool_use_callback,
+                command_sandbox=sandbox,
+                command_result_callback=outcomes.append,
+                cancel_event=cancel_event,
+            )
+            return output, outcomes[-1] if outcomes else None
+
+        # Hook/callback exceptions inside a real check must escape, not become success text.
+        result = handler(workspace=workspace, runtime=self_check_runtime,
+                         command_runner=run_check, cancel_event=cancel_event)
+        if post_tool_use_callback is not None:
+            post_tool_use_callback(tool_name, {}, result)
+        return result
+
     command_results: list[CommandExecutionResult] = []
     try:
         if tool_name == "run_command":
             command_kwargs: dict[str, object] = {}
             if command_result_callback is not None:
                 command_kwargs["result_callback"] = command_results.append
+            if cancel_event is not None:
+                command_kwargs["cancel_event"] = cancel_event
             result = handler(
                 workspace=workspace,
                 **arguments,
@@ -675,6 +744,8 @@ def execute_tool(
             if cancel_event is not None:
                 document_kwargs["cancel_event"] = cancel_event
             result = handler(workspace=workspace, **arguments, **document_kwargs)
+        elif tool_name in {"write_file", "edit_file", "delete_file"} and file_change_callback is not None:
+            result = handler(workspace=workspace, **arguments, file_change_callback=file_change_callback)
         else:
             result = handler(workspace=workspace, **arguments)
     except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:

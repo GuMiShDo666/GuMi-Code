@@ -68,6 +68,11 @@ def decide_permission(
         )
 
     if risk is ToolRisk.EXECUTE:
+        if tool_name == "self_check":
+            return PermissionResult(
+                decision=PermissionDecision.ALLOW,
+                reason="宿主选择的隔离自检可以直接执行；环境准备另行确认",
+            )
         return PermissionResult(
             decision=PermissionDecision.ASK,
             reason=f"命令执行前需要确认：{tool_name}",

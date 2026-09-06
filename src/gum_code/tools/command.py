@@ -1,6 +1,7 @@
 """Validate and run argv-only commands inside a fixed Docker sandbox."""
 
 import os
+import json
 import queue
 import re
 import secrets
@@ -42,12 +43,26 @@ _DOCKER_CONTROL_TIMEOUT_SECONDS = 5
 _DOCKER_CLEANUP_TIMEOUT_SECONDS = 5
 _READ_CHUNK_BYTES = 8192
 _DOCKER_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ENVIRONMENT_LABEL = "io.gum-code.project-environment"
+ENVIRONMENT_SCOPE_LABEL = "io.gum-code.project-scope"
+ENVIRONMENT_VOLUME_RE = re.compile(r"gum-code-env-[0-9a-f]{32}\Z")
+
+
+@dataclass(frozen=True)
+class DependencyMount:
+    """Host-owned dependency volume, never accepted from tool arguments."""
+
+    volume: str
+    scope: str
+    ecosystem: str
+    package_root: str = "."
 
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
     docker_path: Path
     image_id: str
+    dependency: DependencyMount | None = None
 
 
 @dataclass(frozen=True)
@@ -241,8 +256,45 @@ def _validate_run_command(
 
     _validate_argument_paths(workspace, cwd_path, argv)
 
-    _validate_sandbox_workspace(workspace)
     _validate_docker_sandbox(sandbox)
+    if sandbox is not None:
+        _validate_dependency_mount(sandbox, workspace)
+    _validate_sandbox_workspace(workspace, sandbox=sandbox)
+
+
+def _validate_dependency_mount(sandbox: DockerSandboxConfig, workspace: Path) -> None:
+    dependency = sandbox.dependency
+    if dependency is None:
+        return
+    if (
+        not isinstance(dependency, DependencyMount)
+        or not ENVIRONMENT_VOLUME_RE.fullmatch(dependency.volume)
+        or not re.fullmatch(r"[0-9a-f]{64}", dependency.scope)
+        or dependency.ecosystem not in {"python", "node"}
+    ):
+        raise ValueError("项目依赖环境无效")
+    package = _resolve_workspace_path(workspace, dependency.package_root)
+    if not package.is_dir():
+        raise ValueError("项目依赖环境目录无效")
+    if dependency.ecosystem == "node":
+        target = str(package.relative_to(workspace.resolve()) / "node_modules")
+        _reject_symlinks(workspace, target)
+        path = package / "node_modules"
+        if path.exists() and not path.is_dir():
+            raise ValueError("项目依赖挂载位置不是目录")
+    result = _run_docker_control(sandbox.docker_path, [
+        "volume", "inspect", "--format", "{{json .Labels}}", dependency.volume,
+    ])
+    try:
+        labels = json.loads(result.stdout) if len(result.stdout) <= 8192 else None
+    except (ValueError, UnicodeError):
+        labels = None
+    if (
+        result.returncode != 0 or not isinstance(labels, dict)
+        or labels.get(ENVIRONMENT_LABEL) != "v1"
+        or labels.get(ENVIRONMENT_SCOPE_LABEL) != dependency.scope
+    ):
+        raise ValueError("项目依赖卷不存在或归属不匹配")
 
 
 def _validate_image_reference(image: str) -> None:
@@ -339,7 +391,9 @@ def _validate_mount_component(value: str) -> None:
         raise ValueError("Workspace 路径包含 Docker mount 不支持的字符")
 
 
-def _find_sensitive_paths(workspace: Path) -> list[tuple[Path, bool]]:
+def _find_sensitive_paths(
+    workspace: Path, *, dependency_root: Path | None = None,
+) -> list[tuple[Path, bool]]:
     root = workspace.resolve()
     sensitive: list[tuple[Path, bool]] = []
 
@@ -355,6 +409,9 @@ def _find_sensitive_paths(workspace: Path) -> list[tuple[Path, bool]]:
         for name in directory_names:
             relative = relative_directory / name
             candidate = directory_path / name
+            if relative == dependency_root:
+                # The verified readonly managed volume covers this exact subtree.
+                continue
             if _is_sensitive_path(relative):
                 if candidate.is_symlink():
                     raise ValueError("敏感路径不允许是符号链接")
@@ -382,10 +439,19 @@ def _find_sensitive_paths(workspace: Path) -> list[tuple[Path, bool]]:
     return sensitive
 
 
-def _validate_sandbox_workspace(workspace: Path) -> None:
+def _managed_dependency_root(sandbox: DockerSandboxConfig | None) -> Path | None:
+    dependency = sandbox.dependency if sandbox is not None else None
+    if dependency is not None and dependency.ecosystem == "node":
+        return Path(dependency.package_root) / "node_modules"
+    return None
+
+
+def _validate_sandbox_workspace(
+    workspace: Path, *, sandbox: DockerSandboxConfig | None = None,
+) -> None:
     root = workspace.resolve()
     _validate_mount_component(str(root))
-    for relative, _ in _find_sensitive_paths(root):
+    for relative, _ in _find_sensitive_paths(root, dependency_root=_managed_dependency_root(sandbox)):
         _validate_mount_component(
             f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
         )
@@ -394,11 +460,13 @@ def _validate_sandbox_workspace(workspace: Path) -> None:
 def _prepare_sensitive_masks(
     workspace: Path,
     mask_root: Path,
+    *,
+    sandbox: DockerSandboxConfig | None = None,
 ) -> list[tuple[Path, str]]:
     masks: list[tuple[Path, str]] = []
 
     for index, (relative, is_directory) in enumerate(
-        _find_sensitive_paths(workspace)
+        _find_sensitive_paths(workspace, dependency_root=_managed_dependency_root(sandbox))
     ):
         destination = f"{_CONTAINER_WORKSPACE}/{relative.as_posix()}"
         _validate_mount_component(destination)
@@ -445,6 +513,7 @@ def _build_docker_argv(
 ) -> list[str]:
     root = workspace.resolve()
     _validate_mount_component(str(root))
+    _validate_dependency_mount(sandbox, workspace)
 
     command = [
         str(sandbox.docker_path),
@@ -486,6 +555,24 @@ def _build_docker_argv(
             ]
         )
 
+    program = argv[0]
+    if sandbox.dependency is not None:
+        dependency = sandbox.dependency
+        package = _container_workdir(workspace, dependency.package_root)
+        target = "/opt/gum-env" if dependency.ecosystem == "python" else f"{package}/node_modules"
+        command.extend(["--mount", f"type=volume,source={dependency.volume},target={target},readonly,volume-nocopy"])
+        if dependency.ecosystem == "python":
+            if program in {"python", "python3"}:
+                program = "/opt/gum-env/bin/python"
+            command.extend([
+                "--env", "VIRTUAL_ENV=/opt/gum-env",
+                "--env", "PATH=/opt/gum-env/bin:/usr/local/bin:/usr/bin:/bin",
+                "--env", f"PYTHONPATH={package}:{package}/src",
+                "--env", "PYTHONDONTWRITEBYTECODE=1",
+            ])
+        else:
+            command.extend(["--env", f"PATH={target}/.bin:/usr/local/bin:/usr/bin:/bin"])
+
     command.extend(
         [
             "--workdir",
@@ -499,7 +586,7 @@ def _build_docker_argv(
             "--env",
             "XDG_DATA_HOME=/tmp/.local/share",
             "--entrypoint",
-            argv[0],
+            program,
             sandbox.image_id,
             *argv[1:],
         ]
@@ -547,6 +634,8 @@ def _communicate_bounded(
     process: subprocess.Popen[bytes],
     timeout_seconds: int,
     captured: CommandCapture,
+    *,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     if process.stdout is None or process.stderr is None:
         raise OSError("Docker output pipes are unavailable")
@@ -573,6 +662,8 @@ def _communicate_bounded(
 
     try:
         while len(finished) < 2:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(process.args, timeout_seconds)
@@ -590,7 +681,18 @@ def _communicate_bounded(
                 raise chunk
             getattr(captured, name).add(chunk)
 
-        process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        if cancel_event is None:
+            process.wait(timeout=max(0.1, deadline - time.monotonic()))
+        else:
+            while process.poll() is None:
+                if cancel_event.is_set():
+                    raise KeyboardInterrupt
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(process.args, timeout_seconds)
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    continue
     except BaseException:
         # Stop the pipe writer before closing buffered readers (which may block).
         _stop_process(process)
@@ -671,6 +773,7 @@ def _run_command(
     timeout_seconds: int = 120,
     *,
     sandbox: DockerSandboxConfig | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> CommandExecutionResult:
     """Run validated argv in Docker and return bounded host execution evidence.
 
@@ -684,6 +787,8 @@ def _run_command(
         sandbox=sandbox,
     )
     assert sandbox is not None
+    if cancel_event is not None and cancel_event.is_set():
+        raise KeyboardInterrupt
 
     prepared_logs = prepare_command_logs(workspace)
     container_name = f"gum-code-{secrets.token_hex(8)}"
@@ -714,7 +819,7 @@ def _run_command(
         )
 
     with tempfile.TemporaryDirectory(prefix="gum-code-masks-") as tmpdir:
-        masks = _prepare_sensitive_masks(workspace, Path(tmpdir))
+        masks = _prepare_sensitive_masks(workspace, Path(tmpdir), **({"sandbox": sandbox} if sandbox.dependency is not None else {}))
         docker_argv = _build_docker_argv(
             sandbox,
             workspace,
@@ -742,6 +847,7 @@ def _run_command(
                 process,
                 timeout_seconds,
                 captured,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
             )
         except subprocess.TimeoutExpired:
             cleaned = _abort_container(process, sandbox, container_name)
@@ -797,6 +903,7 @@ def run_command(
     *,
     sandbox: DockerSandboxConfig | None = None,
     result_callback: CommandResultCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Keep model text separate from optional host-owned execution evidence.
 
@@ -805,7 +912,8 @@ def run_command(
     """
     try:
         result = _run_command(
-            workspace, argv, cwd, timeout_seconds, sandbox=sandbox
+            workspace, argv, cwd, timeout_seconds, sandbox=sandbox,
+            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
         )
     except KeyboardInterrupt as exc:
         if result_callback is not None:

@@ -193,9 +193,10 @@ def _file_hash(root: Path, name: str, charge: Callable[[int], None]) -> tuple[st
     info = target.lstat()
     if not stat.S_ISREG(info.st_mode):
         raise _ScanError("scan_path")
-    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
     with os.fdopen(descriptor, "rb") as source:
-        if _signature(os.fstat(source.fileno())) != _signature(info):
+        opened = os.fstat(source.fileno())
+        if not stat.S_ISREG(opened.st_mode) or _signature(opened) != _signature(info):
             raise _ScanError("scan_changed")
         digest = hashlib.sha256()
         while chunk := source.read(65536):
@@ -224,13 +225,14 @@ def _validate_excluded_dirs(root: Path, paths: tuple[str, ...]) -> None:
             raise _ScanError("scan_path") from None
 
 
-def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
-                          internal_paths: tuple[Path, ...] = ()) -> str:
+def _workspace_scan(workspace: Path, output_dirs: tuple[str, ...] = (),
+                    internal_paths: tuple[Path, ...] = ()) -> tuple[str, dict[str, tuple[str, int]]]:
     """Hash bounded ordinary inputs, failing closed on races, links, or limits."""
     root = workspace.resolve()
     started = time.monotonic()
     count = total = 0
     digest = hashlib.sha256()
+    snapshot: dict[str, tuple[str, int]] = {}
 
     def check_limits() -> None:
         if count > MAX_SCAN_FILES or total > MAX_SCAN_BYTES or time.monotonic() - started > MAX_SCAN_SECONDS:
@@ -270,9 +272,11 @@ def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
                 raise _ScanError("scan_path")
             digest.update(json.dumps([relative.as_posix(), stat.S_IFMT(info.st_mode), info.st_mode & 0o111]).encode())
             if stat.S_ISDIR(info.st_mode):
+                snapshot[relative.as_posix()] = ("__directory__", info.st_mode & 0o111)
                 visit(target)
             elif stat.S_ISREG(info.st_mode):
                 file_hash, _ = _file_hash(root, relative.as_posix(), charge)
+                snapshot[relative.as_posix()] = (file_hash, info.st_mode & 0o111)
                 digest.update(file_hash.encode())
             else:
                 raise _ScanError("scan_path")
@@ -289,7 +293,19 @@ def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
         raise
     except (ValueError, RuntimeError):
         raise _ScanError("scan_path") from None
-    return digest.hexdigest()
+    return digest.hexdigest(), snapshot
+
+
+def workspace_fingerprint(workspace: Path, output_dirs: tuple[str, ...] = (),
+                          internal_paths: tuple[Path, ...] = ()) -> str:
+    """Retain the historical fingerprint while sharing the safe scan boundary."""
+    return _workspace_scan(workspace, output_dirs, internal_paths)[0]
+
+
+def workspace_snapshot(workspace: Path, output_dirs: tuple[str, ...] = (),
+                       internal_paths: tuple[Path, ...] = ()) -> dict[str, tuple[str, int]]:
+    """Return bounded content identities for observing actual command changes."""
+    return _workspace_scan(workspace, output_dirs, internal_paths)[1]
 
 
 class VerificationRuntime:
