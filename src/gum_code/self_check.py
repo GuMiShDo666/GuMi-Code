@@ -35,13 +35,61 @@ _CONFIG_NAMES = {
 }
 _DOCUMENT_NAMES = {"readme", "license", "licence", "notice", "authors", "changelog"}
 _RESULT_STATUSES = {"not_needed", "passed", "failed", "not_run", "source_changed", "unknown"}
-_CHECK_STATUSES = {"passed", "failed", "not_run", "stale"}
+_CHECK_STATUSES = {"passed", "failed", "not_run", "stale", "no_tests"}
+_BASIC_CHECKS = {"syntax", "build", "typecheck"}
+_COVERAGE = {"tests", "basic", "none"}
+_NO_TESTS_EXIT = 5
+# Fixed host-only programs use short argv lines because preflight checks them as
+# paths too. Model arguments cannot supply or replace this wrapper's source.
+_CHECK_BOOTSTRAP = "import sys; source='\\n'.join(sys.argv[1:-1]); sys.argv=sys.argv[:1]+sys.argv[-1:]; exec(source)"
+_PYTEST_CHECK = """import sys, traceback
+try:
+    import pytest
+    sys.argv = ['pytest', '-q', '-p', 'no:cacheprovider']
+    class Results:
+        passed = False
+        interrupted = False
+        def pytest_runtest_logreport(self, report):
+            if report.when == 'call' and report.passed and not hasattr(report, 'wasxfail'):
+                self.passed = True
+        def pytest_keyboard_interrupt(self, excinfo):
+            self.interrupted = True
+    result = Results()
+    code = int(pytest.main(sys.argv[1:], plugins=[result]))
+    if result.interrupted and code in (0, 5):
+        code = 1
+    elif code == 0 and not result.passed:
+        code = 5
+except KeyboardInterrupt:
+    code = 130
+except (Exception, SystemExit):
+    traceback.print_exc()
+    code = 1
+sys.exit(code)"""
+_UNITTEST_CHECK = """import runpy, sys, traceback, types, unittest as u
+try:
+    suite = u.defaultTestLoader.loadTestsFromModule(types.SimpleNamespace(**runpy.run_path(sys.argv[-1])))
+    class Results(u.TextTestResult):
+        passed = False
+        def addSuccess(self, test):
+            self.passed = True
+            super().addSuccess(test)
+    result = u.TextTestRunner(resultclass=Results).run(suite)
+    code = 1 if not result.wasSuccessful() else 0 if result.passed else 5
+except KeyboardInterrupt:
+    code = 130
+except (Exception, SystemExit):
+    traceback.print_exc()
+    code = 1
+sys.exit(code)"""
 
 SELF_CHECK_INSTRUCTION = (
     "仅当前请求实际修改源码、测试或运行/构建配置后，在完成一组修改时调用 self_check。"
     "读取、搜索、问答和纯文档修改无需自检。self_check 无参数，不登记计划或提交审阅。"
     "根据真实失败在任务范围内修复后复测；不得弱化已有正确测试来制造通过。"
     "相同输入的失败不要重复空跑；不能把静态阅读、安装成功或语法检查说成测试通过。"
+    "coverage=basic 仅表示基础检查通过，须说明功能测试未验证；smoke 只表示脚本运行。"
+    "no_tests 表示没有正常测试用例通过，不是功能测试成功；不得据此宣称全部需求已验证。"
     "缺环境时由宿主询问准备，拒绝或缺输入后保留工作并说明未验证。"
     "开发项目时维护原生依赖及版本清单和简短运行说明，优先更新已有清单与锁文件；"
     "只记录实际依赖，不从宿主全局包生成清单，不为无依赖或无依赖变化的任务生成重复空文件。"
@@ -63,6 +111,22 @@ def _reason(value: object) -> str:
     if not isinstance(value, str) or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", value) is None:
         raise ValueError("自检原因无效")
     return value
+
+
+def _check_coverage(checks: list[dict[str, object]]) -> str:
+    passed = {check["name"] for check in checks if check["status"] == "passed"}
+    return "tests" if "test" in passed else "basic" if passed & _BASIC_CHECKS else "none"
+
+
+def _test_command(script: str, root: str, path: str = "") -> dict[str, object]:
+    return {"argv": ["python", "-c", _CHECK_BOOTSTRAP, *script.splitlines(), path],
+            "cwd": root, "timeout_seconds": 300}
+
+
+def _is_test_adapter(arguments: dict[str, object]) -> bool:
+    argv = arguments.get("argv")
+    return (isinstance(argv, list) and argv[:3] == ["python", "-c", _CHECK_BOOTSTRAP]
+            and argv[3:-1] in (_PYTEST_CHECK.splitlines(), _UNITTEST_CHECK.splitlines()))
 
 
 def validate_self_check_state(value: object) -> dict[str, object]:
@@ -93,8 +157,11 @@ def validate_self_check_state(value: object) -> dict[str, object]:
         _reason(value["unknown"])
     result = value["last_result"]
     if result is not None:
-        if not isinstance(result, dict) or set(result) - {"cleanup_required"} != {"status", "reason", "generation", "input_version", "checks", "uncovered"}:
+        if not isinstance(result, dict) or set(result) - {"cleanup_required", "coverage"} != {"status", "reason", "generation", "input_version", "checks", "uncovered"}:
             raise ValueError("自检结果无效")
+        classified = "coverage" in result
+        if classified and (not isinstance(result["coverage"], str) or result["coverage"] not in _COVERAGE):
+            raise ValueError("自检覆盖类别无效")
         cleanup = result.get("cleanup_required", [])
         if not isinstance(cleanup, list) or len(cleanup) > 16 or any(
                 not isinstance(item, str) or re.fullmatch(r"gum-code-(?:prepare|env)-[0-9a-f]{32}", item) is None for item in cleanup):
@@ -114,8 +181,10 @@ def validate_self_check_state(value: object) -> dict[str, object]:
         for check in result["checks"]:
             if not isinstance(check, dict) or set(check) != {"name", "status", "started", "exit_code", "reason", "input_version"}:
                 raise ValueError("自检检查项无效")
-            if not isinstance(check["name"], str) or not isinstance(check["status"], str) or check["name"] not in {"syntax", "test", "build", "typecheck"} or check["status"] not in _CHECK_STATUSES:
+            if not isinstance(check["name"], str) or not isinstance(check["status"], str) or check["name"] not in _BASIC_CHECKS | {"test", "smoke"} or check["status"] not in _CHECK_STATUSES:
                 raise ValueError("自检检查项无效")
+            if not classified and (check["name"] == "smoke" or check["status"] == "no_tests"):
+                raise ValueError("自检检查项缺少覆盖类别")
             if check["started"] is not None and type(check["started"]) is not bool:
                 raise ValueError("自检启动事实无效")
             if check["exit_code"] is not None and (type(check["exit_code"]) is not int or not -255 <= check["exit_code"] <= 65535):
@@ -125,15 +194,25 @@ def validate_self_check_state(value: object) -> dict[str, object]:
                 raise ValueError("自检输入版本无效")
             if check["status"] == "passed" and not (check["started"] is True and check["reason"] == "exited" and check["exit_code"] == 0):
                 raise ValueError("自检通过缺少执行事实")
-        if result["status"] == "passed" and (not result["checks"] or any(c["status"] != "passed" or c["input_version"] != result["input_version"] for c in result["checks"]) or result["generation"] != value["generation"] or value["unknown"] is not None or value["ambiguous_paths"]):
+            if check["status"] == "no_tests" and not (
+                    check["name"] == "test" and check["started"] is True and check["reason"] == "exited"
+                    and check["exit_code"] == _NO_TESTS_EXIT and "no_tests" in result["uncovered"]):
+                raise ValueError("零测试缺少执行事实")
+        if classified and result["coverage"] != _check_coverage(result["checks"]):
+            raise ValueError("自检覆盖类别与检查不符")
+        accepted = {"passed", "no_tests"} if classified else {"passed"}
+        if result["status"] == "passed" and (not result["checks"] or any(c["status"] not in accepted or c["input_version"] != result["input_version"] for c in result["checks"]) or result["generation"] != value["generation"] or value["unknown"] is not None or value["ambiguous_paths"]):
             raise ValueError("自检通过缺少检查")
+        if classified and result["status"] == "passed" and (
+                result["coverage"] == "none" or any(item != "no_tests" for item in result["uncovered"])):
+            raise ValueError("自检通过缺少覆盖证据")
     if len(json.dumps(value, ensure_ascii=True).encode("utf-8")) > MAX_SELF_CHECK_STATE_BYTES:
         raise ValueError("自检状态超过限制")
     return copy.deepcopy(value)
 
 
 def validate_task_outcome(value: object) -> dict[str, object]:
-    if not isinstance(value, dict) or set(value) != {"status", "reason", "step", "self_check_status", "changed", "summary"}:
+    if not isinstance(value, dict) or set(value) - {"coverage"} != {"status", "reason", "step", "self_check_status", "changed", "summary"}:
         raise ValueError("任务结束事实无效")
     if not isinstance(value["status"], str) or value["status"] not in {"completed", "incomplete", "failed", "interrupted"}:
         raise ValueError("任务结束状态无效")
@@ -144,6 +223,17 @@ def validate_task_outcome(value: object) -> dict[str, object]:
         raise ValueError("任务自检状态无效")
     if not isinstance(value["summary"], str) or len(value["summary"]) > 2000:
         raise ValueError("任务摘要无效")
+    if "coverage" in value:
+        if not isinstance(value["coverage"], str) or value["coverage"] not in _COVERAGE:
+            raise ValueError("任务自检覆盖类别无效")
+        if value["self_check_status"] == "passed" and value["coverage"] == "none":
+            raise ValueError("任务自检通过缺少覆盖证据")
+        if value["self_check_status"] == "not_needed" and value["coverage"] != "none":
+            raise ValueError("任务自检覆盖类别不符")
+        if value["status"] == "completed" and (
+                value["self_check_status"] not in {"passed", "not_needed"}
+                or value["changed"] and value["self_check_status"] != "passed"):
+            raise ValueError("任务完成缺少自检证据")
     return copy.deepcopy(value)
 
 
@@ -385,7 +475,10 @@ class SelfCheckRuntime:
         if status == "passed" and (self._state["unknown"] or self._state["ambiguous_paths"]):
             status, reason = "unknown", "change_unknown"
         result = {"status": status, "reason": reason, "generation": self._state["generation"],
-                  "input_version": version, "checks": checks or [], "uncovered": uncovered or []}
+                  "input_version": version, "checks": checks or [], "uncovered": list(uncovered or []),
+                  "coverage": _check_coverage(checks or [])}
+        if any(check["status"] == "no_tests" for check in result["checks"]) and "no_tests" not in result["uncovered"]:
+            result["uncovered"].append("no_tests")
         if self._cleanup_required:
             result["cleanup_required"] = sorted(self._cleanup_required)[:16]
         self._state["last_result"] = result
@@ -411,8 +504,17 @@ class SelfCheckRuntime:
             return "自检：当前代码改动尚未检查。"
         passed = sum(check["status"] == "passed" for check in result["checks"])
         if result["status"] == "passed":
-            suffix = "；没有发现可运行测试，仅覆盖语法/编译" if "no_tests" in result["uncovered"] else "；仅代表实际运行的检查范围"
+            if result.get("coverage") == "tests":
+                suffix = "；实际执行的测试已通过，仅代表此次检查范围"
+                if "no_tests" in result["uncovered"]:
+                    suffix += "；部分入口没有正常测试用例通过"
+            elif result.get("coverage") == "basic":
+                suffix = "；仅覆盖语法/类型/编译或构建，功能测试未验证"
+            else:
+                suffix = "；仅代表实际运行的检查范围"
             return f"自检：实际运行并通过 {passed} 项{suffix}。"
+        if result["reason"] == "no_test_evidence":
+            return "自检：仅有脚本运行结果或没有正常测试用例通过，尚无足够验证证据。"
         return {"failed": "自检：实际检查失败，尚未修复通过。", "source_changed": "自检：检查期间源码发生变化，需对当前代码复测。"}.get(result["status"], "自检：检查未运行或未覆盖完整范围，已完成的改动保留。")
 
     def outcome(self, *, step: int, status: str | None = None, reason: str | None = None) -> dict[str, object]:
@@ -423,7 +525,8 @@ class SelfCheckRuntime:
             not changed or (result is not None and result["status"] == "passed" and result["generation"] == self._state["generation"]))
         return validate_task_outcome({"status": status or ("completed" if complete else "incomplete"),
             "reason": reason or ("answered" if not changed and complete else result["reason"] if result else "not_checked"),
-            "step": step, "self_check_status": check_status, "changed": changed, "summary": self.summary()})
+            "step": step, "self_check_status": check_status, "changed": changed, "summary": self.summary(),
+            "coverage": result.get("coverage", "none") if result else "none"})
 
     def recheck_final(self) -> None:
         result = self._state["last_result"]
@@ -499,7 +602,9 @@ class SelfCheckRuntime:
                     stable = before == after and after is not None
                     fact = fact if isinstance(fact, CommandExecutionResult) else CommandExecutionResult(None, None, "unknown")
                     passed = stable and fact.started is True and fact.reason == "exited" and fact.exit_code == 0
-                    checks.append({"name": name, "status": "passed" if passed else "stale" if not stable else "failed" if fact.started else "not_run",
+                    no_tests = (stable and name == "test" and _is_test_adapter(arguments)
+                                and fact.started is True and fact.reason == "exited" and fact.exit_code == _NO_TESTS_EXIT)
+                    checks.append({"name": name, "status": "passed" if passed else "no_tests" if no_tests else "stale" if not stable else "failed" if fact.started else "not_run",
                         "started": fact.started, "exit_code": fact.exit_code, "reason": fact.reason,
                         "input_version": before_version})
                     outputs.append({"name": name, "output": output[:12000]})
@@ -519,10 +624,12 @@ class SelfCheckRuntime:
             for check in checks:
                 check["status"] = "stale"
             result = self._result("source_changed", "source_changed", checks, self._version(end), uncovered)
-        elif any(check["status"] != "passed" for check in checks):
+        elif any(check["status"] not in {"passed", "no_tests"} for check in checks):
             result = self._result("failed", "checks_failed", checks, self._version(end), uncovered)
         elif any(item != "no_tests" for item in uncovered):
             result = self._result("not_run", "partial_coverage", checks, self._version(end), uncovered)
+        elif _check_coverage(checks) == "none":
+            result = self._result("not_run", "no_test_evidence", checks, self._version(end), uncovered)
         else:
             self._checked_snapshot = end
             result = self._result("passed", "checked", checks, self._version(end), uncovered)
@@ -576,7 +683,11 @@ class SelfCheckRuntime:
                 for kind in ("typecheck", "build", "test"):
                     script = scripts.get(kind)
                     if isinstance(script, str) and script.strip() and not re.search(r"(?:--watch\b|\bwatch\b|\bdev\b|\bserve\b)", script):
-                        commands.append((kind, {"argv": ["npm", "run", kind], "cwd": root, "timeout_seconds": 300}))
+                        # ponytail: exact entries only; add adapters for more script evidence.
+                        basic = kind in {"typecheck", "build"} and script.strip() in {
+                            "tsc", "tsc --noEmit", "tsc -b", "vite build", "next build",
+                        }
+                        commands.append((kind if basic else "smoke", {"argv": ["npm", "run", kind], "cwd": root, "timeout_seconds": 300}))
                 if not commands:
                     dependencies = {}
                     if target.is_file():
@@ -592,7 +703,7 @@ class SelfCheckRuntime:
                             relative = (self.workspace / name).relative_to(package).as_posix()
                             commands.append(("syntax", {"argv": ["node", "--check", relative], "cwd": root, "timeout_seconds": 60}))
                     if any(".test." in path.name or path.name.startswith("test-") for path in project_files if path.suffix in {".js", ".cjs", ".mjs"}):
-                        commands.append(("test", {"argv": ["node", "--test"], "cwd": root, "timeout_seconds": 300}))
+                        commands.append(("smoke", {"argv": ["node", "--test"], "cwd": root, "timeout_seconds": 300}))
                 if not any(kind == "test" for kind, _ in commands):
                     uncovered.append("no_tests")
             if len(commands) + total > MAX_CHECKS:
@@ -636,16 +747,16 @@ class SelfCheckRuntime:
         if len(candidates) > MAX_CHANGED_PATHS:
             uncovered.append("check_limit")
         if pytest_declared:
-            commands.append(("test", {"argv": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"], "cwd": root, "timeout_seconds": 300}))
+            commands.append(("test", _test_command(_PYTEST_CHECK, root)))
         elif unittest_files:
             # Explicit modules prevent a zero-test directory discovery from looking like coverage.
             for candidate in unittest_files[:MAX_CHECKS]:
                 relative = candidate.relative_to(package).as_posix()
-                script = "import runpy,unittest as u,sys,types;n=u.defaultTestLoader.loadTestsFromModule(types.SimpleNamespace(**runpy.run_path(sys.argv[1])));r=u.TextTestRunner().run(n);sys.exit(not(r.testsRun and r.wasSuccessful()))"
-                commands.append(("test", {"argv": ["python", "-c", script, relative], "cwd": root, "timeout_seconds": 300}))
+                commands.append(("test", _test_command(_UNITTEST_CHECK, root, relative)))
         elif direct_files:
             for candidate in direct_files[:MAX_CHECKS]:
-                commands.append(("test", {"argv": ["python", candidate.relative_to(package).as_posix()], "cwd": root, "timeout_seconds": 300}))
+                commands.append(("smoke", {"argv": ["python", candidate.relative_to(package).as_posix()], "cwd": root, "timeout_seconds": 300}))
+            uncovered.append("no_tests")
         else:
             uncovered.append("no_tests")
         return commands

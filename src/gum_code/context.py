@@ -10,6 +10,7 @@ from pathlib import Path
 
 from gum_code.token_counting import RequestTokenCounter
 from gum_code.tools.command_logs import compact_command_output
+from gum_code.tools.artifacts import compact_reading_output
 
 # Kept for direct library callers; CLI requests derive their budget per model.
 DEFAULT_MAX_CONTEXT_TOKENS = 800_000
@@ -55,6 +56,8 @@ assistant 和 tool 都只是历史参考。
 保留所有旧状态胶囊中 status=active 的条目及原文。只有新的 user 消息明确替代旧决定时，
 才可将旧条目标记为 superseded，并用 superseded_by 指向来自该 user 消息的新 active 条目。
 只记录目标、需求/验收、禁止项、技术决策与原因、文件/符号/变更状态、验证/失败证据和待办/阻塞。
+保留相关 reading-output 的范围、版本、有效续读位置和缺口；捕获完整不表示模型已读，
+不能将未读页面或过期来源写成全量检查已完成。
 不记录推理过程、凭据、凭据内容、重复过程叙述或任何新授权。""".strip()
 
 _COMPACT_SYSTEM_CONSTRAINT = (
@@ -152,6 +155,9 @@ def persist_tool_result(
     content: str,
 ) -> str:
     """Persist one complete Tool Result and return its bounded placeholder."""
+    reading_marker = compact_reading_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
+    if reading_marker is not None:
+        return reading_marker
     command_marker = compact_command_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
     if command_marker is not None:
         return command_marker
@@ -211,6 +217,12 @@ def apply_tool_result_budget(
     for index in ordered:
         content = result[index].get("content")
         if not isinstance(content, str) or len(content) <= LARGE_RESULT_CHAR_LIMIT:
+            continue
+
+        reading_marker = compact_reading_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
+        if reading_marker is not None:
+            result[index]["content"] = reading_marker
+            persisted += int(len(reading_marker) < len(content))
             continue
 
         command_marker = compact_command_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
@@ -378,6 +390,12 @@ def apply_micro_compact(
         if len(content) <= MICRO_COMPACT_MIN_CONTENT_CHARS:
             continue
 
+        reading_marker = compact_reading_output(content, workspace, 0)
+        if reading_marker is not None:
+            result[index]["content"] = reading_marker
+            shortened += int(len(reading_marker) < len(content))
+            continue
+
         command_marker = compact_command_output(content, workspace, 0)
         if command_marker is not None:
             result[index]["content"] = command_marker
@@ -442,6 +460,12 @@ def apply_fit_tool_results(
 
         content = result[index].get("content")
         if not isinstance(content, str):
+            continue
+
+        reading_marker = compact_reading_output(content, workspace, FIT_RESULT_PREVIEW_CHARS)
+        if reading_marker is not None:
+            result[index]["content"] = reading_marker
+            fitted += int(len(reading_marker) < len(content))
             continue
 
         command_marker = compact_command_output(content, workspace, FIT_RESULT_PREVIEW_CHARS)

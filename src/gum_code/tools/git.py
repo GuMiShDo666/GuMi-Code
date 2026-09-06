@@ -5,10 +5,12 @@ import tempfile
 from pathlib import Path
 
 from gum_code.tools.common import (
-    MAX_OUTPUT_CHARS,
+    ReadingCapture,
     _is_sensitive_path,
-    _truncate_output,
+    _resolve_workspace_path,
 )
+from gum_code.tools.artifacts import reading_result
+from gum_code.tools.command import _communicate_bounded
 
 _GIT_TIMEOUT = 10
 _GIT_CONFIG_OVERRIDES = (
@@ -32,7 +34,7 @@ def _isolated_git_env(home: str) -> dict[str, str]:
     }
 
 
-def _run_git(workspace: Path, args: list[str]) -> str:
+def _run_git(workspace: Path, args: list[str]) -> str | None:
     git_path = shutil.which("git")
     if git_path is None:
         return "Error: 未找到 git，请先安装"
@@ -56,14 +58,15 @@ def _run_git(workspace: Path, args: list[str]) -> str:
             prefix="gum-code-git-",
             dir=temp_parent,
         ) as isolated_home:
-            result = subprocess.run(
+            captured = ReadingCapture()
+            result = subprocess.Popen(
                 command,
                 cwd=str(workspace_root),
-                capture_output=True,
-                text=True,
-                timeout=_GIT_TIMEOUT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=_isolated_git_env(isolated_home),
             )
+            _communicate_bounded(result, _GIT_TIMEOUT, captured)
     except FileNotFoundError:
         return "Error: 未找到 git，请先安装"
     except subprocess.TimeoutExpired:
@@ -74,7 +77,10 @@ def _run_git(workspace: Path, args: list[str]) -> str:
     if result.returncode != 0:
         return "Error: 不是 Git 仓库或 git 命令失败"
 
-    return result.stdout
+    try:
+        return captured.text()
+    except UnicodeDecodeError:
+        return "Error: git 输出不是有效 UTF-8"
 
 
 def _path_has_sensitive_part(path_text: str) -> bool:
@@ -111,24 +117,36 @@ def _filter_sensitive_diff(output: str) -> str:
     return "\n".join(result)
 
 
-def git_status(workspace: Path) -> str:
-    output = _run_git(workspace, ["status", "--short", "--branch"])
+def git_status(workspace: Path, path: str = ".", *, artifact_workspace: Path | None = None) -> str:
+    relative = _resolve_workspace_path(workspace, path).relative_to(workspace.resolve()).as_posix()
+    output = _run_git(workspace, ["--literal-pathspecs", "status", "--short", "--branch", "--", relative])
+    destination = artifact_workspace or workspace
+    if output is None:
+        return reading_result(destination, "git_status", {"path": relative}, "", gap_reason="capture_limit")
 
     if output.startswith("Error:"):
         return output
 
     output = _filter_sensitive_status(output)
 
-    return _truncate_output(output, MAX_OUTPUT_CHARS)
+    return reading_result(destination, "git_status", {"path": relative}, output)
 
 
-def git_diff(workspace: Path, staged: bool = False) -> str:
+def git_diff(workspace: Path, staged: bool = False, path: str = ".",
+             *, artifact_workspace: Path | None = None) -> str:
+    if type(staged) is not bool:
+        raise ValueError("staged 必须是布尔值")
+    relative = _resolve_workspace_path(workspace, path).relative_to(workspace.resolve()).as_posix()
     args = ["diff", "--no-ext-diff", "--no-textconv"]
 
     if staged:
         args = ["diff", "--cached", "--no-ext-diff", "--no-textconv"]
 
-    output = _run_git(workspace, args)
+    output = _run_git(workspace, ["--literal-pathspecs", *args, "--", relative])
+    arguments = {"staged": staged, "path": relative}
+    destination = artifact_workspace or workspace
+    if output is None:
+        return reading_result(destination, "git_diff", arguments, "", gap_reason="capture_limit")
 
     if output.startswith("Error:"):
         return output
@@ -136,6 +154,6 @@ def git_diff(workspace: Path, staged: bool = False) -> str:
     output = _filter_sensitive_diff(output)
 
     if not output.strip():
-        return "(no changes)"
+        output = "(no changes)"
 
-    return _truncate_output(output, MAX_OUTPUT_CHARS)
+    return reading_result(destination, "git_diff", arguments, output)

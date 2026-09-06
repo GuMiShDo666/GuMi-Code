@@ -22,6 +22,7 @@ from gum_code.model_protocol import (
 from gum_code.session import TASK_INTERRUPTED_RESULT
 from gum_code.token_counting import RequestTokenCounter, TokenBudgetTracker
 from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
+from gum_code.tools.artifacts import READING_SYSTEM_INSTRUCTION
 from gum_code.tools.registry import (
     PostToolUseCallback,
     PreToolUseCallback,
@@ -155,7 +156,10 @@ SUBAGENT_SYSTEM_PROMPT = (
     "code, paths, and identifiers exactly. "
     "For PDF/DOCX/image evidence, omit text line ranges and state the source "
     "version and page/block/image reference in the claim. Visual tools share "
-    "the parent's consent and call limit; report unread content honestly."
+    "the parent's consent and call limit; report unread content honestly. "
+    "Retained reading paths in your temporary workspace expire when you finish; "
+    "report actual findings and unread gaps, not temporary paths as durable parent evidence. "
+    + READING_SYSTEM_INSTRUCTION
 )
 
 _REPORT_KEYS = frozenset({"summary", "findings", "evidence", "risks"})
@@ -756,6 +760,7 @@ def run_read_only_subagent(
                             )
                         result = execute_tool(
                             workspace=tool_workspace,
+                            artifact_workspace=artifact_root,
                             tool_name=tool_name,
                             arguments_json=call.function.arguments,
                             pre_tool_use_callback=pre_tool_use_callback,
