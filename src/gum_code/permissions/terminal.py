@@ -1,6 +1,5 @@
 import json
 import re
-import unicodedata
 from collections.abc import Callable
 from pathlib import Path
 
@@ -8,8 +7,6 @@ from prompt_toolkit.shortcuts import choice
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-
-from gum_code.verification import MAX_VERIFICATION_APPROVAL_CHARS
 
 MAX_ARGUMENTS_PREVIEW = 1000
 
@@ -102,44 +99,11 @@ def make_interactive_approval(
     return approve
 
 
-def _verification_preview(details: dict[str, object]) -> str:
-    if not isinstance(details, dict) or set(details) != {
-        "task_id", "goal", "workspace", "image_id", "checks"
-    }:
-        raise ValueError("验证批准信息无效")
-    preview = json.dumps(details, ensure_ascii=False, indent=2, allow_nan=False)
-    # JSON escapes embedded newlines; preserve only its own formatting newlines.
-    preview = "".join(
-        f"\\u{ord(character):04x}"
-        if character != "\n" and unicodedata.category(character) in {
-            "Cc", "Cf", "Zl", "Zp"
-        }
-        else character
-        for character in preview
-    )
-    if len(preview) > MAX_VERIFICATION_APPROVAL_CHARS:
-        raise ValueError("验证批准信息过长，不能截断后批准")
-    return preview
-
-
-_VERIFICATION_APPROVAL_SCOPE = (
-    "仅批准当前进程、工作区和阶段的扫描范围及可重复验证命令；未知命令仍须逐次批准。\n"
-    "dependency_dirs 为安装依赖，output_dirs 为生成产物；具体排除目录不逐文件核验，锁文件不证明其内容未变。\n"
-    "修改命令、定义/入口、执行配置或排除范围后须重新批准；恢复会话不继承许可。\n"
-    "命令在断网 Docker Sandbox 中执行，仍可修改工作区；通过不代表生产验收完成。"
-)
 
 
 def request_verification_approval(details: dict[str, object]) -> bool:
-    """Approve explicit scan scope and eligible repeats, never truncate consent."""
-    try:
-        preview = _verification_preview(details)
-        print(_VERIFICATION_APPROVAL_SCOPE, flush=True)
-        print(preview, flush=True)
-        answer = input("是否批准本阶段扫描范围及可重复验证？(y/N): ")
-        return answer.strip().lower() in {"y", "yes"}
-    except (Exception, KeyboardInterrupt, EOFError):
-        return False
+    """Deprecated compatibility entry; old verification scopes grant nothing."""
+    return False
 
 
 def make_verification_approval(
@@ -148,25 +112,45 @@ def make_verification_approval(
     *,
     chooser: Callable[..., object] = choice,
 ) -> Callable[[dict[str, object]], bool]:
-    """Render a validated, credential-free bundle only in the approval view."""
-    resolved_workspace = str(Path(workspace).resolve())
+    """Deprecated compatibility factory; no menu or historical permission."""
+    return request_verification_approval
 
-    def approve(details: dict[str, object]) -> bool:
-        try:
-            if details.get("workspace") != resolved_workspace:
-                return False
-            preview = _verification_preview(details)
-            body = Text(_VERIFICATION_APPROVAL_SCOPE + "\n\n" + preview)
-            console.print(
-                Panel(body, title="Verification Permission", border_style="yellow")
-            )
-            decision = chooser(
-                "是否批准本阶段扫描范围及可重复验证？",
-                options=[(False, "拒绝"), (True, "批准本阶段范围及可重复验证")],
-                default=False,
-            )
-            return decision is True
-        except (Exception, KeyboardInterrupt, EOFError):
-            return False
 
-    return approve
+def request_environment_preparation(
+    details: dict[str, object], *, interactive: bool = False,
+    console: Console | None = None,
+) -> bool:
+    """Ask for the host-selected environment only; never display raw metadata."""
+    if not interactive or not isinstance(details, dict):
+        return False
+    ecosystem = details.get("ecosystem")
+    if not isinstance(ecosystem, str):
+        return False
+    language = {"python": "Python", "node": "Node.js"}.get(ecosystem)
+    if language is None:
+        return False
+    source = "PyPI" if ecosystem == "python" else "npm 公共仓库"
+    runtime = details.get("runtime")
+    version = ""
+    if isinstance(runtime, str) and re.fullmatch(r"v?\d{1,3}(?:\.\d{1,3}){0,2}", runtime):
+        version = " " + runtime
+    missing = details.get("missing")
+    missing_text = {
+        "docker_unavailable": "Docker 不可用，需手动安装或启动；本程序不会修改系统。",
+        "runtime_unavailable": "没有匹配的隔离运行时。",
+        "project_dependencies": "项目依赖环境尚未准备。",
+    }.get(missing, "缺少可用运行环境或依赖。") if isinstance(missing, str) else "缺少可用运行环境或依赖。"
+    text = (
+        f"{language}{version} 自检：{missing_text}创建项目专属环境将从公共镜像及 {source} 下载，"
+        "占用本地空间，并可能执行第三方依赖安装代码；不会创建数据库或云服务。"
+    )
+    if console is None:
+        print(text, flush=True)
+    else:
+        console.print(Text(text))
+    try:
+        answer = input("是否创建该项目运行环境？(y/N): ")
+    except EOFError:
+        return False
+    # Ctrl-C remains cancellation rather than consent or an ordinary refusal.
+    return answer.strip().lower() in {"y", "yes"}

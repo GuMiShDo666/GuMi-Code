@@ -44,11 +44,12 @@ from gum_code.events import (
     context_percentage,
     create_console,
     deduplicate_tool_execution,
-    task_state_text,
+    environment_cleanup_text,
+    task_outcome_text,
 )
 from gum_code.permissions.terminal import (
     make_interactive_approval,
-    make_verification_approval,
+    request_environment_preparation,
 )
 from gum_code.session import (
     MAX_SESSION_TITLE_CHARS,
@@ -68,7 +69,8 @@ from gum_code.session import (
 from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
-from gum_code.verification import VerificationRuntime, validate_task_state
+from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
+from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
 from gum_code.vision import VisionRuntime
 from gum_code.user_state import (
     SessionEntry,
@@ -164,37 +166,10 @@ def resolve_task_type(
     interactive: bool = False,
     chooser: Callable[..., object] | None = None,
 ) -> bool | None:
-    """Confirm stage intent without treating model text as user authority."""
+    """Accept the retired public argument without selecting any runtime mode."""
     if requested not in {None, "development", "read-only"}:
         raise ValueError("task-type 必须是 development 或 read-only")
-    requirement = None
-    if previous is not None and previous.get("status") != "completed":
-        requirement = previous.get("requires_verification")
-    if requirement is True and requested == "read-only":
-        raise ValueError("当前开发阶段尚未完成，不能降为只读；请继续验收或新建 Session")
-    if requirement is True:
-        return True
-    if requested is not None:
-        return requested == "development"
-    if requirement is False:
-        return False
-    if not interactive:
-        return None
-    try:
-        selected = (chooser or choice)(
-            "确认本阶段任务类型（不会批准命令执行）",
-            options=[
-                (None, "暂不确认（不能报告已验证完成）"),
-                ("development", "开发：实现、修复或修改代码，完成前必须验收"),
-                ("read-only", "问答/只读：不交付代码修改，无需构建验收"),
-            ],
-            default=None,
-        )
-    except (Exception, KeyboardInterrupt, EOFError):
-        return None
-    if selected not in {"development", "read-only"}:
-        return None
-    return selected == "development"
+    return None
 
 
 def _choose_directory(
@@ -748,17 +723,22 @@ class InteractiveRuntime:
     sticky_skills: tuple[str, ...] = ()
     skill_runtime: SkillRuntime | None = None
     pending_skill_activations: list[SkillSnapshot] | None = None
-    verification_runtime: VerificationRuntime | None = None
+    verification_runtime: object | None = None  # Retired constructor argument.
     task_type_consumed: bool = False
     last_task_state: dict[str, object] | None = None
     vision_runtime: VisionRuntime | None = None
     session_write_lock: object = field(default_factory=RLock, repr=False)
+    self_check_runtime: SelfCheckRuntime | None = None
+    last_task_outcome: dict[str, object] | None = None
 
     def close(self) -> None:
         if self.vision_runtime is not None:
             self.vision_runtime.cancel()
         self.vision_runtime = None
         self.verification_runtime = None
+        if self.self_check_runtime is not None:
+            self.self_check_runtime.cancel()
+        self.self_check_runtime = None
         if self.lease is not None:
             self.lease.release()
             self.lease = None
@@ -806,6 +786,35 @@ class InteractiveRuntime:
             if data.user_request_id is not None and data.vision_state is not None else None
         )
 
+    def _restore_self_check(self, data: SessionData) -> None:
+        if self.self_check_runtime is not None:
+            self.self_check_runtime.cancel()
+        self.self_check_runtime = (
+            SelfCheckRuntime(
+                self.workspace, request_id=data.user_request_id,
+                initial_state=data.self_check_state, command_sandbox=self.command_sandbox,
+            ) if data.user_request_id is not None else None
+        )
+        if self.self_check_runtime is not None and data.source_event_seq is not None:
+            self.self_check_runtime.bind_source(data.source_event_seq)
+            if self.session_path is not None:
+                # A crash between a side effect and its fact event is not clean.
+                with self.session_write_lock:
+                    entries = session_audit_entries(self.session_path)
+                fact_seq = max(
+                    (entry["seq"] for entry in entries
+                     if entry["type"] == "self_check.state" and entry["seq"] > data.source_event_seq),
+                    default=data.source_event_seq,
+                )
+                if any(
+                    entry["seq"] > fact_seq
+                    and entry["type"] == "tool.execution_started"
+                    and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}
+                    for entry in entries
+                ):
+                    self.self_check_runtime.mark_unknown()
+        self.last_task_outcome = None
+
     def _record_skill_activation(self, snapshot: SkillSnapshot) -> None:
         with self.session_write_lock:
             if self.pending_skill_activations is None:
@@ -837,29 +846,18 @@ class InteractiveRuntime:
         destination = Path(path).resolve()
         if self.session_path is not None and destination == self.session_path.resolve():
             if destination.exists():
-                self._restore_vision(load_session(
+                data = load_session(
                     destination, allow_incomplete_tool_batch=True, allow_pending_user_tail=True,
-                ))
+                )
+                self._restore_vision(data)
+                self._restore_self_check(data)
             elif self.vision_runtime is not None:
                 self.vision_runtime.cancel()
                 self.vision_runtime = None
-            if self.verification_runtime is not None:
-                previous = self.verification_runtime.export_state()
-                self.verification_runtime = (
-                    VerificationRuntime(
-                        self.workspace,
-                        initial_state=previous,
-                        internal_paths=(
-                            (destination, self.lease.lock_path) if self.lease is not None else ()
-                        ),
-                    )
-                    if previous.get("status") != "completed"
-                    else None
-                )
-                self.last_task_state = (
-                    self.verification_runtime.export_state()
-                    if self.verification_runtime is not None else previous
-                )
+            if not destination.exists() and self.self_check_runtime is not None:
+                self.self_check_runtime.cancel()
+                self.self_check_runtime = None
+            self.verification_runtime = None
             return
         lease = SessionLease(destination).acquire()
         try:
@@ -891,14 +889,7 @@ class InteractiveRuntime:
         self.sticky_skills = data.sticky_skills
         self.last_task_state = data.task_state
         self._restore_vision(data)
-        self.verification_runtime = (
-            VerificationRuntime(
-                self.workspace, initial_state=data.task_state,
-                internal_paths=(self.session_path, lease.lock_path),
-            )
-            if data.task_state is not None and data.task_state.get("status") != "completed"
-            else None
-        )
+        self._restore_self_check(data)
         self.first_task = next(
             (
                 str(message.get("content"))
@@ -987,7 +978,8 @@ class InteractiveRuntime:
         self._ensure_session()
         if resume_data is not None:
             self._restore_vision(resume_data)
-            request_id = None
+            self._restore_self_check(resume_data)
+            request_id = None if resume_data.user_request_id is not None else str(uuid.uuid4())
         else:
             if self.vision_runtime is not None:
                 self.vision_runtime.cancel()
@@ -997,6 +989,21 @@ class InteractiveRuntime:
                 persist_callback=self._persist_vision,
                 settings_loader=lambda: load_vision_settings(),
             )
+        if resume_data is None or self.self_check_runtime is None:
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.cancel()
+            self.self_check_runtime = SelfCheckRuntime(
+                self.workspace, request_id=request_id, command_sandbox=self.command_sandbox,
+            )
+            if resume_data is not None and resume_data.user_request_id is None:
+                # Legacy logs cannot distinguish an original request from a Stop
+                # continuation; past execution is uncertain, not a clean reset.
+                with self.session_write_lock:
+                    entries = session_audit_entries(self.session_path)
+                if any(entry["type"] == "tool.execution_started"
+                       and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}
+                       for entry in entries):
+                    self.self_check_runtime.mark_unknown()
         first_snapshot = True
         if self.first_task is None:
             self.first_task = task
@@ -1006,41 +1013,16 @@ class InteractiveRuntime:
             sticky_names=self.sticky_skills,
             activation_callback=self._record_skill_activation,
         )
-        previous = (
-            self.verification_runtime.export_state()
-            if self.verification_runtime is not None
-            else None
-        )
-        requested = (
-            None if self.task_type_consumed else getattr(self.args, "task_type", None)
-        )
-        requirement = resolve_task_type(
-            requested,
-            previous=previous,
-            interactive=bool(getattr(self.args, "interactive_terminal", False)),
-        )
+        if not self.task_type_consumed and getattr(self.args, "task_type", None) is not None:
+            self.console.print(Text("提示：--task-type 已弃用；自检由本轮实际代码变化触发。"))
         self.task_type_consumed = True
-        if (
-            self.verification_runtime is None
-            or (previous is not None and previous.get("status") == "completed")
-            or (previous is not None and previous.get("requires_verification") is not requirement)
-        ):
-            self.verification_runtime = VerificationRuntime(
-                self.workspace,
-                requires_verification=requirement,
-                initial_state=(
-                    previous if previous and previous.get("status") != "completed"
-                    else None
-                ),
-                approval_callback=make_verification_approval(self.workspace, self.console),
-            )
-        else:
-            self.verification_runtime.approval_callback = make_verification_approval(
-                self.workspace, self.console
-            )
+        self.verification_runtime = None
         assert self.session_path is not None and self.lease is not None
-        self.verification_runtime.set_internal_paths((self.session_path, self.lease.lock_path))
-        self.last_task_state = None
+        self.self_check_runtime.set_internal_paths((self.session_path, self.lease.lock_path))
+        self.self_check_runtime.approval_callback = (
+            lambda summary: request_environment_preparation(summary, console=self.console, interactive=True)
+        ) if bool(getattr(self.args, "interactive_terminal", False)) else None
+        self.last_task_outcome = None
 
         def snapshot(messages: list[dict[str, object]]) -> None:
             nonlocal latest, first_snapshot
@@ -1049,24 +1031,26 @@ class InteractiveRuntime:
             self._save(messages, user_request_id=request_id if first_snapshot else None)
             if first_snapshot:
                 first_snapshot = False
-                if request_id is not None and self.vision_runtime is not None:
+                if request_id is not None:
                     with self.session_write_lock:
                         saved = load_session(self.session_path, allow_incomplete_tool_batch=True,
                                              allow_pending_user_tail=True)
                     if saved.user_request_id != request_id or saved.source_event_seq is None:
-                        raise RuntimeError("图片解析缺少原始用户请求来源")
+                        raise RuntimeError("缺少原始用户请求来源")
                     # Budget -> Session lock ordering; do not bind while saving.
-                    self.vision_runtime.bind_source(saved.source_event_seq)
+                    if self.vision_runtime is not None:
+                        self.vision_runtime.bind_source(saved.source_event_seq)
+                    self.self_check_runtime.bind_source(saved.source_event_seq)
 
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
         render_event = deduplicate_tool_execution(renderer)
 
         def event_callback(event_type: str, payload: dict[str, object]) -> None:
-            if event_type == "task_state":
-                state = validate_task_state(payload)
+            if event_type == "self_check_state":
                 assert self.session_path is not None
-                self._append_event("task.state", state)
-                self.last_task_state = state
+                self._append_event("self_check.state", payload)
+            elif event_type == "task_outcome":
+                self.last_task_outcome = validate_task_outcome(payload)
             render_event(event_type, payload)
         kwargs: dict[str, object] = {}
         if self.command_sandbox is not None:
@@ -1090,7 +1074,7 @@ class InteractiveRuntime:
                 initial_messages=self.messages,
                 token_counter=self.token_counter,
                 skill_runtime=self.skill_runtime,
-                verification_runtime=self.verification_runtime,
+                self_check_runtime=self.self_check_runtime,
                 vision_runtime=self.vision_runtime,
                 on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
                     runtime, console=self.console,
@@ -1098,10 +1082,14 @@ class InteractiveRuntime:
                 ),
                 **kwargs,
             )
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
+            self.self_check_runtime.cancel()
             if self.vision_runtime is not None:
                 self.vision_runtime.cancel()
             renderer.close()
+            cleanup = environment_cleanup_text(getattr(error, "cleanup_required", ()))
+            if cleanup is not None:
+                self.console.print(Text(cleanup, style="yellow"))
             self._recover_failed_turn(latest, completed)
             self.console.print(
                 Text(
@@ -1111,6 +1099,7 @@ class InteractiveRuntime:
             )
             return
         except Exception:
+            self.self_check_runtime.cancel()
             if self.vision_runtime is not None:
                 self.vision_runtime.cancel()
             renderer.close()
@@ -1121,7 +1110,7 @@ class InteractiveRuntime:
                 self.sticky_skills = self.skill_runtime.sticky_names
             renderer.close()
 
-        if self.last_task_state is None or self.last_task_state.get("status") not in {
+        if self.last_task_outcome is None or self.last_task_outcome.get("status") not in {
             "completed", "incomplete", "failed", "interrupted",
         }:
             raise RuntimeError("缺少可信任务终态，不能展示完成结果")
@@ -1129,8 +1118,8 @@ class InteractiveRuntime:
         if (
             not self.title
             and self.first_task is not None
-            and self.last_task_state is not None
-            and self.last_task_state.get("status") == "completed"
+            and self.last_task_outcome is not None
+            and self.last_task_outcome.get("status") == "completed"
         ):
             with self.console.status("正在生成 Session 标题…"):
                 self.title = generate_title(
@@ -1149,6 +1138,7 @@ class InteractiveRuntime:
         self.skill_runtime = None
         self.pending_skill_activations = None
         self.last_task_state = None
+        self.last_task_outcome = None
 
     def compact_context(self) -> bool:
         if not self.messages:
@@ -1165,7 +1155,7 @@ class InteractiveRuntime:
         tools = build_agent_tool_schemas(
             allow_run_command=bool(getattr(self.args, "allow_run_command", False)),
             allow_subagent=bool(getattr(self.args, "allow_subagent", True)),
-            allow_verification=True,
+            allow_self_check=True,
         )
         before_tokens = self.token_counter.count_request(self.messages, tools)
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
@@ -1210,18 +1200,13 @@ class InteractiveRuntime:
         table.add_row("Session", Text(_safe_terminal_text(session)))
         table.add_row("Sandbox", "on" if self.args.allow_run_command else "off")
         table.add_row("Subagent", "on" if self.args.allow_subagent else "off")
-        if self.last_task_state is not None:
-            state_text = task_state_text(self.last_task_state) or "尚未完成验收"
-            if self.verification_runtime is None or (
-                self.verification_runtime.export_state().get("stop_reason") == "restored"
-            ):
-                state_text = "历史记录（继续交付须复核）：" + state_text
-            table.add_row("验收", state_text)
+        if self.last_task_outcome is not None:
+            table.add_row("自检", task_outcome_text(self.last_task_outcome) or "状态未确认")
         if self.messages:
             tools = build_agent_tool_schemas(
                 allow_run_command=self.args.allow_run_command,
                 allow_subagent=self.args.allow_subagent,
-                allow_verification=True,
+                allow_self_check=True,
             )
             used_tokens = self.token_counter.count_request(self.messages, tools)
             percent = context_percentage(used_tokens, self.args.max_context_tokens)
@@ -1445,15 +1430,13 @@ def _handle_repl_command(runtime: InteractiveRuntime, command: str) -> bool:
         runtime.close()
         return True
     if command == "/help":
-        runtime.console.print(Text(" ".join(sorted(KNOWN_COMMANDS))))
+        runtime.console.print(Text(" ".join(sorted(KNOWN_COMMANDS - {"/revoke-verification"}))))
     elif command == "/compact":
         runtime.compact_context()
     elif command == "/status":
         runtime.show_status()
     elif command == "/revoke-verification":
-        if runtime.verification_runtime is not None:
-            runtime.verification_runtime.revoke_grants()
-        runtime.console.print(Text("已撤销当前阶段的验收重跑许可；后续执行须重新批准。"))
+        runtime.console.print(Text("验收登记与阶段许可已移除；无需使用此命令。"))
     elif command == "/verbose":
         runtime.verbose = not runtime.verbose
         runtime.console.print(Text(f"verbose: {'on' if runtime.verbose else 'off'}"))
@@ -1633,18 +1616,6 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
             title=data.title if data else "",
             sticky_skills=data.sticky_skills if data else (),
             last_task_state=data.task_state if data else None,
-            verification_runtime=(
-                VerificationRuntime(
-                    workspace, initial_state=data.task_state,
-                    internal_paths=(
-                        (session_path, initial_lease.lock_path)
-                        if session_path is not None and initial_lease is not None else ()
-                    ),
-                )
-                if data is not None and data.task_state is not None
-                and data.task_state.get("status") != "completed"
-                else None
-            ),
             first_task=next(
                 (
                     str(message.get("content"))
@@ -1658,6 +1629,7 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
         initial_lease = None
         if data is not None:
             runtime._restore_vision(data)
+            runtime._restore_self_check(data)
             runtime.messages = runtime._recover_loaded_data(data)
         try:
             return run_repl(runtime)

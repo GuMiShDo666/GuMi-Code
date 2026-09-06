@@ -1,4 +1,4 @@
-"""Wire explicit task intent, durable outcomes, and process-level exit status."""
+"""Wire original requests, durable check facts, and process-level outcomes."""
 
 import argparse
 import sys
@@ -18,10 +18,10 @@ from gum_code.config import (
 from gum_code.events import (
     create_console,
     deduplicate_tool_execution,
+    environment_cleanup_text,
     print_terminal_event,
 )
 from gum_code.interactive import (
-    resolve_task_type,
     request_extra_vision_calls,
     run_interactive,
     select_workspace,
@@ -29,7 +29,7 @@ from gum_code.interactive import (
 )
 from gum_code.permissions.terminal import (
     request_terminal_approval,
-    request_verification_approval,
+    request_environment_preparation,
 )
 from gum_code.session import (
     SESSION_VERSION,
@@ -44,7 +44,7 @@ from gum_code.skills import SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
-from gum_code.verification import VerificationRuntime, validate_task_state
+from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
 from gum_code.vision import VisionRuntime
 
 
@@ -71,7 +71,7 @@ def parse_args(
     parser.add_argument("--workspace", help="工作区目录路径")
     parser.add_argument(
         "--task-type", choices=("development", "read-only"),
-        help="确认当前阶段类型；非交互未声明且无可恢复类型时只能报告未验证",
+        help="已弃用；接受旧参数，但不再改变自检或工具行为",
     )
     parser.add_argument(
         "--max-steps", type=_positive_int, default=MAX_STEPS,
@@ -84,7 +84,7 @@ def parse_args(
     )
     parser.add_argument(
         "--allow-run-command", action="store_true",
-        help="允许模型请求在 Docker Sandbox 中执行命令；固定验收可另行批准阶段内重跑",
+        help="允许模型请求在 Docker Sandbox 中执行普通命令；自检无需此参数",
     )
     parser.add_argument(
         "--no-subagent", dest="allow_subagent", action="store_false",
@@ -143,6 +143,7 @@ def parse_args(
 def _run_one_shot(args: argparse.Namespace) -> int:
     lease: SessionLease | None = None
     vision_runtime: VisionRuntime | None = None
+    self_check_runtime: SelfCheckRuntime | None = None
     session_write_lock = RLock()
     try:
         session_file = args.session_file or args.resume_session
@@ -192,7 +193,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             command_sandbox = load_docker_sandbox(args.sandbox_image)
             print(
                 "警告：run_command 已启用；命令将在断网 Docker Sandbox 中运行，"
-                "但仍可修改未遮蔽的 workspace 文件；固定验收重跑需单独批准。"
+                "但仍可修改未遮蔽的 workspace 文件；普通命令仍需批准。"
             )
 
         settings = load_settings()
@@ -271,45 +272,40 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             activation_callback=record_activation if session_file is not None else None,
         )
 
-        previous_state = resumed.task_state if resumed is not None else None
-        if previous_state is not None and previous_state.get("status") == "completed":
-            previous_state = None
-        verification_runtime = VerificationRuntime(
-            args.workspace,
-            requires_verification=resolve_task_type(
-                args.task_type,
-                previous=previous_state,
-                interactive=args.interactive_terminal,
-            ),
-            initial_state=previous_state,
-            approval_callback=request_verification_approval,
+        # A one-shot task is always new explicit user input, even with --resume.
+        request_id = str(uuid.uuid4())
+        if args.task_type is not None:
+            print("提示：--task-type 已弃用；自检由本轮实际代码变化触发。", flush=True)
+        self_check_runtime = SelfCheckRuntime(
+            args.workspace, request_id=request_id, command_sandbox=command_sandbox,
+            approval_callback=(lambda summary: request_environment_preparation(
+                summary, interactive=args.interactive_terminal,
+            )) if args.interactive_terminal else None,
             internal_paths=(
                 (Path(session_file), lease.lock_path)
                 if session_file is not None and lease is not None
                 else ()
             ),
         )
-        # A one-shot task is always new explicit user input, even with --resume.
-        request_id = str(uuid.uuid4())
         vision_runtime = VisionRuntime(
             load_vision_settings(), request_id=request_id,
             persist_callback=(lambda state: append_event("vision.state", state))
             if session_file is not None else None,
             settings_loader=lambda: load_vision_settings(),
         )
-        last_task_state: dict[str, object] | None = None
+        last_task_outcome: dict[str, object] | None = None
         render_event = deduplicate_tool_execution(print_terminal_event)
 
         def event_callback(event_type: str, payload: dict[str, object]) -> None:
-            nonlocal last_task_state
-            if event_type == "task_state":
-                state = validate_task_state(payload)
+            nonlocal last_task_outcome
+            if event_type == "self_check_state":
                 if session_file is not None:
-                    append_event("task.state", state)
-                last_task_state = state
+                    append_event("self_check.state", payload)
+            elif event_type == "task_outcome":
+                last_task_outcome = validate_task_outcome(payload)
             elif event_type == "final_answer" and (
-                last_task_state is None
-                or last_task_state.get("status") not in {
+                last_task_outcome is None
+                or last_task_outcome.get("status") not in {
                     "completed", "incomplete", "failed", "interrupted",
                 }
             ):
@@ -335,12 +331,13 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                         saved = load_session(session_file, allow_incomplete_tool_batch=True,
                                              allow_pending_user_tail=True)
                         if saved.user_request_id != request_id or saved.source_event_seq is None:
-                            raise RuntimeError("图片解析缺少原始用户请求来源")
+                            raise RuntimeError("缺少原始用户请求来源")
                         source_event_seq = saved.source_event_seq
                         first_snapshot = False
                 # Never acquire the budget lock while holding the Session lock.
                 if source_event_seq is not None:
                     vision_runtime.bind_source(source_event_seq)
+                    self_check_runtime.bind_source(source_event_seq)
 
         kwargs: dict[str, object] = {}
         if command_sandbox is not None:
@@ -361,19 +358,21 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             initial_messages=initial_messages,
             token_counter=token_counter,
             skill_runtime=skill_runtime,
-            verification_runtime=verification_runtime,
+            self_check_runtime=self_check_runtime,
             vision_runtime=vision_runtime,
             on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
                 runtime, interactive=args.interactive_terminal,
             ),
             **kwargs,
         )
-        if last_task_state is not None and last_task_state.get("status") == "completed":
+        if last_task_outcome is not None and last_task_outcome.get("status") == "completed":
             return 0
         return 1
     finally:
         if vision_runtime is not None:
             vision_runtime.cancel()
+        if self_check_runtime is not None:
+            self_check_runtime.cancel()
         if lease is not None:
             lease.release()
 
@@ -385,6 +384,13 @@ def main(argv: list[str] | None = None) -> int:
         if args.task is None:
             return run_interactive(args)
         return _run_one_shot(args)
+    except KeyboardInterrupt as error:
+        sys.stdout.flush()
+        print("本轮已中断；已发生的改动未回滚。", file=sys.stderr, flush=True)
+        cleanup = environment_cleanup_text(getattr(error, "cleanup_required", ()))
+        if cleanup is not None:
+            print(cleanup, file=sys.stderr, flush=True)
+        return 130
     except (RuntimeError, OpenAIError, OSError, ValueError) as exc:
         sys.stdout.flush()
         print(f"[错误] {exc}", file=sys.stderr, flush=True)

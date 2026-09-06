@@ -2,6 +2,7 @@
 
 import copy
 import json
+import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -38,9 +39,8 @@ from gum_code.token_counting import (
     load_token_counter,
 )
 from gum_code.tools.command import DockerSandboxConfig
-from gum_code.verification import (
-    VERIFICATION_INSTRUCTION, VERIFICATION_TOOL_SCHEMA, VerificationRuntime,
-)
+from gum_code.verification import VERIFICATION_INSTRUCTION
+from gum_code.self_check import SELF_CHECK_INSTRUCTION, SelfCheckRuntime
 from gum_code.tools import (
     ApprovalCallback,
     ToolExecutionDenied,
@@ -166,6 +166,7 @@ def build_agent_tool_schemas(
     allow_subagent: bool = True,
     allow_skills: bool = False,
     allow_verification: bool = False,
+    allow_self_check: bool = True,
 ) -> list[dict[str, object]]:
     schemas = [
         *get_tool_schemas(allow_run_command=allow_run_command),
@@ -175,8 +176,8 @@ def build_agent_tool_schemas(
         schemas.append(TASK_TOOL_SCHEMA)
     if allow_skills:
         schemas.extend(SKILL_TOOL_SCHEMAS)
-    if allow_verification:
-        schemas.append(VERIFICATION_TOOL_SCHEMA)
+    if not allow_self_check:
+        schemas = [schema for schema in schemas if schema["function"]["name"] != "self_check"]
     return schemas
 
 
@@ -190,6 +191,7 @@ def _is_context_length_error(error: object) -> bool:
 
 
 def _with_system_instructions(content: str) -> str:
+    content = content.replace("\n\n" + VERIFICATION_INSTRUCTION, "")
     parts = [content]
     if TODO_SYSTEM_INSTRUCTION not in content:
         parts.append(TODO_SYSTEM_INSTRUCTION)
@@ -315,29 +317,38 @@ def _finish_answer(
     messages: list[dict[str, object]], answer: str, *, status: str, reason: str,
     step: int, event_callback: AgentEventCallback | None,
     message_snapshot_callback: MessageSnapshotCallback | None,
-    verification_runtime: VerificationRuntime | None,
+    self_check_runtime: SelfCheckRuntime | None,
 ) -> str:
     """Save a final message and trusted outcome before rendering the answer."""
     if not messages or messages[-1] != {"role": "assistant", "content": answer}:
         messages.append({"role": "assistant", "content": answer})
     _send_message_snapshot(message_snapshot_callback, messages)
-    if verification_runtime is not None:
-        if status == "completed" and verification_runtime.requires_verification is True:
-            complete, _, current_reason = verification_runtime.completion(command_available=True)
-            if not complete:
-                status, reason = "incomplete", current_reason
-                answer = "最终保存后工作版本或验收记录发生变化，本阶段尚未完成验证。" + verification_runtime.summary(
-                    status=status, reason=reason,
-                )
+    if self_check_runtime is not None:
+        self_check_runtime.recheck_final()
+        outcome = self_check_runtime.outcome(step=step)
+        if status != "completed":
+            outcome = self_check_runtime.outcome(step=step, status=status, reason=reason)
+        summary = outcome["summary"]
+        if summary:
+            answer += "\n\n" + summary
+            messages[-1] = {"role": "assistant", "content": answer}
+            _send_message_snapshot(message_snapshot_callback, messages)
+            self_check_runtime.recheck_final()
+            refreshed = self_check_runtime.outcome(
+                step=step, status=None if status == "completed" else status,
+                reason=None if status == "completed" else reason,
+            )
+            if refreshed != outcome:
+                answer = answer.removesuffix(summary) + refreshed["summary"]
                 messages[-1] = {"role": "assistant", "content": answer}
                 _send_message_snapshot(message_snapshot_callback, messages)
-        verification_runtime.finish(status, reason)
+                outcome = refreshed
         if event_callback is not None:
-            try:
-                event_callback("task_state", verification_runtime.export_state())
-            except BaseException:
-                verification_runtime.persistence_failed()
-                raise
+            event_callback("self_check_state", self_check_runtime.export_state())
+            event_callback("task_outcome", outcome)
+    elif event_callback is not None:
+        event_callback("task_outcome", {"status": status, "reason": reason, "step": step,
+            "self_check_status": "not_needed", "changed": False, "summary": ""})
     if event_callback is not None:
         event_callback("final_answer", {"step": step, "answer": answer})
     return answer
@@ -361,7 +372,7 @@ def _run_agent_loop(
     command_sandbox: DockerSandboxConfig | None = None,
     allow_subagent: bool = True,
     skill_runtime: SkillRuntime | None = None,
-    verification_runtime: VerificationRuntime | None = None,
+    self_check_runtime: SelfCheckRuntime | None = None,
     vision_runtime: "VisionRuntime | None" = None,
     on_vision_budget_exhausted: "Callable[[VisionRuntime], None] | None" = None,
 ) -> str:
@@ -477,23 +488,23 @@ def _run_agent_loop(
                 message["content"] = skill_runtime.apply_to_system(message["content"])
                 break
 
-    if verification_runtime is not None:
+    if self_check_runtime is not None:
         for message in messages:
             if message.get("role") == "system" and isinstance(message.get("content"), str):
-                if VERIFICATION_INSTRUCTION not in message["content"]:
-                    message["content"] += "\n\n" + VERIFICATION_INSTRUCTION
+                if SELF_CHECK_INSTRUCTION not in message["content"]:
+                    message["content"] += "\n\n" + SELF_CHECK_INSTRUCTION
                 break
 
     _send_message_snapshot(message_snapshot_callback, messages)
 
-    if verification_runtime is not None and event_callback is not None:
-        event_callback("task_state", verification_runtime.export_state())
+    if self_check_runtime is not None and event_callback is not None:
+        event_callback("self_check_state", self_check_runtime.export_state())
 
     agent_tool_schemas = build_agent_tool_schemas(
         allow_run_command=allow_run_command,
         allow_subagent=allow_subagent,
         allow_skills=skill_runtime is not None,
-        allow_verification=verification_runtime is not None,
+        allow_self_check=self_check_runtime is not None,
     )
 
     allowed_tool_names = {
@@ -536,12 +547,45 @@ def _run_agent_loop(
     denied_tool_calls: set[tuple[str, str]] = set()
     delegations_started = 0
     started_descriptions: set[str] = set()
+    host_check_pending = False
+    candidate_answer = ""
 
     for step in range(1, max_steps + 1):
-        if verification_runtime is not None:
-            verification_runtime.set_step(step)
         if step > 1 and event_callback is not None:
             event_callback("request_prepare", {"step": step})
+
+        if host_check_pending:
+            host_check_pending = False
+            call_id = "host_self_check_" + uuid.uuid4().hex
+            messages.append({"role": "assistant", "content": "[Harness self_check] 自动检查当前请求的代码改动。",
+                "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "self_check", "arguments": "{}"}}]})
+            _send_message_snapshot(message_snapshot_callback, messages)
+            in_flight = copy.deepcopy(messages)
+            in_flight.append({"role": "tool", "tool_call_id": call_id, "content": "", IN_FLIGHT_MARKER_KEY: True})
+            _send_message_snapshot(message_snapshot_callback, in_flight)
+            if event_callback is not None:
+                event_callback("tool_call", {"step": step, "tool_name": "self_check", "source": "host"})
+            result = execute_tool(
+                workspace=workspace, tool_name="self_check", arguments_json="{}",
+                approval_callback=approval_callback, pre_tool_use_callback=pre_tool_use_callback,
+                post_tool_use_callback=post_tool_use_callback,
+                before_execute_callback=lambda: _emit_tool_execution(event_callback, step, "self_check"),
+                command_sandbox=command_sandbox, self_check_runtime=self_check_runtime,
+                file_change_callback=self_check_runtime.on_file_change,
+            )
+            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
+            _send_message_snapshot(message_snapshot_callback, messages)
+            if event_callback is not None:
+                event_callback("tool_result", {"step": step, "tool_name": "self_check", "result": result})
+                event_callback("self_check_state", self_check_runtime.export_state())
+            outcome = self_check_runtime.outcome(step=step)
+            if outcome["status"] == "completed" or outcome["self_check_status"] not in {"failed", "source_changed"}:
+                return _finish_answer(
+                    messages, candidate_answer, status="completed", reason="answered", step=step,
+                    event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
+                    self_check_runtime=self_check_runtime,
+                )
+            continue
 
         # Keep this degradation order so summaries see already-bounded Tool Results.
         used_tokens = token_budget.count_request(messages, agent_tool_schemas)
@@ -764,37 +808,17 @@ def _run_agent_loop(
                 _send_message_snapshot(message_snapshot_callback, messages)
                 continue
 
-            if verification_runtime is not None:
-                complete, can_continue, reason = verification_runtime.completion(
-                    command_available=allow_run_command and command_sandbox is not None,
-                )
-                if not complete and can_continue:
-                    messages.append({"role": "user", "content": (
-                        "[Harness verification] 当前任务未通过验收：" + reason + "。"
-                        + verification_runtime.summary() + VERIFICATION_INSTRUCTION
-                    )})
-                    _send_message_snapshot(message_snapshot_callback, messages)
-                    if event_callback is not None:
-                        event_callback("task_state", verification_runtime.export_state())
-                    continue
-                answer = (message.content or "") if complete else (
-                    "本阶段尚未完成验证（" + reason + "）。"
-                    + verification_runtime.summary(status="incomplete", reason=reason)
-                )
-                return _finish_answer(
-                    messages, answer, status="completed" if complete else "incomplete",
-                    reason=reason, step=step, event_callback=event_callback,
-                    message_snapshot_callback=message_snapshot_callback,
-                    verification_runtime=verification_runtime,
-                )
-
-            answer = message.content or ""
-            if event_callback is not None:
-                event_callback(
-                    "final_answer",
-                    {"step": step, "answer": answer},
-                )
-            return answer
+            if self_check_runtime is not None and self_check_runtime.needs_check():
+                if step == max_steps:
+                    break
+                candidate_answer = message.content or ""
+                host_check_pending = True
+                continue
+            return _finish_answer(
+                messages, message.content or "", status="completed", reason="answered", step=step,
+                event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
+                self_check_runtime=self_check_runtime,
+            )
 
         has_todo_write = any(
             tool_call.function.name == "todo_write"
@@ -1103,11 +1127,6 @@ def _run_agent_loop(
                             event_callback, step, "todo_write"
                         ),
                     )
-                elif tool_name == "verification" and verification_runtime is not None:
-                    result = verification_runtime.execute(
-                        tool_call.function.arguments, command_sandbox,
-                        lambda: _emit_tool_execution(event_callback, step, tool_name),
-                    )
                 elif skill_runtime is not None and tool_name in SKILL_TOOL_NAMES:
                     result = skill_runtime.execute(
                         tool_name,
@@ -1127,42 +1146,37 @@ def _run_agent_loop(
                             "in this run; do not retry."
                         )
                     else:
-                        command_outcomes: list[object] = []
                         execution_kwargs: dict[str, object] = {}
                         if vision_runtime is not None:
                             execution_kwargs["vision_runtime"] = vision_runtime
-                        effective_approval = approval_callback
-                        if verification_runtime is not None:
-                            effective_approval = verification_runtime.wrap_approval(
-                                approval_callback, command_sandbox
-                            )
-                            if tool_name == "run_command":
-                                execution_kwargs["command_result_callback"] = command_outcomes.append
+                        if self_check_runtime is not None:
+                            execution_kwargs["self_check_runtime"] = self_check_runtime
+                            execution_kwargs["file_change_callback"] = self_check_runtime.on_file_change
+                        command_attempted = False
 
                         def before_execution() -> None:
-                            if verification_runtime is not None:
-                                verification_runtime.before_tool(tool_name)
+                            nonlocal command_attempted
+                            if self_check_runtime is not None and tool_name == "run_command":
+                                self_check_runtime.before_command(json.loads(tool_call.function.arguments))
+                                command_attempted = True
                             _emit_tool_execution(event_callback, step, tool_name)
 
-                        result = execute_tool(
-                            workspace=workspace,
-                            tool_name=tool_name,
-                            arguments_json=tool_call.function.arguments,
-                            approval_callback=effective_approval,
-                            pre_tool_use_callback=pre_tool_use_callback,
-                            post_tool_use_callback=post_tool_use_callback,
-                            before_execute_callback=before_execution,
-                            command_sandbox=command_sandbox,
-                            **execution_kwargs,
-                        )
-                        if verification_runtime is not None and tool_name == "run_command":
-                            try:
-                                command_arguments = json.loads(tool_call.function.arguments)
-                            except (TypeError, ValueError):
-                                command_arguments = None
-                            verification_runtime.observe_command(
-                                command_arguments, command_outcomes[-1] if command_outcomes else None,
-                            )
+                        try:
+                            if tool_name == "self_check" and index != len(message.tool_calls) - 1:
+                                result = "Error: self_check must be called after the other tools in the batch."
+                            else:
+                                result = execute_tool(
+                                    workspace=workspace, tool_name=tool_name,
+                                    arguments_json=tool_call.function.arguments,
+                                    approval_callback=approval_callback,
+                                    pre_tool_use_callback=pre_tool_use_callback,
+                                    post_tool_use_callback=post_tool_use_callback,
+                                    before_execute_callback=before_execution,
+                                    command_sandbox=command_sandbox, **execution_kwargs,
+                                )
+                        finally:
+                            if command_attempted:
+                                self_check_runtime.after_command()
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)
 
@@ -1209,8 +1223,8 @@ def _run_agent_loop(
             )
             _send_message_snapshot(message_snapshot_callback, messages)
 
-            if verification_runtime is not None and event_callback is not None:
-                event_callback("task_state", verification_runtime.export_state())
+            if self_check_runtime is not None and event_callback is not None:
+                event_callback("self_check_state", self_check_runtime.export_state())
 
         # Siblings are joined and every Tool Result is durable before host input.
         # Visual credits never extend the main model step budget or replay tools.
@@ -1279,12 +1293,10 @@ def _run_agent_loop(
                 )
 
     answer = FINALIZATION_EMPTY_ANSWER
-    if verification_runtime is not None:
-        answer += "\n" + verification_runtime.summary(status="incomplete", reason="step_budget")
     return _finish_answer(
         messages, answer, status="incomplete", reason="step_budget", step=max_steps,
         event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
-        verification_runtime=verification_runtime,
+        self_check_runtime=self_check_runtime,
     )
 
 
@@ -1299,43 +1311,46 @@ def run_agent(
     hook_registry: HookRegistry | None = None, token_counter: RequestTokenCounter | None = None,
     command_sandbox: DockerSandboxConfig | None = None, allow_subagent: bool = True,
     skill_runtime: SkillRuntime | None = None,
-    verification_runtime: VerificationRuntime | None = None,
+    verification_runtime: object | None = None,
+    self_check_runtime: SelfCheckRuntime | None = None,
     vision_runtime: "VisionRuntime | None" = None,
     on_vision_budget_exhausted: "Callable[[VisionRuntime], None] | None" = None,
 ) -> str:
-    """Return answer text; optional host verification owns durable completion."""
+    """Return answer text; host facts describe checks without a registration gate."""
     state_ready = False
+    last_step = 0
     def emit(name: str, payload: dict[str, object]) -> None:
-        nonlocal state_ready
-        if name == "task_state":
+        nonlocal state_ready, last_step
+        if type(payload.get("step")) is int:
+            last_step = payload["step"]
+        if name == "self_check_state":
             state_ready = True
         if event_callback is not None:
             event_callback(name, payload)
 
-    if verification_runtime is not None:
-        if verification_runtime.workspace != workspace.resolve():
-            raise ValueError("验证状态与工作区不匹配")
-        verification_runtime.begin_run(user_query)
+    if self_check_runtime is not None and self_check_runtime.workspace != workspace.resolve():
+        raise ValueError("自检状态与工作区不匹配")
     try:
         return _run_agent_loop(
             client=client, model=model, workspace=workspace, user_query=user_query,
             max_steps=max_steps, approval_callback=approval_callback,
-            event_callback=emit if verification_runtime is not None else event_callback,
+            event_callback=emit if self_check_runtime is not None else event_callback,
             message_snapshot_callback=message_snapshot_callback, initial_messages=initial_messages,
             max_context_tokens=max_context_tokens, model_context_tokens=model_context_tokens,
             allow_run_command=allow_run_command, hook_registry=hook_registry,
             token_counter=token_counter, command_sandbox=command_sandbox,
             allow_subagent=allow_subagent, skill_runtime=skill_runtime,
-            verification_runtime=verification_runtime,
+            self_check_runtime=self_check_runtime,
             vision_runtime=vision_runtime,
             on_vision_budget_exhausted=on_vision_budget_exhausted,
         )
     except BaseException as error:
-        if verification_runtime is not None:
+        if self_check_runtime is not None:
             status = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
-            if verification_runtime.finish(status, status) and state_ready and event_callback is not None:
+            if state_ready and event_callback is not None:
                 try:
-                    event_callback("task_state", verification_runtime.export_state())
+                    event_callback("self_check_state", self_check_runtime.export_state())
+                    event_callback("task_outcome", self_check_runtime.outcome(step=last_step, status=status, reason=status))
                 except Exception:
                     # Preserve the original failure; never render a successful outcome.
                     pass

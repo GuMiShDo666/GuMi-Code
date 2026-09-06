@@ -1,6 +1,8 @@
 import os
 import stat
 import tempfile
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from gum_code.tools.common import (
@@ -16,6 +18,28 @@ from gum_code.tools.common import (
 MAX_FILE_CONTENT_CHARS = 200_000
 
 
+@dataclass(frozen=True)
+class FileChange:
+    """Host-only fact emitted after a real file content/existence change."""
+
+    path: str
+    before_head: bytes | None
+    after_head: bytes | None
+    executable: bool = False
+
+
+FileChangeCallback = Callable[[FileChange], None]
+
+
+def _changed(callback: FileChangeCallback | None, change: FileChange) -> None:
+    if callback is not None:
+        try:
+            callback(change)
+        except Exception:
+            # The file is already committed; do not convert a failed journal to a Tool Result.
+            raise RuntimeError("文件变更记录失败；已发生的写入未回滚") from None
+
+
 def list_files(workspace: Path, path: str = ".") -> str:
     root = workspace.resolve()
     target = _resolve_workspace_path(workspace, path)
@@ -28,7 +52,7 @@ def list_files(workspace: Path, path: str = ".") -> str:
 
     entries = []
     for item in target.iterdir():
-        if _is_sensitive_name(item.name):
+        if item.name in SKIP_NAMES or _is_sensitive_name(item.name):
             continue
         resolved = item.resolve()
         try:
@@ -133,16 +157,39 @@ def write_file(
     content: str,
     overwrite: bool = False,
     create_parents: bool = False,
+    *,
+    file_change_callback: FileChangeCallback | None = None,
 ) -> str:
     _validate_write_file(workspace, path, content, overwrite, create_parents)
 
     target = _resolve_workspace_path(workspace, path)
+    encoded = content.encode("utf-8")
+    previous = None
+    executable = False
+    if file_change_callback is not None and target.exists():
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            before = os.fstat(source.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise ValueError("写入目标不是普通文件")
+            previous = source.read(len(encoded) + 1)
+            after = os.fstat(source.fileno())
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise ValueError("文件在写入前发生变化")
+        executable = bool(before.st_mode & 0o111)
 
     parent = target.parent
     if not parent.exists():
         parent.mkdir(parents=True)
 
     _atomic_write(target, content)
+    if file_change_callback is not None and previous != encoded:
+        _changed(file_change_callback, FileChange(
+            target.relative_to(workspace.resolve()).as_posix(),
+            previous[:512] if previous is not None else None, encoded[:512], executable,
+        ))
 
     return f"写入 {len(content)} 字符"
 
@@ -185,6 +232,8 @@ def edit_file(
     old_text: str,
     new_text: str,
     replace_all: bool = False,
+    *,
+    file_change_callback: FileChangeCallback | None = None,
 ) -> str:
     _validate_edit_file(workspace, path, old_text, new_text, replace_all)
 
@@ -192,7 +241,13 @@ def edit_file(
     content = target.read_text(encoding="utf-8")
     count = content.count(old_text)
     new_content = content.replace(old_text, new_text)
+    executable = bool(target.stat().st_mode & 0o111)
     _atomic_write(target, new_content)
+    if content != new_content:
+        _changed(file_change_callback, FileChange(
+            target.relative_to(workspace.resolve()).as_posix(),
+            content.encode("utf-8")[:512], new_content.encode("utf-8")[:512], executable,
+        ))
 
     return f"替换 {count} 处"
 
@@ -214,10 +269,23 @@ def _validate_delete_file(workspace: Path, path: str) -> None:
 def delete_file(
     workspace: Path,
     path: str,
+    *,
+    file_change_callback: FileChangeCallback | None = None,
 ) -> str:
     _validate_delete_file(workspace, path)
 
     target = _resolve_workspace_path(workspace, path)
+    head = b""
+    executable = bool(target.stat().st_mode & 0o111)
+    if file_change_callback is not None:
+        descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as source:
+            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                raise ValueError("删除目标不是普通文件")
+            head = source.read(512)
     target.unlink()
+    _changed(file_change_callback, FileChange(
+        target.relative_to(workspace.resolve()).as_posix(), head, None, executable,
+    ))
 
     return f"已删除：{path}"
