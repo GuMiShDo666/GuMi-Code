@@ -78,7 +78,6 @@ macOS / Linux:
 ```bash
 .venv/bin/gum-code \
   --workspace /path/to/project \
-  --task-type read-only \
   "Inspect this project and explain its directory structure."
 ```
 
@@ -87,15 +86,16 @@ Windows PowerShell:
 ```powershell
 .\.venv\Scripts\gum-code.exe `
   --workspace "C:\path\to\project" `
-  --task-type read-only `
   "Inspect this project and explain its directory structure."
 ```
 
 `--workspace` must point to an existing directory. Non-interactive terminals also require a task string.
 
-Use `--task-type development` for a development stage or `read-only` for questions and inspection. An interactive terminal asks for the type at the start of an undeclared stage. A non-interactive run without a declared or resumed stage type can only report an unverified outcome. Declaring a task type does not authorize commands; a read-only task that modifies files still requires verification.
+Submit your task without choosing a development or read-only mode. The deprecated `--task-type` option prints a compatibility notice but no longer changes execution.
 
-The root Agent defaults to 128 model steps per run, configurable with `--max-steps`. Implementation, self-review, and repairs share this budget. At the limit, the harness stops and reports remaining work without another model finalization request. Main-loop steps do not cap all model requests, tokens, or spending.
+The root Agent defaults to 512 model steps per run, configurable with `--max-steps`, and stops earlier on completion. Implementation, self-checks, and repairs share this budget. At the limit, the harness reports remaining work without extra model, tool, or self-check calls. Main-loop steps do not cap all requests, tokens, or spending; subagent and vision quotas remain separate.
+
+Truncated replies or unfinished Todo items trigger continuation reminders within the remaining budget. After two consecutive reminders without progress, another premature ending produces an incomplete outcome. Normal reads, edits, and text continuation can keep working. This guard cannot prove that the model covered every requirement.
 
 The request budget defaults to 80% of the resolved model context window. Use `--max-context-tokens` for a smaller positive integer budget; a value above the model window is a configuration error. A window discovered from provider metadata is used only for the current run and is not written to configuration.
 
@@ -110,27 +110,39 @@ Start Docker and prepare a trusted local image first. Gum Code does not pull or 
   --sandbox-image trusted-local-image:tag
 ```
 
-On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`. Ordinary commands require approval per call. Registered checks can receive explicit permission to repeat within the current stage, while retaining the existing safety checks.
+On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`. Ordinary commands require approval per call. Automatic self-checks run only host-selected project checks and do not authorize arbitrary model commands.
 
-## Verification and repair
+## Automatic self-checks and repair
 
-Confirm the stage scope and check list before development. The Agent runs the project's applicable build/tests, reads failures, and repairs within the remaining steps. Delivery also requires a requirements and change review. The harness reports stage completion only when required checks pass for the current code and the review has no unresolved items. Code changes invalidate previous passes. Missing checks, unavailable environments or permission, exhausted steps, and interruptions are not verification success.
+After changes to source, tests, or runtime/build configuration, the Agent calls the parameterless `self_check` tool and repairs failures within the remaining steps. If the model ends before checking, the host schedules a check within that same budget. Reading, questions, documentation-only edits, and unchanged writes do not trigger checks. You do not register a check plan or submit acceptance results.
 
-Repeat permission applies only to the current process, workspace, and stage. Ordinary code repairs can be retested; changes to commands, definitions/entry points, execution configuration, or output exclusions require approval again. In the REPL, `/revoke-verification` revokes repeat permission without deleting history; another execution requires fresh approval. Restarting, resuming, or forking does not restore permission. Only declared and approved generated directories can be excluded from input-version checks; new files and Git-ignored files are not assumed to be irrelevant outputs.
+Checks bind to current code and environment inputs. Later edits, checks that rewrite source, or uncertain inputs invalidate previous passes. Installation success, model claims, and PASS strings are not execution evidence.
 
-A one-shot development task exits with `0` after verified completion and `1` if incomplete or verification fails. A completed read-only answer still exits with `0`. A failed REPL turn leaves the conversation open for follow-up. Passing checks does not establish complete business coverage or production readiness. Bounded content scans may be blocked by workspace size, symbolic-link inputs, or concurrent changes; they are not atomic filesystem snapshots.
+Self-checks distinguish executed test cases, syntax/type/build checks, and ordinary scripts. The fixed pytest/unittest adapters require a successful non-skipped, non-expected-failure case for test-pass evidence. Zero or all-skipped cases do not count. Unknown scripts, empty scripts, and npm test returning zero prove only successful script execution. Passing basic checks can support qualified completion with function behavior explicitly unverified; successful scripts alone cannot pass self-check. Test execution does not establish assertion quality, requirement coverage, or production readiness.
 
-### Large-workspace verification scopes
+A completed one-shot task exits with `0`; incomplete work, failed/unavailable checks after code edits, and exhausted budgets return `1`. A failed REPL turn leaves the conversation open. Exhaustion does not trigger another model request, and unchanged failing checks are not rerun in an empty loop.
 
-In addition to generated `output_dirs`, verification plans can propose concrete installed-dependency directories, such as `node_modules`, through `dependency_dirs`. Exclusions require explicit scope approval; neither directory names nor `.gitignore` activate them automatically. Source, required configuration, and lockfiles remain checked. Unknown wrapper commands still need per-call execution approval even after their scan scope is approved.
+### Missing environments
 
-Excluded directories are not checked file by file, and an unchanged lockfile does not prove their contents unchanged. Resuming a Session or revoking permission requires fresh scope approval. Included inputs retain the per-scan limits of 20,000 entries, 128 MiB, and 5 seconds. Oversized source trees, symbolic links, or concurrent changes produce a diagnostic, not a verification pass.
+An available isolated environment needs no per-check prompt. Downloading a runtime or installing project dependencies requires consent after a short risk explanation; refusal, empty input, or non-interactive execution does not approve preparation. Preparation supports standard public Python/pip and Node.js/npm manifests and compatible locks, using project-specific Docker dependency volumes. Network-enabled preparation containers receive selected dependency metadata, not workspace source or user configuration. Dependency installation scripts can still execute third-party code and use the network. Checks run offline with read-only dependencies and a writable workspace. Gum Code does not install/start Docker, provision databases or cloud services, or install global host packages. Other package managers and unsupported dependencies report an unavailable environment. Preparation requires POSIX locking and safe file operations; Windows is not supported yet.
+
+Existing dirty files are not attributed to the current request. Input scans remain bounded to 20,000 entries, 128 MiB, and 5 seconds, and fail closed on unsafe or uncertain inputs. Only verified managed dependencies and known outputs are excluded; Git-ignore status alone does not exclude source.
+
+The `self_check.state` Session event stores request-local change facts. Resume/fork clears current passing evidence and preparation permission; old `task.state` entries remain historical. Older binaries may reject new fields or events. Preserve original logs and use a compatible or new Session when downgrading.
 
 ### Build logs
 
 `run_command` keeps draining stdout/stderr; exceeding the preview or saved-log budget alone does not stop a command. Bounded head/tail buffers are kept in memory, then private logs are saved on completion when possible: at most 5 MiB per file and 100 MiB per workspace for new command logs. Only the oldest completed logs owned by this mechanism are reclaimed; other tool artifacts are untouched. Temporary containers use `--log-driver=none` to avoid a second Docker container log.
 
 The model can page through retained content with `read_tool_output`. Omitted middle output cannot be recovered, and old references may become unavailable after cleanup. The `complete` pagination field means the saved file has been read, not that the original output is complete. Ordinary write, quota, or lock failures allow execution to continue with an explicit unsaved-log status; path and sandbox safety failures still reject execution. A genuine zero exit with unchanged inputs is not failed solely for truncated or unsaved logs, while timeouts and pipe read errors cannot pass. The terminal still does not stream log bodies.
+
+### File, search, and Git pagination
+
+Long listings, searches, UTF-8 file reads, and Git status/diffs retain bounded snapshots. The model uses `read_tool_output` on demand, including for long single lines; you do not page results by hand. A full audit requires reading the relevant scope or stating the coverage gap.
+
+Results distinguish reaching the saved snapshot's end (`complete`), capturing the requested scope (`scope_complete`), and remaining file lines. `read_file` defaults to 200 lines, up to 400; subsequent line windows carry the source version to prevent mixing changed files. Git status/diff accept a workspace-relative path to narrow the scope.
+
+Responses stay within 20,000 characters and snapshots within 5 MiB. Directory scans allow 10,000 entries, 64 levels, and 10 seconds. Text source-version scans allow 32 MiB and 10 seconds; search/Git capture also has byte and time limits. Limits, save failures, and source changes produce explicit gaps. Reading snapshots have no workspace-wide automatic eviction quota; child snapshots expire with the child's temporary directory.
 
 ## PDFs, DOCX files, and images
 
@@ -156,7 +168,7 @@ New Sessions use private append-only v3 JSONL event logs with the existing 5 MiB
 
 Verification plans and historical outcomes use a separate `task.state` event; `turn.completed` remains a conversation boundary. The new reader accepts older logs without verification state and treats them as unverified. Older releases cannot read logs containing `task.state`. Preserve those logs when downgrading and use an older readable Session or a new one; do not delete historical events to force compatibility.
 
-Within one model step, adjacent executions of the same tool produce one terminal progress line while every call, result, and Session event remains distinct.
+The terminal switches one line between `思考中...`, `正在读取...`, and `正在修改文件...`, without tool names or accumulated status lines. Calls, results, and Session events remain distinct.
 
 Adjacent `task` calls in one model step form a parallel group. Non-`task` tools are serial barriers, and the parent waits for the whole group before committing results in the original Tool Call order. A root run starts at most four Subagents. They share the current OpenAI-compatible client, so an injected client must support concurrent `chat.completions.create()` calls. `Ctrl+C` cooperatively cancels later work but cannot forcibly stop a synchronous HTTP request already in progress.
 
@@ -168,7 +180,7 @@ Adjacent `task` calls in one model step form a parallel group. Non-`task` tools 
 | Model protocol | Calls OpenAI-compatible Chat Completions with `tool_calls`, using a generic local estimate calibrated by valid provider `usage` values for token budgeting. | Only text messages and tool definitions are counted. A manual model window is required when a third-party gateway does not expose one. |
 | Files and Git | Lists, reads, searches, writes, and edits files, and reads Git status and diffs. | File tools stay inside the workspace. Deletion requires approval. Path, symlink, sensitive filename, and size rules apply. |
 | Command execution | Runs one argv command in a network-disabled Docker container after explicit enablement. | `run_command` is disabled by default. Ordinary commands need per-call approval; fixed checks can receive explicit stage-scoped repeat permission. The container can modify the workspace and cannot protect against malicious images, a compromised Docker daemon, or runtime vulnerabilities. |
-| Verification | Combines real command outcomes, input versions, and self-review before stage completion, with repairs and reruns within the remaining steps. | Depends on the confirmed scope, check list, and execution environment. It does not guarantee that the model can repair every error or cover every business requirement. |
+| Self-checks | Runs project checks after actual code changes, binds evidence to current inputs, and repairs/reruns within the remaining steps. | Requires an available isolated environment and distinguishes tests from basic checks. It cannot guarantee repair of every error or full business coverage. |
 | Context | Bounds tool results, performs structured compaction, supports manual compaction, and retries once after a context-length error. The terminal reports only the percentage of the configured context limit. | Compaction state belongs to the current Session. Gum Code does not provide cross-Session long-term memory. |
 | Sessions | Stores interactive history in v3 JSONL event logs and supports structural audit, completed-turn forks, listing, renaming, resuming, and safe interrupted-batch closure. | Each file is capped at 5 MiB. Start or fork a Session at the limit. Inspect current state when an in-flight tool may have produced side effects; the harness does not replay it. |
 | Skills | Reuses the top-level Codex user Skill library through explicit sticky activation and progressive root-Agent reads. | `.system`, plugin, and project Skills are excluded. Scripts never execute, and Subagents receive no Skills. |

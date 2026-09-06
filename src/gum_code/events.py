@@ -207,6 +207,16 @@ def task_outcome_text(payload: dict[str, object]) -> str | None:
         return None
     if payload.get("status") == "interrupted":
         return "本轮已中断，已发生的改动未回滚。"
+    coverage = payload.get("coverage")
+    if check_status == "passed" and "coverage" in payload:
+        labels = {
+            "tests": "实际执行的测试已通过；仅代表此次检查范围。",
+            "basic": "基础检查已通过；功能测试未验证。",
+            "none": "自检未取得足够验证证据，已保留本轮结果。",
+        }
+        return labels.get(coverage, "当前自检覆盖范围未确认，不能报告通过。") if isinstance(coverage, str) else "当前自检覆盖范围未确认，不能报告通过。"
+    if check_status == "not_run" and "coverage" in payload:
+        return "自检未取得足够验证证据，已保留本轮结果。"
     return {
         "not_needed": "本轮无代码变化，无需自检。",
         "passed": "所运行的自检已通过；具体覆盖范围见结果。",

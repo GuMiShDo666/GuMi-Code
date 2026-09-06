@@ -1,19 +1,26 @@
+import codecs
+import hashlib
+import io
 import os
+import re
 import stat
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from gum_code.tools.common import (
-    MAX_OUTPUT_CHARS,
+    MAX_READING_SCAN_ENTRIES,
+    MAX_READING_SOURCE_BYTES,
+    READING_TIMEOUT_SECONDS,
     SKIP_NAMES,
     _is_sensitive_name,
     _is_sensitive_path,
     _reject_symlinks,
     _resolve_workspace_path,
-    _truncate_output,
 )
+from gum_code.tools.artifacts import MAX_READING_BODY_BYTES, ReadingBuffer, reading_result
 
 MAX_FILE_CONTENT_CHARS = 200_000
 
@@ -40,7 +47,7 @@ def _changed(callback: FileChangeCallback | None, change: FileChange) -> None:
             raise RuntimeError("文件变更记录失败；已发生的写入未回滚") from None
 
 
-def list_files(workspace: Path, path: str = ".") -> str:
+def list_files(workspace: Path, path: str = ".", *, artifact_workspace: Path | None = None) -> str:
     root = workspace.resolve()
     target = _resolve_workspace_path(workspace, path)
 
@@ -50,28 +57,37 @@ def list_files(workspace: Path, path: str = ".") -> str:
     if not target.is_dir():
         raise ValueError(f"路径不是目录：{path!r}")
 
-    entries = []
-    for item in target.iterdir():
-        if item.name in SKIP_NAMES or _is_sensitive_name(item.name):
-            continue
-        resolved = item.resolve()
-        try:
-            rel = resolved.relative_to(root)
-        except ValueError:
-            continue
-        if _is_sensitive_path(rel):
-            continue
-        if item.is_dir():
-            entries.append(f"[DIR] {item.name}")
-        else:
-            entries.append(f"[FILE] {item.name}")
-
+    entries: list[str] = []
+    size = 0
+    gap = None
+    deadline = time.monotonic() + READING_TIMEOUT_SECONDS
+    with os.scandir(target) as iterator:
+        for count, entry in enumerate(iterator, 1):
+            if count > MAX_READING_SCAN_ENTRIES:
+                gap = "scan_limit"
+                break
+            if time.monotonic() >= deadline:
+                gap = "timeout"
+                break
+            if entry.name in SKIP_NAMES or _is_sensitive_name(entry.name):
+                continue
+            item = Path(entry.path)
+            try:
+                rel = item.resolve().relative_to(root)
+            except ValueError:
+                continue
+            if _is_sensitive_path(rel):
+                continue
+            text = f"[{'DIR' if entry.is_dir() else 'FILE'}] {entry.name}"
+            size += len(text.encode("utf-8")) + 1
+            entries.append(text)
+            if size > MAX_READING_BODY_BYTES:
+                gap = "capture_limit"
+                break
     entries.sort()
-
-    if len(entries) > 200:
-        entries = entries[:200]
-
-    return "\n".join(entries)
+    return reading_result(artifact_workspace or workspace, "list_files", {"path": target.relative_to(root).as_posix()},
+                          "\n".join(entries), max_items=200, gap_reason=gap,
+                          total_items=len(entries))
 
 
 def read_file(
@@ -79,12 +95,20 @@ def read_file(
     path: str,
     start_line: int = 1,
     max_lines: int = 200,
+    expected_source_version: str | None = None,
+    *,
+    artifact_workspace: Path | None = None,
 ) -> str:
-    if start_line < 1:
+    if type(start_line) is not int or start_line < 1:
         raise ValueError("start_line 必须 >= 1")
 
-    if not 1 <= max_lines <= 400:
+    if type(max_lines) is not int or not 1 <= max_lines <= 400:
         raise ValueError("max_lines 必须在 1 到 400 之间")
+    if expected_source_version is not None and (
+        not isinstance(expected_source_version, str)
+        or re.fullmatch(r"[0-9a-f]{64}", expected_source_version) is None
+    ):
+        raise ValueError("expected_source_version 必须是 SHA-256")
 
     target = _resolve_workspace_path(workspace, path)
 
@@ -94,19 +118,66 @@ def read_file(
     if not target.is_file():
         raise ValueError(f"路径不是普通文件：{path!r}")
 
-    lines = []
-    with target.open("r", encoding="utf-8") as f:
-        for line_number, line in enumerate(f, start=1):
-            if line_number < start_line:
-                continue
-            stripped = line.rstrip("\n")
-            lines.append(f"{line_number} | {stripped}")
-            if len(lines) >= max_lines:
+    arguments = {"path": target.relative_to(workspace.resolve()).as_posix(),
+                 "start_line": start_line, "max_lines": max_lines}
+    destination = artifact_workspace or workspace
+
+    def unavailable(reason: str) -> str:
+        return reading_result(destination, "read_file", arguments, "", gap_reason=reason)
+
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    deadline = time.monotonic() + READING_TIMEOUT_SECONDS
+    digest = hashlib.sha256()
+    decoder = io.IncrementalNewlineDecoder(codecs.getincrementaldecoder("utf-8")(), translate=True)
+    output = ReadingBuffer()
+    line_number, line_started, selected_lines, read_bytes = 1, False, 0, 0
+    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("读取目标不是普通文件")
+        if before.st_size > MAX_READING_SOURCE_BYTES:
+            return unavailable("source_limit")
+        while True:
+            if time.monotonic() >= deadline:
+                return unavailable("timeout")
+            chunk = stream.read(min(8192, MAX_READING_SOURCE_BYTES - read_bytes + 1))
+            read_bytes += len(chunk)
+            if read_bytes > MAX_READING_SOURCE_BYTES:
+                return unavailable("source_limit")
+            digest.update(chunk)
+            parts = decoder.decode(chunk, final=not chunk).split("\n")
+            for index, part in enumerate(parts):
+                ended = index < len(parts) - 1
+                if not part and not ended:
+                    continue
+                if start_line <= line_number < start_line + max_lines:
+                    if not line_started:
+                        output.add(("\n" if selected_lines else "") + f"{line_number} | ")
+                        selected_lines += 1
+                    output.add(part)
+                line_started = True
+                if ended:
+                    line_number += 1
+                    line_started = False
+            if not chunk:
                 break
-
-    output = "\n".join(lines)
-
-    return _truncate_output(output, MAX_OUTPUT_CHARS)
+        after = os.fstat(stream.fileno())
+    try:
+        current = target.stat()
+    except OSError:
+        return unavailable("source_changed")
+    if identity(before) != identity(after) or identity(before) != identity(current):
+        return unavailable("source_changed")
+    source_version = digest.hexdigest()
+    if expected_source_version is not None and expected_source_version != source_version:
+        return unavailable("source_changed")
+    total_lines = line_number - 1 + int(line_started)
+    has_more = total_lines >= start_line + max_lines
+    return reading_result(destination, "read_file", arguments, output.text(),
+                          gap_reason="capture_limit" if output.truncated else None,
+                          source_version=source_version, file_has_more=has_more,
+                          next_start_line=start_line + max_lines if has_more else None)
 
 
 def _atomic_write(target: Path, content: str) -> None:

@@ -13,7 +13,7 @@ from gum_code.permissions import (
     decide_permission,
 )
 from gum_code.permissions.policy import ToolRisk
-from gum_code.tools.artifacts import read_tool_output
+from gum_code.tools.artifacts import READING_TOOL_NAMES, read_tool_output
 from gum_code.tools.command import (
     CommandExecutionResult,
     CommandResultCallback,
@@ -158,6 +158,10 @@ READ_FILE_SCHEMA = {
                     "minimum": 1,
                     "maximum": 400,
                     "default": 200,
+                },
+                "expected_source_version": {
+                    "type": "string", "pattern": "^[0-9a-f]{64}$",
+                    "description": "Exact source_version from the previous line window; reject changed files.",
                 },
             },
             "required": ["path"],
@@ -310,7 +314,10 @@ GIT_STATUS_SCHEMA = {
         "description": "Show the git working tree status.",
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "path": {"type": "string", "default": ".",
+                         "description": "Literal workspace-relative file or directory scope."},
+            },
             "additionalProperties": False,
         },
     },
@@ -328,6 +335,8 @@ GIT_DIFF_SCHEMA = {
                     "type": "boolean",
                     "description": "Show staged (cached) changes instead of unstaged.",
                 },
+                "path": {"type": "string", "default": ".",
+                         "description": "Literal workspace-relative file or directory scope; deleted paths allowed."},
             },
             "additionalProperties": False,
         },
@@ -535,6 +544,25 @@ ALL_TOOL_SCHEMAS: dict[str, dict] = {
     "self_check": SELF_CHECK_SCHEMA,
 }
 
+for _reading_name in READING_TOOL_NAMES:
+    ALL_TOOL_SCHEMAS[_reading_name]["function"]["description"] += (
+        " Returns <reading-output>: follow exact next via read_tool_output when needed. "
+        "complete is retained-result EOF; scope_complete describes capture, not full-file review. "
+        "Limits or unavailable storage are explicit gaps."
+    )
+READ_FILE_SCHEMA["function"]["description"] += (
+    " file_has_more/next_start_line describe unread later lines; carry source_version "
+    "as expected_source_version for the next window after finishing this page sequence."
+)
+for _reading_schema in (FIND_FILES_SCHEMA, SEARCH_TEXT_SCHEMA):
+    _reading_schema["function"]["parameters"]["properties"]["max_results"]["description"] = (
+        "Maximum first-page items; later retained output is available through exact next."
+    )
+READ_TOOL_OUTPUT_SCHEMA["function"]["description"] += (
+    " Native reading snapshots return <reading-output> with original scope/version and gaps. "
+    "A new query is not a continuation of an old snapshot."
+)
+
 ALL_TOOL_HANDLERS: dict[str, Callable[..., str]] = {
     "list_files": list_files,
     "read_file": read_file,
@@ -613,6 +641,7 @@ def execute_tool(
     cancel_event: Event | None = None,
     self_check_runtime: "SelfCheckRuntime | None" = None,
     file_change_callback: Callable | None = None,
+    artifact_workspace: Path | None = None,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
@@ -629,6 +658,11 @@ def execute_tool(
 
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
+
+    if tool_name in READING_TOOL_NAMES | {"read_tool_output"} and arguments.keys() - (
+        ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
+    ):
+        return "Error: Invalid tool arguments"
 
     if tool_name == "self_check" and arguments:
         return "Error: self_check requires an empty JSON object"
@@ -746,6 +780,8 @@ def execute_tool(
             result = handler(workspace=workspace, **arguments, **document_kwargs)
         elif tool_name in {"write_file", "edit_file", "delete_file"} and file_change_callback is not None:
             result = handler(workspace=workspace, **arguments, file_change_callback=file_change_callback)
+        elif tool_name in READING_TOOL_NAMES | {"read_tool_output"} and artifact_workspace is not None:
+            result = handler(workspace=workspace, **arguments, artifact_workspace=artifact_workspace)
         else:
             result = handler(workspace=workspace, **arguments)
     except (UnicodeDecodeError, TypeError, ValueError, OSError) as exc:

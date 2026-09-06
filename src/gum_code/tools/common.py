@@ -39,6 +39,35 @@ SAFE_ENV_TEMPLATE_NAMES = {
 }
 
 MAX_OUTPUT_CHARS = 20_000
+MAX_READING_SCAN_ENTRIES = 10_000
+MAX_READING_DEPTH = 64
+READING_TIMEOUT_SECONDS = 10
+MAX_READING_CAPTURE_BYTES = 5 * 1024 * 1024
+MAX_READING_SOURCE_BYTES = 32 * 1024 * 1024
+
+
+class _BytePrefix:
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.data = bytearray()
+        self.total_bytes = 0
+
+    def add(self, chunk: bytes, *, final: bool = False) -> None:
+        self.total_bytes += len(chunk)
+        self.data.extend(chunk[:max(0, self.limit - len(self.data))])
+
+
+class ReadingCapture:
+    """Raw bounded stdout for strict parsing; stderr is drained without retention."""
+
+    def __init__(self) -> None:
+        self.stdout = _BytePrefix(MAX_READING_CAPTURE_BYTES + 1)
+        self.stderr = _BytePrefix(0)
+
+    def text(self) -> str | None:
+        if self.stdout.total_bytes > MAX_READING_CAPTURE_BYTES:
+            return None
+        return self.stdout.data.decode("utf-8")
 
 
 def _resolve_workspace_path(

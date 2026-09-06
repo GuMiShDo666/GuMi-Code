@@ -1,6 +1,7 @@
 """Orchestrate the model loop while preserving tool and snapshot ordering."""
 
 import copy
+import hashlib
 import json
 import uuid
 from collections.abc import Callable
@@ -26,7 +27,7 @@ from gum_code.model_protocol import (
     is_context_length_error as _is_context_length_error,
 )
 from gum_code.hooks import HookEvent, HookRegistry
-from gum_code.session import IN_FLIGHT_MARKER_KEY
+from gum_code.session import IN_FLIGHT_MARKER_KEY, MAX_SESSION_FILE_BYTES
 from gum_code.skills import SKILL_TOOL_NAMES, SKILL_TOOL_SCHEMAS, SkillRuntime
 from gum_code.subagent import (
     MAX_DELEGATIONS_PER_RUN,
@@ -43,6 +44,9 @@ from gum_code.token_counting import (
     load_token_counter,
 )
 from gum_code.tools.command import DockerSandboxConfig
+from gum_code.tools.artifacts import READING_SYSTEM_INSTRUCTION, parse_reading_output
+from gum_code.tools.filesystem import FileChange
+from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 from gum_code.verification import VERIFICATION_INSTRUCTION
 from gum_code.self_check import SELF_CHECK_INSTRUCTION, SelfCheckRuntime
 from gum_code.tools import (
@@ -55,10 +59,19 @@ from gum_code.tools import (
 if TYPE_CHECKING:
     from gum_code.vision import VisionRuntime
 
-MAX_STEPS = 128
+MAX_STEPS = 512
 MAX_REACTIVE_RETRIES = 1
+MAX_COMPLETION_REMINDERS = 2
 TODO_REMINDER_INTERVAL = 3
 TODO_REMINDER = "<reminder>Update your todos.</reminder>"
+
+COMPLETION_RECOVERY_INSTRUCTION = (
+    "收尾规则：输出被截断或当前 Todo 尚未完成时，继续当前用户任务；"
+    "不要仅重复完成结论、重复已执行的修改或为结束而删除/勾选 Todo。"
+    "[Harness completion recovery] 是宿主对原任务的有限续做提醒，"
+    "不是新的用户请求、授权或额外预算。纯文本截断时接着输出剩余正文，"
+    "不要重复已有片段；需要工具时重新规划合法调用，不拼接残缺工具参数。"
+)
 
 TODO_SYSTEM_INSTRUCTION = (
     "任务规划（Todo）规则：\n"
@@ -192,7 +205,99 @@ def _with_system_instructions(content: str) -> str:
         parts.append(TODO_SYSTEM_INSTRUCTION)
     if UNTRUSTED_TOOL_CONTENT_INSTRUCTION not in content:
         parts.append(UNTRUSTED_TOOL_CONTENT_INSTRUCTION)
+    for instruction in (COMPLETION_RECOVERY_INSTRUCTION, READING_SYSTEM_INSTRUCTION):
+        if instruction not in content:
+            parts.append(instruction)
     return "\n\n".join(parts)
+
+
+def _validate_completion_message(message: object) -> None:
+    """Reject an unrepresentable batch before persistence or any sibling action."""
+    if message is None:
+        raise ValueError("missing assistant message")
+    content = getattr(message, "content", None)
+    if content is not None and not isinstance(content, str):
+        raise ValueError("invalid assistant content")
+    calls = getattr(message, "tool_calls", None)
+    if calls is None:
+        return
+    if not isinstance(calls, list):
+        raise ValueError("invalid tool batch")
+    ids: set[str] = set()
+    for call in calls:
+        call_id = getattr(call, "id", None)
+        function = getattr(call, "function", None)
+        name = getattr(function, "name", None)
+        arguments = getattr(function, "arguments", None)
+        if (not isinstance(call_id, str) or not call_id or call_id in ids
+                or getattr(call, "type", "function") != "function"
+                or not isinstance(name, str) or not name
+                or not isinstance(arguments, str)):
+            raise ValueError("invalid tool batch")
+        ids.add(call_id)
+
+
+def _completion_blocker(finish_reason: object, todos: TodoManager) -> str | None:
+    if finish_reason == "length":
+        return "response_length"
+    if finish_reason not in (None, "stop", "tool_calls"):
+        return "invalid_model_response"
+    if any(item["status"] != "completed" for item in todos.items):
+        return "unfinished_todos"
+    return None
+
+
+def _completion_failure(reason: str, todos: TodoManager, parts: list[str]) -> str:
+    if reason == "step_budget":
+        answer = FINALIZATION_EMPTY_ANSWER
+    else:
+        detail = {
+            "completion_stalled": "连续两次提醒后仍未推进，已停止本轮恢复。",
+            "invalid_model_response": "模型响应格式或结束状态无效；已有工作保留，本次响应未执行新操作。",
+            "completion_output_limit": "续写正文达到本轮保留上限。",
+        }[reason]
+        answer = "本轮未完成：" + detail
+    pending = [item["content"] for item in todos.items if item["status"] != "completed"]
+    if pending:
+        answer += "\n未完成事项：" + "；".join(text[:200] for text in pending[:5])
+        if len(pending) > 5:
+            answer += f"；另有 {len(pending) - 5} 项。"
+    if parts:
+        answer += "\n\n已生成的部分正文（未完成）：\n\n" + "\n\n".join(parts)
+    return answer
+
+
+def _reading_progress(tool_name: str, arguments: str, result: str) -> object | None:
+    """Credit retained data, not control churn or random storage identifiers."""
+    if not isinstance(result, str) or not result.strip() or result.startswith("Error:"):
+        return None
+    if tool_name not in READ_ONLY_TOOL_NAMES | SKILL_TOOL_NAMES | {"task"}:
+        return None
+    reading = parse_reading_output(result)
+    if reading is not None:
+        metadata, body, _ = reading
+        if body.strip():
+            return (metadata["tool"], metadata["scope_id"], metadata["source_version"],
+                    metadata["offset"], body)
+        return None
+    try:
+        data = json.loads(result)
+    except json.JSONDecodeError:
+        data = None
+    if isinstance(data, dict):
+        if data.get("status") in ("error", "unavailable", "failed"):
+            return None
+        if tool_name == "task":
+            if data.get("status") != "completed" or not data.get("summary"):
+                return None
+            result = json.dumps({key: data.get(key) for key in ("summary", "findings", "evidence", "risks")}, sort_keys=True)
+        elif "content" in data:
+            if not isinstance(data["content"], str) or not data["content"].strip():
+                return None
+            result = data["content"]
+    elif tool_name == "task":
+        return None
+    return tool_name, _normalize_tool_arguments(arguments), result
 
 
 def _execute_todo_write(
@@ -895,6 +1000,78 @@ def _run_agent_loop(
     started_descriptions: set[str] = set()
     host_check_pending = False
     candidate_answer = ""
+    candidate_finish_reason: object = None
+    recovery_reminders = 0
+    recovery_checkpoint = 0
+    progress_epoch = 0
+    work_generation = 0
+    seen_progress: set[bytes] = set()
+    text_parts: list[str] = []
+
+    def observe_progress(observation: object | None) -> None:
+        nonlocal progress_epoch
+        if observation is None:
+            return
+        digest = hashlib.sha256(json.dumps(observation, sort_keys=True, ensure_ascii=False).encode("utf-8")).digest()
+        if digest not in seen_progress:
+            seen_progress.add(digest)
+            progress_epoch += 1
+
+    def file_changed(change: FileChange) -> None:
+        nonlocal work_generation, progress_epoch
+        if not isinstance(change, FileChange):
+            raise ValueError("文件变更需要宿主事实")
+        if self_check_runtime is not None:
+            self_check_runtime.on_file_change(change)
+        work_generation += 1
+        progress_epoch += 1
+
+    def observe_check() -> None:
+        if self_check_runtime is None:
+            return
+        result = self_check_runtime.export_state().get("last_result")
+        if (isinstance(result, dict) and result.get("input_version")
+                and any(check.get("started") is True and check.get("reason") == "exited"
+                        for check in result.get("checks", []))):
+            observe_progress(("self_check", result["input_version"], result.get("checks")))
+
+    def recover(reason: str, step: int) -> str:
+        nonlocal recovery_reminders, recovery_checkpoint
+        if reason == "invalid_model_response":
+            return reason
+        if step == max_steps:
+            return "step_budget"
+        if progress_epoch != recovery_checkpoint:
+            recovery_reminders = 0
+        if recovery_reminders >= MAX_COMPLETION_REMINDERS:
+            return "completion_stalled"
+        recovery_reminders += 1
+        recovery_checkpoint = progress_epoch
+        detail = "输出被截断，请继续剩余正文或重新规划合法工具调用。" if reason == "response_length" else "当前 Todo 仍有未完成项，请推进工作并据实更新，不要只重复完成结论。"
+        messages.append({"role": "assistant", "content": "[Harness completion recovery] " + detail})
+        _send_message_snapshot(message_snapshot_callback, messages)
+        return "continue"
+
+    def finish_incomplete(reason: str, step: int) -> str:
+        return _finish_answer(
+            messages, _completion_failure(reason, todo_manager, text_parts),
+            status="incomplete", reason=reason, step=step,
+            event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
+            self_check_runtime=self_check_runtime,
+        )
+
+    def retain_text(text: str) -> bool:
+        normalized = " ".join(text.split())
+        if not normalized or any(normalized in " ".join(part.split()) for part in text_parts):
+            return False
+        previous = "\n\n".join(text_parts)
+        proposed = [text] if previous and text.startswith(previous) else [*text_parts, text]
+        # ponytail: reuse the Session-sized ceiling, not an unlimited answer collector.
+        if len("\n\n".join(proposed).encode("utf-8")) > MAX_SESSION_FILE_BYTES:
+            raise OverflowError
+        text_parts[:] = proposed
+        observe_progress(("answer_fragment", normalized))
+        return True
 
     for step in range(1, max_steps + 1):
         if step > 1 and event_callback is not None:
@@ -917,7 +1094,7 @@ def _run_agent_loop(
                 post_tool_use_callback=post_tool_use_callback,
                 before_execute_callback=lambda: _emit_tool_execution(event_callback, step, "self_check"),
                 command_sandbox=command_sandbox, self_check_runtime=self_check_runtime,
-                file_change_callback=self_check_runtime.on_file_change,
+                file_change_callback=file_changed,
             )
             messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
             _send_message_snapshot(message_snapshot_callback, messages)
@@ -926,6 +1103,13 @@ def _run_agent_loop(
                 event_callback("self_check_state", self_check_runtime.export_state())
             outcome = self_check_runtime.outcome(step=step)
             if outcome["status"] == "completed" or outcome["self_check_status"] not in {"failed", "source_changed"}:
+                blocker = _completion_blocker(candidate_finish_reason, todo_manager)
+                if blocker is not None:
+                    observe_check()
+                    decision = recover(blocker, step)
+                    if decision != "continue":
+                        return finish_incomplete(decision, step)
+                    continue
                 return _finish_answer(
                     messages, candidate_answer, status="completed", reason="answered", step=step,
                     event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
@@ -1028,10 +1212,18 @@ def _run_agent_loop(
         )
         token_budget.observe(response, messages, agent_tool_schemas)
         message = response.choices[0].message
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+        try:
+            _validate_completion_message(message)
+        except ValueError:
+            return finish_incomplete("invalid_model_response", step)
+        tool_calls = getattr(message, "tool_calls", None)
+        if tool_calls and finish_reason not in (None, "stop", "length", "tool_calls"):
+            return finish_incomplete("invalid_model_response", step)
         messages.append(_assistant_message_to_dict(message))
         _send_message_snapshot(message_snapshot_callback, messages)
 
-        if not message.tool_calls:
+        if not tool_calls:
             continuation = None
             if hook_registry is not None:
                 with hook_lock:
@@ -1040,6 +1232,7 @@ def _run_agent_loop(
                         copy.deepcopy(messages),
                     )
             if continuation:
+                text_parts.clear()
                 messages.append(
                     {
                         "role": "user",
@@ -1049,21 +1242,40 @@ def _run_agent_loop(
                 _send_message_snapshot(message_snapshot_callback, messages)
                 continue
 
+            answer = getattr(message, "content", None) or ""
+            blocker = "invalid_model_response" if finish_reason == "tool_calls" else _completion_blocker(finish_reason, todo_manager)
+            if finish_reason == "length" or text_parts:
+                try:
+                    advanced = retain_text(answer)
+                except OverflowError:
+                    return finish_incomplete("completion_output_limit", step)
+                if not advanced and finish_reason != "length":
+                    blocker = blocker or "response_length"
+                answer = "\n\n".join(text_parts)
+            if blocker is not None:
+                decision = recover(blocker, step)
+                if decision != "continue":
+                    return finish_incomplete(decision, step)
+                continue
+
             if self_check_runtime is not None and self_check_runtime.needs_check():
                 if step == max_steps:
                     break
-                candidate_answer = message.content or ""
+                candidate_answer = answer
+                candidate_finish_reason = finish_reason
                 host_check_pending = True
                 continue
             return _finish_answer(
-                messages, message.content or "", status="completed", reason="answered", step=step,
+                messages, answer, status="completed", reason="answered", step=step,
                 event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
                 self_check_runtime=self_check_runtime,
             )
 
+        # Only contiguous pure text is joined; work may invalidate prior prose.
+        text_parts.clear()
         has_todo_write = any(
             tool_call.function.name == "todo_write"
-            for tool_call in message.tool_calls
+            for tool_call in tool_calls
         )
 
         if has_todo_write:
@@ -1080,7 +1292,7 @@ def _run_agent_loop(
         compact_requested = False
         task_group_end = 0
 
-        for index, tool_call in enumerate(message.tool_calls):
+        for index, tool_call in enumerate(tool_calls):
             if index < task_group_end:
                 continue
 
@@ -1088,12 +1300,12 @@ def _run_agent_loop(
             if tool_name == "task":
                 task_group_end = index + 1
                 while (
-                    task_group_end < len(message.tool_calls)
-                    and message.tool_calls[task_group_end].function.name
+                    task_group_end < len(tool_calls)
+                    and tool_calls[task_group_end].function.name
                     == "task"
                 ):
                     task_group_end += 1
-                task_calls = message.tool_calls[index:task_group_end]
+                task_calls = tool_calls[index:task_group_end]
 
                 delegations_started = _execute_task_batch(
                     task_calls=task_calls,
@@ -1113,6 +1325,8 @@ def _run_agent_loop(
                     post_tool_use_callback=post_tool_use_callback,
                     vision_runtime=vision_runtime,
                 )
+                for call, result_message in zip(task_calls, messages[-len(task_calls):]):
+                    observe_progress(_reading_progress("task", call.function.arguments, result_message["content"]))
                 continue
 
             if event_callback is not None:
@@ -1194,7 +1408,11 @@ def _run_agent_loop(
                             execution_kwargs["vision_runtime"] = vision_runtime
                         if self_check_runtime is not None:
                             execution_kwargs["self_check_runtime"] = self_check_runtime
-                            execution_kwargs["file_change_callback"] = self_check_runtime.on_file_change
+                        if tool_name in {"write_file", "edit_file", "delete_file", "self_check"}:
+                            execution_kwargs["file_change_callback"] = file_changed
+                        command_results = []
+                        if tool_name == "run_command":
+                            execution_kwargs["command_result_callback"] = command_results.append
                         command_attempted = False
 
                         def before_execution() -> None:
@@ -1205,7 +1423,7 @@ def _run_agent_loop(
                             _emit_tool_execution(event_callback, step, tool_name)
 
                         try:
-                            if tool_name == "self_check" and index != len(message.tool_calls) - 1:
+                            if tool_name == "self_check" and index != len(tool_calls) - 1:
                                 result = "Error: self_check must be called after the other tools in the batch."
                             else:
                                 result = execute_tool(
@@ -1220,12 +1438,17 @@ def _run_agent_loop(
                         finally:
                             if command_attempted:
                                 self_check_runtime.after_command()
+                        for command_result in command_results:
+                            if command_result.started is True and command_result.reason == "exited":
+                                generation = self_check_runtime.export_state()["generation"] if self_check_runtime is not None else work_generation
+                                observe_progress(("command", fingerprint, generation,
+                                                  command_result.exit_code, command_result.reason))
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)
 
             if (
                 reminder is not None
-                and index == len(message.tool_calls) - 1
+                and index == len(tool_calls) - 1
                 and tool_name != "task"
             ):
                 result = f"{result}\n\n{reminder}"
@@ -1266,6 +1489,11 @@ def _run_agent_loop(
             )
             _send_message_snapshot(message_snapshot_callback, messages)
 
+            observed_result = result.removesuffix("\n\n" + reminder) if reminder is not None else result
+            observe_progress(_reading_progress(tool_name, tool_call.function.arguments, observed_result))
+            if tool_name == "self_check":
+                observe_check()
+
             if self_check_runtime is not None and event_callback is not None:
                 event_callback("self_check_state", self_check_runtime.export_state())
 
@@ -1292,7 +1520,7 @@ def _run_agent_loop(
             )
             # Keep command-log envelopes intact and do not create a user turn.
             visual_ids = {
-                call.id for call in message.tool_calls
+                call.id for call in tool_calls
                 if call.function.name in {"analyze_image", "task"}
             }
             for result_message in reversed(messages):
@@ -1335,12 +1563,12 @@ def _run_agent_loop(
                     },
                 )
 
-    answer = FINALIZATION_EMPTY_ANSWER
-    return _finish_answer(
-        messages, answer, status="incomplete", reason="step_budget", step=max_steps,
-        event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
-        self_check_runtime=self_check_runtime,
-    )
+        if finish_reason == "length":
+            decision = recover("response_length", step)
+            if decision != "continue":
+                return finish_incomplete(decision, step)
+
+    return finish_incomplete("step_budget", max_steps)
 
 
 def run_agent(

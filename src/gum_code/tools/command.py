@@ -24,6 +24,7 @@ from gum_code.tools.command_logs import (
     publish_command_log,
 )
 from gum_code.tools.common import (
+    ReadingCapture,
     _is_sensitive_path,
     _reject_symlinks,
     _resolve_workspace_path,
@@ -633,7 +634,7 @@ def _read_pipe(
 def _communicate_bounded(
     process: subprocess.Popen[bytes],
     timeout_seconds: int,
-    captured: CommandCapture,
+    captured: CommandCapture | ReadingCapture,
     *,
     cancel_event: threading.Event | None = None,
 ) -> None:
