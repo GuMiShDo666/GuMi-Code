@@ -43,7 +43,6 @@ from gum_code.events import (
     RichEventRenderer,
     context_percentage,
     create_console,
-    deduplicate_tool_execution,
     environment_cleanup_text,
     task_outcome_text,
 )
@@ -366,8 +365,12 @@ def _configuration_wizard(
 
         while True:
             try:
-                with console.status("正在验证 provider…"):
+                renderer = RichEventRenderer(console)
+                try:
+                    renderer("model_call", {})
                     validate_provider_settings(settings)
+                finally:
+                    renderer.close()
                 save_user_settings(target, settings)
                 return settings
             except (KeyboardInterrupt, EOFError):
@@ -1019,8 +1022,11 @@ class InteractiveRuntime:
         self.verification_runtime = None
         assert self.session_path is not None and self.lease is not None
         self.self_check_runtime.set_internal_paths((self.session_path, self.lease.lock_path))
+        renderer = RichEventRenderer(self.console, verbose=self.verbose)
         self.self_check_runtime.approval_callback = (
-            lambda summary: request_environment_preparation(summary, console=self.console, interactive=True)
+            renderer.paused(lambda summary: request_environment_preparation(
+                summary, console=self.console, interactive=True,
+            ))
         ) if bool(getattr(self.args, "interactive_terminal", False)) else None
         self.last_task_outcome = None
 
@@ -1042,16 +1048,13 @@ class InteractiveRuntime:
                         self.vision_runtime.bind_source(saved.source_event_seq)
                     self.self_check_runtime.bind_source(saved.source_event_seq)
 
-        renderer = RichEventRenderer(self.console, verbose=self.verbose)
-        render_event = deduplicate_tool_execution(renderer)
-
         def event_callback(event_type: str, payload: dict[str, object]) -> None:
             if event_type == "self_check_state":
                 assert self.session_path is not None
                 self._append_event("self_check.state", payload)
             elif event_type == "task_outcome":
                 self.last_task_outcome = validate_task_outcome(payload)
-            render_event(event_type, payload)
+            renderer(event_type, payload)
         kwargs: dict[str, object] = {}
         if self.command_sandbox is not None:
             kwargs["command_sandbox"] = self.command_sandbox
@@ -1066,9 +1069,9 @@ class InteractiveRuntime:
                 max_steps=self.args.max_steps,
                 max_context_tokens=self.args.max_context_tokens,
                 allow_run_command=self.args.allow_run_command,
-                approval_callback=make_interactive_approval(
+                approval_callback=renderer.paused(make_interactive_approval(
                     self.workspace, self.console
-                ),
+                )),
                 event_callback=event_callback,
                 message_snapshot_callback=snapshot,
                 initial_messages=self.messages,
@@ -1076,10 +1079,10 @@ class InteractiveRuntime:
                 skill_runtime=self.skill_runtime,
                 self_check_runtime=self.self_check_runtime,
                 vision_runtime=self.vision_runtime,
-                on_vision_budget_exhausted=lambda runtime: request_extra_vision_calls(
+                on_vision_budget_exhausted=renderer.paused(lambda runtime: request_extra_vision_calls(
                     runtime, console=self.console,
                     interactive=bool(getattr(self.args, "interactive_terminal", False)),
-                ),
+                )),
                 **kwargs,
             )
         except KeyboardInterrupt as error:
@@ -1121,10 +1124,14 @@ class InteractiveRuntime:
             and self.last_task_outcome is not None
             and self.last_task_outcome.get("status") == "completed"
         ):
-            with self.console.status("正在生成 Session 标题…"):
+            title_renderer = RichEventRenderer(self.console)
+            try:
+                title_renderer("model_call", {})
                 self.title = generate_title(
                     self.client, self.settings.model, self.first_task
                 )
+            finally:
+                title_renderer.close()
             if self.messages is not None:
                 self._save(self.messages)
 
@@ -1178,8 +1185,7 @@ class InteractiveRuntime:
             self.console.print(Text("上下文整理失败，已保留原 Session。", style="red"))
             return False
         else:
-            renderer(
-                "context_compacted",
+            renderer.render_compaction(
                 {
                     "before_tokens": before_tokens,
                     "after_tokens": after_tokens,

@@ -3,15 +3,31 @@
 import json
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from functools import wraps
+from threading import RLock
+from typing import ParamSpec, TypeVar
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.text import Text
 from rich.theme import Theme
 
 MAX_PREVIEW = 1000
 _ANSWER_THEME = Theme({"markdown.code": "bold"}, inherit=False)
+_READ_PROGRESS_TOOLS = frozenset({
+    "list_files", "read_file", "read_document", "analyze_image", "find_files",
+    "search_text", "git_status", "git_diff", "read_tool_output", "find_skills",
+    "load_skill", "read_skill_resource",
+})
+_WRITE_PROGRESS_TOOLS = frozenset({"write_file", "edit_file", "delete_file"})
+_THINKING_EVENTS = frozenset({
+    "request_prepare", "subagent_prepare", "model_call", "subagent_step",
+    "context_summary",
+})
+_P = ParamSpec("_P")
+_R = TypeVar("_R")
 
 AgentEventCallback = Callable[
     [str, dict[str, object]],
@@ -229,52 +245,126 @@ def _self_check_cleanup_notice(payload: dict[str, object]) -> str | None:
 class RichEventRenderer:
     """Render bounded progress without exposing raw arguments or results."""
 
-    def __init__(self, console: Console, *, verbose: bool = False) -> None:
+    def __init__(
+        self, console: Console, *, verbose: bool = False,
+        persistent_callback: AgentEventCallback | None = None,
+    ) -> None:
         self.console = console
         self.verbose = verbose
+        self._persistent_callback = persistent_callback
         self._status: object | None = None
+        self._message: str | None = None
+        self._running = False
+        self._pause_depth = 0
+        self._closed = False
+        # Input/close can overlap child callbacks; never hold this lock over input.
+        self._lock = RLock()
+        try:
+            self._terminal = bool(console.file.isatty())
+        except (AttributeError, OSError):
+            self._terminal = False
 
     def set_verbose(self, enabled: bool) -> None:
         self.verbose = enabled
 
     def _stop_status(self) -> None:
         status = self._status
-        if status is not None:
-            self._status = None
+        if status is not None and self._running:
+            self._running = False
             status.stop()  # type: ignore[attr-defined]
 
     def _start_status(self, message: str) -> None:
-        self._stop_status()
-        self._status = self.console.status(message, spinner="dots")
-        self._status.start()  # type: ignore[attr-defined]
+        with self._lock:
+            if self._closed or message == self._message:
+                return
+            self._message = message
+            if not self._terminal:
+                return
+            # Group keeps Spinner from assembling Text into a wrapping text line.
+            text = Group(Text(message, no_wrap=True, overflow="crop"))
+            if self._status is None:
+                self._status = self.console.status(text, spinner="dots")
+            else:
+                self._status.update(text)  # type: ignore[attr-defined]
+            if not self._pause_depth and not self._running:
+                self._status.start()  # type: ignore[attr-defined]
+                self._running = True
+
+    @contextmanager
+    def pause(self) -> Iterator[None]:
+        """Suspend refresh across input/output, including concurrent child events."""
+        with self._lock:
+            self._pause_depth += 1
+            self._stop_status()
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._pause_depth -= 1
+                if not self._pause_depth and not self._closed and self._status is not None:
+                    self._status.start()  # type: ignore[attr-defined]
+                    self._running = True
+
+    def paused(self, callback: Callable[_P, _R]) -> Callable[_P, _R]:
+        """Preserve the original approval callback's values and exceptions."""
+        @wraps(callback)
+        def invoke(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+            with self.pause():
+                return callback(*args, **kwargs)
+        return invoke
 
     def close(self) -> None:
-        self._stop_status()
+        with self._lock:
+            self._closed = True
+            self._stop_status()
 
     def __call__(self, event_type: str, payload: dict[str, object]) -> None:
-        if event_type in {"request_prepare", "subagent_prepare"}:
-            self._start_status("准备中...")
-            return
-        if event_type in {"model_call", "subagent_step"}:
+        if event_type in _THINKING_EVENTS:
             self._start_status("思考中...")
             return
-        if event_type == "context_summary":
-            self._start_status("整理上下文中...")
-            return
-
         if event_type == "tool_execution":
-            self._stop_status()
-            name = _bounded_inline(payload.get("tool_name", "未知"))
-            self.console.print(Text(f"执行中：正在调用{name}"))
+            name = payload.get("tool_name")
+            if isinstance(name, str) and name in _READ_PROGRESS_TOOLS:
+                message = "正在读取..."
+            elif isinstance(name, str) and name in _WRITE_PROGRESS_TOOLS:
+                message = "正在修改文件..."
+            else:
+                message = "思考中..."
+            self._start_status(message)
             return
+        if event_type in {"tool_call", "subagent_tool", "subagent_start"}:
+            return
+        if event_type in {"context_usage", "context_compacted"} and not self.verbose:
+            return
+        if event_type == "subagent_end" and payload.get("status") not in {"error", "cancelled"}:
+            return
+        if event_type == "tool_result":
+            if payload.get("tool_name") in {"read_document", "analyze_image"}:
+                visible = _document_notice(payload) is not None
+            else:
+                visible = (
+                    str(payload.get("result", "")).startswith("Error:")
+                    or _command_failure(payload) is not None
+                    or (payload.get("tool_name") == "delete_file"
+                        and isinstance(payload.get("deleted_path"), str))
+                )
+            if not visible and _self_check_cleanup_notice(payload) is None:
+                return
+        elif event_type not in {
+            "final_answer", "task_state", "task_outcome", "subagent_end",
+            "context_usage", "context_compacted", "tool_batch_recovery",
+            "pending_user_discarded",
+        }:
+            return
+        if event_type in {"final_answer", "task_outcome"}:
+            self.close()
+        with self.pause():
+            if self._persistent_callback is not None:
+                self._persistent_callback(event_type, payload)
+            else:
+                self._render_persistent(event_type, payload)
 
-        if event_type in {"tool_call", "subagent_tool"}:
-            self._stop_status()
-            return
-
-        self._stop_status()
-        if event_type == "final_answer":
-            return
+    def _render_persistent(self, event_type: str, payload: dict[str, object]) -> None:
         if event_type == "task_state":
             text = task_state_text(payload)
             if text is not None:
@@ -314,12 +404,9 @@ class RichEventRenderer:
                     )
                 )
             return
-        if event_type == "subagent_start":
-            self.console.print(Text("Subagent 开始"))
-            return
         if event_type == "subagent_end":
-            status = _safe_inline(payload.get("status", "结束"))
-            self.console.print(Text(f"Subagent：{status}"))
+            text = "Subagent 已取消。" if payload.get("status") == "cancelled" else "Subagent 执行失败。"
+            self.console.print(Text(text, style="yellow"))
             return
         if event_type == "context_compacted":
             text = _compacted_text(payload)
@@ -330,6 +417,9 @@ class RichEventRenderer:
                 Text("已安全闭合上次中断的工具批次。", style="yellow")
             )
             return
+        if event_type == "pending_user_discarded":
+            self.console.print(Text("已丢弃 Session 中未完成的旧用户输入，仅执行本次任务。", style="yellow"))
+            return
         if self.verbose and event_type == "context_usage":
             text = _usage_text(payload)
             if text is not None:
@@ -339,9 +429,15 @@ class RichEventRenderer:
             return
 
     def render_answer(self, answer: str) -> None:
-        self._stop_status()
+        self.close()
         with self.console.use_theme(_ANSWER_THEME):
             self.console.print(Markdown(_safe_multiline(answer)))
+
+    def render_compaction(self, payload: dict[str, object]) -> None:
+        """Keep the explicit /compact result separate from automatic progress."""
+        with self.pause():
+            text = _compacted_text(payload)
+            self.console.print(Text(text or "已整理上下文。", style="cyan"))
 
 
 def _truncate(text: str) -> str:
@@ -350,8 +446,10 @@ def _truncate(text: str) -> str:
     return text
 
 
-def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
-    """Render one event while sanitizing model-derived terminal text."""
+def print_terminal_event(
+    event_type: str, payload: dict[str, object], *, verbose: bool = False,
+) -> None:
+    """Render permanent plain output only, sanitizing model-derived text."""
     if event_type == "task_outcome":
         text = task_outcome_text(payload)
         if text is not None:
@@ -362,52 +460,23 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         if text is not None:
             print(text, flush=True)
         return
-    progress_text = {
-        "request_prepare": "准备中...",
-        "subagent_prepare": "准备中...",
-        "model_call": "思考中...",
-        "subagent_step": "思考中...",
-        "context_summary": "整理上下文中...",
-    }.get(event_type)
-    if progress_text is not None:
-        print(
-            f"── 第 {_safe_inline(payload.get('step', '?'))} 步："
-            f"{progress_text} ──",
-            flush=True,
-        )
-        return
-
-    if event_type == "tool_execution":
-        name = _bounded_inline(payload.get("tool_name", "未知"))
-        print(
-            f"── 第 {_safe_inline(payload.get('step', '?'))} 步："
-            f"执行中：正在调用{name} ──",
-            flush=True,
-        )
-        return
-
-    if event_type == "subagent_start":
-        print(
-            "  └─ Subagent 开始"
-            f"（最多 {payload.get('max_calls')} 次模型请求）",
-            flush=True,
-        )
+    if event_type in _THINKING_EVENTS | {"tool_execution", "subagent_start"}:
         return
 
     if event_type == "subagent_tool":
         return
 
     if event_type == "subagent_end":
-        print(
-            "  └─ Subagent "
-            f"{_safe_inline(payload.get('status'))}"
-            f"（{payload.get('calls_used')} / {payload.get('max_calls')} 次请求）"
-        )
+        if payload.get("status") == "error":
+            print("Subagent 执行失败。", flush=True)
+        elif payload.get("status") == "cancelled":
+            print("Subagent 已取消。", flush=True)
         return
 
     if event_type == "context_compacted":
-        text = _compacted_text(payload)
-        print(f"── {text or '已整理上下文。'} ──")
+        if verbose:
+            text = _compacted_text(payload)
+            print(f"── {text or '已整理上下文。'} ──", flush=True)
         return
 
     if event_type == "tool_batch_recovery":
@@ -415,21 +484,23 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
             "── 恢复中断工具批次：保留 "
             f"{payload.get('completed')} 个已完成结果，"
             f"{payload.get('pending')} 个未执行调用"
-            "交给模型重新规划 ──"
+            "交给模型重新规划 ──",
+            flush=True,
         )
         return
 
     if event_type == "pending_user_discarded":
         print(
             "── 已丢弃 Session 中未完成的旧用户输入，"
-            "仅执行本次任务 ──"
+            "仅执行本次任务 ──",
+            flush=True,
         )
         return
 
     if event_type == "context_usage":
-        text = _usage_text(payload)
+        text = _usage_text(payload) if verbose else None
         if text is not None:
-            print(f"── {text} ──")
+            print(f"── {text} ──", flush=True)
         return
 
     if event_type == "provider_usage":
@@ -450,19 +521,19 @@ def print_terminal_event(event_type: str, payload: dict[str, object]) -> None:
         result = str(payload.get("result", ""))
         command_failure = _command_failure(payload)
         if command_failure is not None:
-            print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──")
-            print(command_failure)
+            print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──", flush=True)
+            print(command_failure, flush=True)
         elif result.startswith("Error:"):
-            print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──")
-            print(_truncate(_safe_multiline(result)))
+            print(f"── 工具错误：{_safe_inline(payload['tool_name'])} ──", flush=True)
+            print(_truncate(_safe_multiline(result)), flush=True)
         elif (
             payload.get("tool_name") == "delete_file"
             and isinstance(payload.get("deleted_path"), str)
         ):
-            print("已删除：" + _bounded_inline(payload["deleted_path"]))
+            print("已删除：" + _bounded_inline(payload["deleted_path"]), flush=True)
         return
 
     if event_type == "final_answer":
-        print("── 最终回答 ──")
-        print(_safe_multiline(payload.get("answer", "")))
+        print("── 最终回答 ──", flush=True)
+        print(_safe_multiline(payload.get("answer", "")), flush=True)
         return
