@@ -4,10 +4,14 @@ import copy
 import hashlib
 import json
 import os
+import sqlite3
 import stat
 import tempfile
 import uuid
 from dataclasses import dataclass
+from collections import deque
+from collections.abc import Iterable, Iterator
+from itertools import chain, islice
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +30,9 @@ SESSION_VERSION = 3
 LEGACY_SESSION_VERSION = 1
 SNAPSHOT_SESSION_VERSION = 2
 MAX_SESSION_FILE_BYTES = 5 * 1024 * 1024
+MAX_SESSION_PROJECTION_BYTES = 5 * 1024 * 1024
+SESSION_HISTORY_WARNING_BYTES = 100 * 1024 * 1024
+MAX_SESSION_AUDIT_ENTRIES = 10_000
 MAX_SESSION_TITLE_CHARS = 30
 IN_FLIGHT_MARKER_KEY = "_gum_code_in_flight"
 LEGACY_IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"
@@ -71,6 +78,10 @@ class SessionData:
     user_request_id: str | None = None
     source_event_seq: int | None = None
     self_check_state: dict[str, object] | None = None
+    plan_state: dict[str, object] | None = None
+    history_bytes: int = 0
+    segment_count: int = 1
+    history_modified_at: float = 0
 
 
 @dataclass(frozen=True)
@@ -109,6 +120,7 @@ _EVENT_TYPES = {
     "task.state",
     "vision.state",
     "self_check.state",
+    "plan.state",
 }
 
 
@@ -161,7 +173,7 @@ def _encode_events(events: list[dict[str, object]]) -> bytes:
         (
             json.dumps(
                 event,
-                ensure_ascii=event["type"] in {"task.state", "vision.state", "self_check.state"},
+                ensure_ascii=event["type"] in {"task.state", "vision.state", "self_check.state", "plan.state"},
                 separators=(",", ":"),
             ) + "\n"
         ).encode("utf-8")
@@ -196,6 +208,9 @@ def _validate_event(event: object, expected_seq: int) -> dict[str, object]:
     elif event_type == "self_check.state":
         if validate_self_check_state(data)["source_event_seq"] is None:
             raise ValueError("self_check.state 缺少原始用户请求来源")
+    elif event_type == "plan.state":
+        from gum_code.todo import validate_plan_state
+        validate_plan_state(data)
     elif event_type == "turn.started" and "request_id" in data:
         _validate_request_id(data["request_id"])
     elif event_type == "skill.activated":
@@ -231,52 +246,14 @@ def _validate_event(event: object, expected_seq: int) -> dict[str, object]:
     return event
 
 
-def _read_event_log(
-    target: Path,
-    *,
-    repair_tail: bool = False,
-) -> list[dict[str, object]]:
-    if target.is_symlink():
-        raise ValueError(f"拒绝读取符号链接目标：{target}")
-    if not target.exists() or not target.is_file():
-        raise ValueError(f"Session 文件不存在或不是普通文件：{target}")
-    if target.stat().st_size > MAX_SESSION_FILE_BYTES:
-        raise ValueError(f"Session 文件超过 {MAX_SESSION_FILE_BYTES} 字节上限：{target}")
-    raw = target.read_bytes()
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ValueError(f"Session 文件不是有效的 UTF-8 文本：{target}") from error
-    if not text:
-        raise ValueError("Session JSONL 为空")
-
-    lines = text.splitlines(keepends=True)
-    events: list[dict[str, object]] = []
-    valid_bytes = 0
-    needs_tail_repair = False
-    for index, line in enumerate(lines):
-        complete = line.endswith("\n")
-        payload = line[:-1] if complete else line
-        try:
-            parsed = json.loads(payload)
-        except json.JSONDecodeError as error:
-            if index == len(lines) - 1 and not complete:
-                needs_tail_repair = repair_tail
-                break
-            raise ValueError(f"Session JSONL 第 {index + 1} 行损坏") from error
-        events.append(_validate_event(parsed, index))
-        valid_bytes += len(line.encode("utf-8"))
-
-    if not events:
-        raise ValueError("Session JSONL 缺少有效事件")
-    header = events[0]
+def _validate_header(header: dict[str, object]) -> None:
     if header["type"] != "session.created":
         raise ValueError("Session JSONL 第一条必须是 session.created")
     data = header["data"]
     assert isinstance(data, dict)
     if data.get("version") != SESSION_VERSION:
         raise ValueError(f"不支持的 Session 版本：{data.get('version')!r}")
-    if {"vision_state", "self_check_state", "user_request_id", "source_event_seq"} & data.keys():
+    if {"vision_state", "self_check_state", "plan_state", "user_request_id", "source_event_seq"} & data.keys():
         raise ValueError("Session header 不允许包含请求派生状态")
     try:
         uuid.UUID(str(data.get("id")))
@@ -308,13 +285,121 @@ def _read_event_log(
             or parent_seq < 0
         ):
             raise ValueError("Session parent_seq 无效")
-    # Never truncate arbitrary files or invalid headers while rejecting a Session.
-    if needs_tail_repair:
-        with target.open("r+b") as file:
-            file.truncate(valid_bytes)
-            file.flush()
-            os.fsync(file.fileno())
-    return events
+
+def _open_log(path: Path, *, writable: bool = False):
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    descriptor = os.open(path, flags)
+    info = os.fstat(descriptor)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        os.close(descriptor)
+        raise ValueError("Session 文件必须是普通非链接文件")
+    if path.parent.name.endswith(".segments") and (
+            info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600):
+        os.close(descriptor)
+        raise ValueError("Session 历史段必须是私有文件")
+    if info.st_size > MAX_SESSION_FILE_BYTES:
+        os.close(descriptor)
+        raise ValueError(f"Session 文件超过 {MAX_SESSION_FILE_BYTES} 字节上限")
+    return os.fdopen(descriptor, "r+b" if writable else "rb")
+
+
+def _segments_directory(target: Path) -> Path:
+    return target.with_name(target.name + ".segments")
+
+
+def _segment_path(target: Path, index: int) -> Path:
+    return target if index == 0 else _segments_directory(target) / f"{index:016d}.jsonl"
+
+
+def _segment_manifest(target: Path, *, allow_uncommitted: bool = False) -> dict[str, object] | None:
+    directory = _segments_directory(target)
+    if not directory.exists() and not directory.is_symlink():
+        return None
+    info = directory.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o700):
+        raise ValueError("Session 分段目录不安全")
+    manifest = directory / "index.json"
+    if not manifest.exists() and not manifest.is_symlink():
+        if not allow_uncommitted:
+            with os.scandir(directory) as entries:
+                if any(entry.name.endswith(".jsonl") for entry in entries):
+                    raise ValueError("Session 分段索引缺失；历史文件保留，不能猜测提交状态")
+        return None  # Unpublished staging files are never history.
+    with _open_log(manifest) as source:
+        raw = source.read(4097)
+    if len(raw) > 4096:
+        raise ValueError("Session 分段索引超过限制")
+    try:
+        data = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Session 分段索引损坏") from error
+    if (not isinstance(data, dict) or set(data) != {"version", "session_id", "segments"}
+            or type(data["version"]) is not int or data["version"] != 1
+            or type(data["segments"]) is not int or data["segments"] < 2):
+        raise ValueError("Session 分段索引无效")
+    _validate_request_id(data["session_id"])
+    return data
+
+
+def _read_event_log(target: Path, *, repair_tail: bool = False) -> Iterator[dict[str, object]]:
+    """Stream committed segments; the small index is topology, not a snapshot."""
+    manifest = _segment_manifest(target)
+    count = manifest["segments"] if manifest else 1
+    expected = 0
+    for index in range(count):
+        path = _segment_path(target, index)
+        try:
+            source = _open_log(path, writable=repair_tail and index == count - 1)
+        except OSError as error:
+            raise ValueError("Session 文件或已提交历史段缺失/不可安全读取") from error
+        with source:
+            start = expected
+            valid_bytes = 0
+            while True:
+                line = source.readline(MAX_SESSION_FILE_BYTES + 1)
+                if not line:
+                    break
+                if len(line) > MAX_SESSION_FILE_BYTES:
+                    raise ValueError("Session 单事件超过分段上限")
+                complete = line.endswith(b"\n")
+                try:
+                    parsed = json.loads(line.decode("utf-8"))
+                except UnicodeDecodeError as error:
+                    raise ValueError("Session 文件不是有效的 UTF-8 文本") from error
+                except json.JSONDecodeError as error:
+                    if index == count - 1 and not complete and expected:
+                        if repair_tail:
+                            source.seek(valid_bytes)
+                            source.truncate()
+                            source.flush()
+                            os.fsync(source.fileno())
+                        break
+                    raise ValueError(f"Session JSONL 第 {expected + 1} 行损坏") from error
+                event = _validate_event(parsed, expected)
+                if expected == 0:
+                    _validate_header(event)
+                    if manifest and manifest["session_id"] != event["data"]["id"]:
+                        raise ValueError("Session 分段身份不匹配")
+                expected += 1
+                valid_bytes = source.tell()
+                yield event
+            if expected == start:
+                raise ValueError("Session JSONL 缺少有效事件")
+
+
+def session_history_usage(path: Path) -> dict[str, object]:
+    target = Path(path)
+    manifest = _segment_manifest(target)
+    count = manifest["segments"] if manifest else 1
+    total, modified = 0, 0.0
+    for index in range(count):
+        with _open_log(_segment_path(target, index)) as source:
+            info = os.fstat(source.fileno())
+            total += info.st_size
+            modified = max(modified, info.st_mtime)
+    return {"bytes": total, "segments": count, "warning_level": total // SESSION_HISTORY_WARNING_BYTES,
+            "modified_at": modified}
 
 
 def _event_message(event: dict[str, object]) -> dict[str, object] | None:
@@ -328,20 +413,71 @@ def _event_message(event: dict[str, object]) -> dict[str, object] | None:
     return copy.deepcopy(message)
 
 
-def _replay_events(
-    events: list[dict[str, object]],
-) -> tuple[list[dict[str, object]], dict[str, object]]:
-    header = events[0]["data"]
+class _RequestIds:
+    """Bound UUID deduplication memory without retaining transcript events."""
+
+    def __init__(self) -> None:
+        self.small: set[str] = set()
+        self.database = None
+
+    def __contains__(self, value: str) -> bool:
+        return value in self.small if self.database is None else self.database.execute(
+            "SELECT 1 FROM ids WHERE id = ?", (value,)).fetchone() is not None
+
+    def add(self, value: str) -> None:
+        if self.database is None and len(self.small) < 1024:
+            self.small.add(value)
+            return
+        if self.database is None:
+            # SQLite owns/removes this private temporary database on close.
+            self.database = sqlite3.connect("")
+            self.database.execute("PRAGMA cache_size = -256")
+            self.database.execute("CREATE TABLE ids (id TEXT PRIMARY KEY)")
+            self.database.executemany("INSERT INTO ids VALUES (?)", ((item,) for item in self.small))
+            self.small.clear()
+        self.database.execute("INSERT INTO ids VALUES (?)", (value,))
+
+    def close(self) -> None:
+        if self.database is not None:
+            self.database.close()
+
+
+def _replay_events(events: Iterable[dict[str, object]]) -> tuple[list[dict[str, object]], dict[str, object]]:
+    # ponytail: linear replay per operation; add disposable checkpoints only for measured latency.
+    request_ids = _RequestIds()
+    try:
+        return _project_events(iter(events), request_ids)
+    finally:
+        request_ids.close()
+
+
+def _projection_bytes(messages: list[dict[str, object]]) -> int:
+    total = 0
+    for message in messages:
+        total += len(json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if total > MAX_SESSION_PROJECTION_BYTES:
+            raise ValueError("Session 内容超过当前消息投影上限；需要先压缩上下文")
+    return total
+
+
+def _project_events(events: Iterator[dict[str, object]], request_ids: _RequestIds) -> tuple[list[dict[str, object]], dict[str, object]]:
+    header = next(events)["data"]
     assert isinstance(header, dict)
     state = copy.deepcopy(header)
     messages: list[dict[str, object]] = []
-    request_ids: set[str] = set()
-    for event in events[1:]:
+    projection_bytes = 0
+    state["_last_seq"] = 0
+    for event in events:
+        state["_last_seq"] = event["seq"]
         event_type = event["type"]
         data = event["data"]
         assert isinstance(data, dict)
         if event_type == "task.state":
             state["task_state"] = validate_task_state(data)
+            continue
+        if event_type == "plan.state":
+            from gum_code.todo import validate_plan_transition
+            state["plan_state"] = validate_plan_transition(state.get("plan_state"), data)
             continue
         if event_type == "vision.state":
             budget = validate_vision_state(data)
@@ -398,6 +534,7 @@ def _replay_events(
             ):
                 raise ValueError("context.compacted messages 无效")
             messages = copy.deepcopy(replacement)
+            projection_bytes = _projection_bytes(messages)
             continue
         message = _event_message(event)
         if message is None:
@@ -443,9 +580,13 @@ def _replay_events(
         if event_type == "tool.result" and messages and _has_in_flight_marker(messages[-1]):
             if messages[-1].get("tool_call_id") != message.get("tool_call_id"):
                 raise ValueError("tool.result 与 in-flight 调用不匹配")
+            projection_bytes -= _projection_bytes([messages[-1]])
             messages[-1] = message
         else:
             messages.append(message)
+        projection_bytes += _projection_bytes([message])
+        if projection_bytes > MAX_SESSION_PROJECTION_BYTES:
+            raise ValueError("Session 内容超过当前消息投影上限；需要先压缩上下文")
     return messages, state
 
 
@@ -525,6 +666,7 @@ def _publish_new_log(target: Path, content: bytes) -> None:
     descriptor, temporary = tempfile.mkstemp(
         dir=str(target.parent), prefix=".tmp-session-"
     )
+    linked = False
     try:
         with os.fdopen(descriptor, "wb") as file:
             file.write(content)
@@ -533,8 +675,14 @@ def _publish_new_log(target: Path, content: bytes) -> None:
             os.fchmod(file.fileno(), 0o600)
         try:
             os.link(temporary, target)
+            linked = True
         except FileExistsError as error:
             raise ValueError(f"Session 文件已存在：{target}") from error
+        _sync_directory(target.parent)
+    except BaseException:
+        if linked and target.exists() and os.path.samestat(os.stat(temporary), target.lstat()):
+            target.unlink()
+        raise
     finally:
         try:
             os.unlink(temporary)
@@ -573,6 +721,107 @@ def _append_bytes(target: Path, content: bytes) -> None:
             raise
 
 
+def _sync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _publish_segment_index(target: Path, session_id: str, segments: int) -> None:
+    directory = _segments_directory(target)
+    descriptor, temporary = tempfile.mkstemp(dir=directory, prefix=".tmp-index-")
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(json.dumps({"version": 1, "session_id": session_id, "segments": segments},
+                                    separators=(",", ":")).encode("utf-8"))
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, directory / "index.json")
+        _sync_directory(directory)
+        _sync_directory(target.parent)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _append_events(target: Path, events: Iterable[dict[str, object]], session_id: str) -> None:
+    # A caller's projection/delta is bounded; reject one oversized event before
+    # publishing any part of the append transaction.
+    chunks: list[bytes] = []
+    buffer = bytearray()
+    total = 0
+    for event in events:
+        encoded = _encode_events([event])
+        if len(encoded) > MAX_SESSION_FILE_BYTES:
+            raise ValueError(f"Session 单事件超过 {MAX_SESSION_FILE_BYTES} 字节上限")
+        total += len(encoded)
+        if total > MAX_SESSION_PROJECTION_BYTES * 2:
+            raise ValueError("Session 单次追加超过限制")
+        if buffer and len(buffer) + len(encoded) > MAX_SESSION_FILE_BYTES:
+            chunks.append(bytes(buffer))
+            buffer.clear()
+        buffer.extend(encoded)
+    if buffer:
+        chunks.append(bytes(buffer))
+    if not chunks:
+        return
+    manifest = _segment_manifest(target)
+    count = manifest["segments"] if manifest else 1
+    active = _segment_path(target, count - 1)
+    with _open_log(active) as source:
+        size = os.fstat(source.fileno()).st_size
+        source.seek(max(0, size - 1))
+        newline = bool(size) and source.read(1) != b"\n"
+    if len(chunks) == 1 and size + newline + len(chunks[0]) <= MAX_SESSION_FILE_BYTES:
+        _append_bytes(active, chunks[0])
+        return
+    directory = _segments_directory(target)
+    if not directory.exists():
+        directory.mkdir(mode=0o700)
+    _segment_manifest(target)  # Validate even an as-yet uncommitted directory.
+    published: list[Path] = []
+    new_count = count + len(chunks)
+    try:
+        for index, content in enumerate(chunks, count):
+            segment = _segment_path(target, index)
+            _publish_new_log(segment, content)
+            published.append(segment)
+        # All new files are durable before this single topology commit.
+        _publish_segment_index(target, session_id, new_count)
+    except BaseException:
+        current = _segment_manifest(target, allow_uncommitted=True)
+        if current is None or current["segments"] != new_count:
+            for segment in published:
+                try:
+                    segment.unlink()
+                except OSError:
+                    pass
+        raise
+
+
+def session_internal_paths(path: Path) -> tuple[Path, ...]:
+    """Return only the exact committed files, never a directory-wide exclusion."""
+    target = Path(path)
+    if not target.exists():
+        return ()
+    manifest = _segment_manifest(target)
+    count = manifest["segments"] if manifest else 1
+    paths = []
+    for index in range(count):
+        item = _segment_path(target, index)
+        with _open_log(item):
+            paths.append(item.resolve())
+    if manifest:
+        paths.append((_segments_directory(target) / "index.json").resolve())
+    lock = target.with_name(target.name + ".lock")
+    if lock.exists():
+        with _open_log(lock):
+            paths.append(lock.resolve())
+    return tuple(paths)
+
+
 def save_session(
     path: Path,
     workspace: Path,
@@ -600,6 +849,7 @@ def save_session(
     if not isinstance(model, str) or not model:
         raise ValueError("Session model 必须是非空字符串")
     fitted = _fit_messages_for_session(Path(workspace), messages)
+    _projection_bytes(fitted)
     if not fitted:
         raise ValueError("Session messages 不能为空")
     request_index = None
@@ -620,6 +870,8 @@ def save_session(
     )
 
     if not target.exists():
+        if _segments_directory(target).exists() or _segments_directory(target).is_symlink():
+            raise ValueError("Session 分段目录已存在，不能覆盖历史")
         header = _event(
             0,
             "session.created",
@@ -643,16 +895,16 @@ def save_session(
             history.append(message)
         content = _encode_events(events)
         if len(content) > MAX_SESSION_FILE_BYTES:
-            raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-        _publish_new_log(target, content)
+            _publish_event_stream(target, events)
+        else:
+            _publish_new_log(target, content)
         return
 
-    events = _read_event_log(target, repair_tail=True)
-    current, state = _replay_events(events)
+    current, state = _replay_events(_read_event_log(target, repair_tail=True))
     if Path(str(state["workspace"])).resolve() != Path(workspace).resolve():
         raise ValueError("Session workspace 不允许变更")
     additions: list[dict[str, object]] = []
-    next_seq = len(events)
+    next_seq = state["_last_seq"] + 1
     metadata: dict[str, object] = {}
     if state.get("model") != model:
         metadata["model"] = model
@@ -668,12 +920,12 @@ def save_session(
     # the projection; compaction and internal user-role notices never bind it.
     if request_index is not None:
         if any(event["type"] == "turn.started" and event["data"].get("request_id") == user_request_id
-               for event in events):
+               for event in _read_event_log(target)):
             raise ValueError("原始用户请求 id 不允许重复开启")
         base = fitted[:request_index]
         if current != base:
             additions.append(_event(next_seq, "context.compacted", {
-                "messages": base, "source_seq": [0, len(events) - 1],
+                "messages": base, "source_seq": [0, state["_last_seq"]],
             }))
             next_seq += 1
         history = copy.deepcopy(base)
@@ -685,11 +937,7 @@ def save_session(
             additions.append(_event(next_seq, event_type, data))
             next_seq += 1
             history.append(message)
-        content = _encode_events(additions)
-        needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
-        if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
-            raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-        _append_bytes(target, content)
+        _append_events(target, additions, state["id"])
         return
 
     prefix = len(fitted) >= len(current) and fitted[: len(current)] == current
@@ -725,7 +973,7 @@ def save_session(
             _event(
                 next_seq,
                 "context.compacted",
-                {"messages": projected, "source_seq": [0, len(events) - 1]},
+                {"messages": projected, "source_seq": [0, state["_last_seq"]]},
             )
         )
         next_seq += 1
@@ -742,16 +990,12 @@ def save_session(
                 "context.compacted",
                 {
                     "messages": fitted,
-                    "source_seq": [0, len(events) - 1],
+                    "source_seq": [0, state["_last_seq"]],
                 },
             )
         )
 
-    content = _encode_events(additions)
-    needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
-    if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
-        raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-    _append_bytes(target, content)
+    _append_events(target, additions, state["id"])
 
 
 def load_session(
@@ -787,8 +1031,8 @@ def load_session(
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        events = _read_event_log(target)
-        messages, state = _replay_events(events)
+        messages, state = _replay_events(_read_event_log(target))
+        usage = session_history_usage(target)
         if not messages:
             raise ValueError("Session 缺少有效的 messages（非空列表）")
         return _session_data_from_messages(
@@ -817,12 +1061,15 @@ def load_session(
                 and not isinstance(state.get("parent_seq"), bool)
                 else None
             ),
-            last_seq=len(events) - 1,
+            last_seq=state["_last_seq"],
             task_state=state.get("task_state"),
             vision_state=state.get("vision_state"),
             user_request_id=state.get("user_request_id"),
             source_event_seq=state.get("source_event_seq"),
             self_check_state=state.get("self_check_state"),
+            plan_state=state.get("plan_state"),
+            history_bytes=usage["bytes"], segment_count=usage["segments"],
+            history_modified_at=usage["modified_at"],
         )
 
     if not isinstance(data, dict):
@@ -899,6 +1146,10 @@ def _session_data_from_messages(
     user_request_id: str | None = None,
     source_event_seq: int | None = None,
     self_check_state: dict[str, object] | None = None,
+    plan_state: dict[str, object] | None = None,
+    history_bytes: int = 0,
+    segment_count: int = 1,
+    history_modified_at: float = 0,
 ) -> SessionData:
     if messages[0].get("role") != "system":
         raise ValueError("Session 第一条消息必须是 system message")
@@ -939,25 +1190,25 @@ def _session_data_from_messages(
         source_event_seq=source_event_seq,
         self_check_state=(validate_self_check_state(self_check_state)
                           if self_check_state is not None else None),
+        plan_state=copy.deepcopy(plan_state),
+        history_bytes=history_bytes, segment_count=segment_count,
+        history_modified_at=history_modified_at,
     )
 
 
 def append_session_event(path: Path, event_type: str, data: dict[str, object]) -> int:
     """Append one validated non-projection Session event."""
-    if event_type not in {"skill.activated", "session.recovered", "task.state", "vision.state", "self_check.state"}:
+    if event_type not in {"skill.activated", "session.recovered", "task.state", "vision.state", "self_check.state", "plan.state"}:
         raise ValueError(f"不允许直接追加 Session 事件：{event_type}")
     target = Path(path)
-    events = _read_event_log(target, repair_tail=True)
-    addition = _event(len(events), event_type, copy.deepcopy(data))
-    _validate_event(addition, len(events))
-    if event_type in {"vision.state", "self_check.state"}:
-        _replay_events([*events, addition])
-    content = _encode_events([addition])
-    needs_newline = 0 if target.read_bytes().endswith(b"\n") else 1
-    if target.stat().st_size + needs_newline + len(content) > MAX_SESSION_FILE_BYTES:
-        raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-    _append_bytes(target, content)
-    return len(events)
+    _, state = _replay_events(_read_event_log(target, repair_tail=True))
+    seq = state["_last_seq"] + 1
+    addition = _event(seq, event_type, copy.deepcopy(data))
+    _validate_event(addition, seq)
+    if event_type in {"vision.state", "self_check.state", "plan.state"}:
+        _replay_events(chain(_read_event_log(target), [addition]))
+    _append_events(target, [addition], state["id"])
+    return seq
 
 
 def migrate_session_to_v3(source: Path, destination: Path) -> Path:
@@ -971,7 +1222,7 @@ def migrate_session_to_v3(source: Path, destination: Path) -> Path:
     if data.version == SESSION_VERSION:
         raise ValueError("Session 已是 v3")
     target = Path(destination)
-    if target.exists():
+    if target.exists() or _segments_directory(target).exists() or _segments_directory(target).is_symlink():
         raise ValueError(f"Session 文件已存在：{target}")
     header = _event(
         0,
@@ -1002,14 +1253,14 @@ def migrate_session_to_v3(source: Path, destination: Path) -> Path:
         )
     content = _encode_events(events)
     if len(content) > MAX_SESSION_FILE_BYTES:
-        raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-    _publish_new_log(target, content)
+        _publish_event_stream(target, events)
+    else:
+        _publish_new_log(target, content)
     return target
 
 
-def session_audit_entries(path: Path) -> list[dict[str, object]]:
+def iter_session_audit_entries(path: Path) -> Iterator[dict[str, object]]:
     """Return only structural event metadata safe for terminal display."""
-    entries: list[dict[str, object]] = []
     for event in _read_event_log(Path(path), repair_tail=False):
         data = event["data"]
         assert isinstance(data, dict)
@@ -1025,7 +1276,7 @@ def session_audit_entries(path: Path) -> list[dict[str, object]]:
                     if isinstance(function, dict) and isinstance(function.get("name"), str):
                         names.append(function["name"])
                 tool_name = ", ".join(names) or None
-        entries.append(
+        yield (
             {
                 "seq": event["seq"],
                 "time": event["time"],
@@ -1049,26 +1300,92 @@ def session_audit_entries(path: Path) -> list[dict[str, object]]:
                 ),
             }
         )
-    return entries
+
+
+def session_audit_entries(path: Path) -> list[dict[str, object]]:
+    """Return a bounded recent audit window; raw history is available by iterator."""
+    entries = deque(iter_session_audit_entries(path), maxlen=MAX_SESSION_AUDIT_ENTRIES)
+    if entries and entries[0]["seq"] != 0:
+        return [{"seq": -1, "time": entries[0]["time"], "type": "history.window",
+                 "status": "truncated", "tool_name": None,
+                 "summary": "Earlier audit entries omitted; use streaming history."}, *entries]
+    return list(entries)
+
+
+def iter_completed_session_turns(path: Path) -> Iterator[tuple[int, str]]:
+    for entry in iter_session_audit_entries(path):
+        if entry["type"] == "turn.completed":
+            yield int(entry["seq"]), str(entry["time"])
 
 
 def completed_session_turns(path: Path) -> list[tuple[int, str]]:
-    return [
-        (int(entry["seq"]), str(entry["time"]))
-        for entry in session_audit_entries(path)
-        if entry["type"] == "turn.completed"
-    ]
+    return list(deque(iter_completed_session_turns(path), maxlen=MAX_SESSION_AUDIT_ENTRIES))
 
 
 def fork_session(source: Path, boundary_seq: int, destination: Path) -> Path:
     """Create an independent v3 child from one completed turn boundary."""
-    events = _read_event_log(Path(source), repair_tail=False)
-    if boundary_seq <= 0 or boundary_seq >= len(events):
+    if type(boundary_seq) is not int or boundary_seq <= 0:
         raise ValueError("fork 边界不存在")
-    if events[boundary_seq]["type"] != "turn.completed":
+    boundary = None
+    for event in _read_event_log(Path(source)):
+        if event["seq"] == boundary_seq:
+            boundary = event["type"]
+    if boundary is None:
+        raise ValueError("fork 边界不存在")
+    if boundary != "turn.completed":
         raise ValueError("只能从已完成 turn 创建 fork")
-    messages, state = _replay_events(events[: boundary_seq + 1])
-    target = Path(destination)
+    _, state = _replay_events(islice(_read_event_log(Path(source)), boundary_seq + 1))
+    return _copy_log(Path(source), Path(destination), state, boundary_seq, fork=True)
+
+
+def _publish_event_stream(target: Path, events: Iterable[dict[str, object]]) -> None:
+    """Stage a complete new logical log; publish its entry path last."""
+    if target.exists() or target.is_symlink() or _segments_directory(target).exists():
+        raise ValueError(f"Session 文件或分段目录已存在：{target}")
+    with tempfile.TemporaryDirectory(dir=target.parent, prefix=".tmp-session-build-") as directory:
+        staged = Path(directory) / "session.jsonl"
+        buffer = bytearray()
+        count = 0
+        identity = None
+        for seq, event in enumerate(events):
+            _validate_event(event, seq)
+            if seq == 0:
+                _validate_header(event)
+                identity = event["data"]["id"]
+            encoded = _encode_events([event])
+            if len(encoded) > MAX_SESSION_FILE_BYTES:
+                raise ValueError("Session 单事件超过分段上限")
+            if buffer and len(buffer) + len(encoded) > MAX_SESSION_FILE_BYTES:
+                _publish_new_log(_segment_path(staged, count), bytes(buffer))
+                count += 1
+                _segments_directory(staged).mkdir(mode=0o700, exist_ok=True)
+                buffer.clear()
+            buffer.extend(encoded)
+        if not buffer:
+            raise ValueError("Session JSONL 为空")
+        _publish_new_log(_segment_path(staged, count), bytes(buffer))
+        count += 1
+        if count > 1:
+            _publish_segment_index(staged, identity, count)
+        _replay_events(_read_event_log(staged))
+        moved = linked = False
+        try:
+            if count > 1:
+                if _segments_directory(target).exists() or _segments_directory(target).is_symlink():
+                    raise ValueError("Session 分段目录已存在")
+                os.rename(_segments_directory(staged), _segments_directory(target))
+                moved = True
+            os.link(staged, target)
+            linked = True
+            _sync_directory(target.parent)
+        except BaseException:
+            if moved and not linked:
+                # Return only this builder's private directory to its staging area.
+                os.rename(_segments_directory(target), _segments_directory(staged))
+            raise
+
+
+def _copy_log(source: Path, target: Path, state: dict[str, object], boundary_seq: int, *, fork: bool) -> Path:
     header = _event(
         0,
         "session.created",
@@ -1083,40 +1400,43 @@ def fork_session(source: Path, boundary_seq: int, destination: Path) -> Path:
             "parent_seq": boundary_seq,
         },
     )
-    child_events = [header]
-    for message in messages:
-        data = {"message": message, "provenance": "fork_import"}
-        child_events.append(
-            _event(
-                len(child_events),
-                _message_event_type(message),
-                data,
-            )
-        )
-    if state.get("user_request_id") is not None:
-        # Preserve source identity through compaction/repeated text; copied
-        # budgets are history, never configuration or verification permission.
-        child_events = [header]
-        sequence_map = {0: 0}
-        for original in events[1:boundary_seq + 1]:
-            if original["type"] == "task.state":
-                sequence_map[original["seq"]] = len(child_events) - 1
-                continue
+    def copied_events():
+        yield header
+        for original in islice(_read_event_log(source), 1, boundary_seq + 1):
             copied = copy.deepcopy(original)
-            copied["seq"] = len(child_events)
-            data = copied["data"]
-            if copied["type"] in {"vision.state", "self_check.state"}:
-                data["source_event_seq"] = sequence_map[data["source_event_seq"]]
-            elif copied["type"] == "context.compacted":
-                data["source_seq"] = [sequence_map.get(value, value) for value in data["source_seq"]]
-            sequence_map[original["seq"]] = copied["seq"]
-            child_events.append(copied)
-        _replay_events(child_events)
-    content = _encode_events(child_events)
-    if len(content) > MAX_SESSION_FILE_BYTES:
-        raise ValueError(f"Session 内容超过 {MAX_SESSION_FILE_BYTES} 字节上限")
-    _publish_new_log(target, content)
+            if fork and copied["type"] == "task.state":
+                # Preserve source sequence identities without restoring legacy obligations.
+                copied["type"] = "session.recovered"
+                copied["data"] = {"kind": "legacy_verification_not_inherited"}
+            yield copied
+    _publish_event_stream(target, copied_events())
     return target
+
+
+def copy_session_log(source: Path, destination: Path) -> Path:
+    """Import a v3 event history with a new identity and no restored authority."""
+    _, state = _replay_events(_read_event_log(Path(source)))
+    return _copy_log(Path(source), Path(destination), state, state["_last_seq"], fork=False)
+
+
+def delete_session_log(path: Path) -> None:
+    """Delete only the explicitly selected, validated logical Session files."""
+    target = Path(path)
+    with SessionLease(target):
+        data = load_session(target, allow_incomplete_tool_batch=True, allow_pending_user_tail=True)
+        if data.version == SESSION_VERSION:
+            for _ in _read_event_log(target):
+                pass
+            manifest = _segment_manifest(target)
+            if manifest:
+                for index in range(1, manifest["segments"]):
+                    _segment_path(target, index).unlink()
+                (_segments_directory(target) / "index.json").unlink()
+                try:
+                    _segments_directory(target).rmdir()
+                except OSError:
+                    pass  # Unknown files are not owned history and are never deleted.
+        target.unlink()
 
 
 class SessionLease:

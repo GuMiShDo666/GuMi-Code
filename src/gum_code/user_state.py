@@ -13,9 +13,10 @@ from gum_code.session import (
     SESSION_VERSION,
     SessionData,
     SessionLease,
+    copy_session_log,
+    delete_session_log,
     load_session,
     migrate_session_to_v3,
-    save_session,
 )
 
 MAX_STATE_BYTES = 256 * 1024
@@ -445,7 +446,7 @@ def list_sessions(
     if not root.exists() or root.is_symlink() or not root.is_dir():
         return []
     wanted = workspace.resolve() if workspace is not None else None
-    loaded: list[tuple[Path, SessionData]] = []
+    loaded: list[tuple[Path, Path, str, float, int, Path | None]] = []
     paths = [*root.glob("*.jsonl"), *root.glob("*.json")]
     for path in paths:
         if path.is_symlink() or not path.is_file():
@@ -456,27 +457,29 @@ def list_sessions(
                 allow_incomplete_tool_batch=True,
                 allow_pending_user_tail=True,
             )
-            loaded.append((path, data))
+            loaded.append((path, data.workspace, data.title,
+                           data.history_modified_at or path.stat().st_mtime,
+                           data.version, data.legacy_source))
         except (OSError, ValueError):
             continue
     migrated_sources = {
-        data.legacy_source.resolve()
-        for _, data in loaded
-        if data.legacy_source is not None
+        legacy_source.resolve()
+        for *_, legacy_source in loaded
+        if legacy_source is not None
     }
     entries: list[SessionEntry] = []
-    for path, data in loaded:
-        if data.version != SESSION_VERSION and path.resolve() in migrated_sources:
+    for path, stored_workspace, title, modified_at, version, _ in loaded:
+        if version != SESSION_VERSION and path.resolve() in migrated_sources:
             continue
-        resolved_workspace = data.workspace.resolve()
+        resolved_workspace = stored_workspace.resolve()
         if wanted is not None and resolved_workspace != wanted:
             continue
         entries.append(
             SessionEntry(
                 path=path.resolve(),
                 workspace=resolved_workspace,
-                title=data.title or path.stem,
-                modified_at=path.stat().st_mtime,
+                title=title or path.stem,
+                modified_at=modified_at,
             )
         )
     entries.sort(key=lambda entry: entry.modified_at, reverse=True)
@@ -506,14 +509,7 @@ def import_session(
         if data.version != SESSION_VERSION:
             migrate_session_to_v3(source_path, target)
         else:
-            save_session(
-                target,
-                data.workspace,
-                data.model,
-                data.messages,
-                data.title,
-                data.sticky_skills,
-            )
+            copy_session_log(source_path, target)
     return target
 
 
@@ -521,4 +517,4 @@ def delete_session(path: Path) -> None:
     target = Path(path)
     if target.is_symlink() or not target.is_file():
         raise ValueError("Session 文件无效")
-    target.unlink()
+    delete_session_log(target)

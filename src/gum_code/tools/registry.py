@@ -81,6 +81,8 @@ ALL_TOOL_RISKS: dict[str, ToolRisk] = {
     "delete_file": ToolRisk.DESTRUCTIVE,
     "run_command": ToolRisk.EXECUTE,
     "self_check": ToolRisk.EXECUTE,
+    "project_service": ToolRisk.EXECUTE,
+    "project_browser": ToolRisk.EXECUTE,
 }
 
 READ_ONLY_TOOL_NAMES = frozenset(
@@ -590,14 +592,70 @@ PREFLIGHTS: dict[str, Callable[..., None]] = {
     "self_check": _validate_self_check,
 }
 
+def _validate_project_tool(workspace: Path, *, runtime=None, browser=False, **arguments) -> None:
+    if runtime is None or Path(runtime.workspace).resolve() != Path(workspace).resolve():
+        raise ValueError("Project runtime unavailable")
+    if browser:
+        runtime.browser.validate(arguments)
+    else:
+        runtime.validate(arguments)
+
+
+def _project_service(workspace: Path, *, runtime, cancel_event=None, **arguments) -> str:
+    return runtime.execute(arguments, approved=True, cancel_event=cancel_event)
+
+
+def _project_browser(workspace: Path, *, runtime, cancel_event=None, **arguments) -> str:
+    return runtime._redact(runtime.browser.execute(arguments, cancel_event=cancel_event))
+
+
+ALL_TOOL_SCHEMAS.update({
+    "project_service": {
+        "type": "function", "function": {
+            "name": "project_service",
+            "description": "Manage this session's Docker project services. Start apps or an isolated PostgreSQL test database; observe readiness/logs, restart unchanged approved services or stop them. No host execution. Services stop at exit; database data remains. External network needs separate consent.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["start", "status", "logs", "restart", "stop"]},
+                "name": {"type": "string", "maxLength": 32},
+                "kind": {"type": "string", "enum": ["app", "postgres"]},
+                "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "cwd": {"type": "string"},
+                "port": {"type": "integer", "minimum": 1024, "maximum": 65535},
+                "ecosystem": {"type": "string", "enum": ["python", "node", "prepared"]},
+                "online": {"type": "boolean"},
+                "database": {"type": "string"},
+            }, "required": ["action"], "additionalProperties": False},
+        },
+    },
+    "project_browser": {
+        "type": "function", "function": {
+            "name": "project_browser",
+            "description": "Observe and interact with a currently running project_service webpage in an isolated browser. Open by service name and relative path; read controls before click/fill. No arbitrary URLs or scripts. Results are observations, not a test-pass certificate. Missing environment requires preparation consent.",
+            "parameters": {"type": "object", "properties": {
+                "action": {"type": "string", "enum": ["open", "read", "click", "fill"]},
+                "service": {"type": "string", "maxLength": 32},
+                "path": {"type": "string", "maxLength": 2000},
+                "selector": {"type": "string", "maxLength": 500},
+                "value": {"type": "string", "maxLength": 4000},
+            }, "required": ["action"], "additionalProperties": False},
+        },
+    },
+})
+ALL_TOOL_HANDLERS.update(project_service=_project_service, project_browser=_project_browser)
+PREFLIGHTS.update(project_service=_validate_project_tool, project_browser=_validate_project_tool)
+
+
 def get_tool_schemas(
     *,
     allow_run_command: bool = False,
+    allow_project_runtime: bool = False,
 ) -> list[dict]:
     visible_names = set(MODEL_VISIBLE_TOOL_NAMES)
 
     if allow_run_command:
         visible_names.add("run_command")
+    if allow_project_runtime:
+        visible_names.update({"project_service", "project_browser"})
 
     return [
         schema
@@ -642,6 +700,7 @@ def execute_tool(
     self_check_runtime: "SelfCheckRuntime | None" = None,
     file_change_callback: Callable | None = None,
     artifact_workspace: Path | None = None,
+    project_runtime=None,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
@@ -651,6 +710,13 @@ def execute_tool(
     if handler is None:
         return f"Error: Unknown tool: {tool_name}"
 
+    # A requested browser check stays incomplete until the real action succeeds.
+    # Keep this host-only and independent of model text or persisted history.
+    if tool_name == "project_browser" and project_runtime is not None:
+        project_runtime.browser.request_attempted = True
+        browser_failed_before = project_runtime.browser.request_failed
+        project_runtime.browser.request_failed = True
+
     try:
         arguments = json.loads(arguments_json)
     except json.JSONDecodeError:
@@ -658,6 +724,11 @@ def execute_tool(
 
     if not isinstance(arguments, dict):
         return "Error: Invalid tool arguments: expected a JSON object"
+
+    if tool_name in {"project_service", "project_browser"} and arguments.keys() - (
+        ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
+    ):
+        return "Error: Invalid tool arguments"
 
     if tool_name in READING_TOOL_NAMES | {"read_tool_output"} and arguments.keys() - (
         ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
@@ -696,7 +767,10 @@ def execute_tool(
     preflight = PREFLIGHTS.get(tool_name)
     if preflight is not None:
         try:
-            if tool_name == "self_check":
+            if tool_name in {"project_service", "project_browser"}:
+                preflight(workspace=workspace, runtime=project_runtime,
+                          browser=tool_name == "project_browser", **arguments)
+            elif tool_name == "self_check":
                 preflight(workspace=workspace, runtime=self_check_runtime)
             elif tool_name == "run_command":
                 preflight(
@@ -717,13 +791,19 @@ def execute_tool(
             detail = f": {blocked}" if blocked else ""
             return f"Error: Tool blocked by PreToolUse hook{detail}"
 
-    if permission.decision is PermissionDecision.ASK:
+    project_observation = tool_name == "project_service" and arguments.get("action") in {"status", "logs"}
+    project_restart = (tool_name == "project_service" and project_runtime is not None
+                       and project_runtime.approved_restart(arguments))
+    if permission.decision is PermissionDecision.ASK and not (project_observation or project_restart):
         if approval_callback is None:
             return f"Error: Approval required: {tool_name}"
 
+        approval_arguments = copy.deepcopy(arguments)
+        if tool_name == "project_browser" and "value" in approval_arguments:
+            approval_arguments["value"] = "<REDACTED>"
         approved = approval_callback(
             tool_name,
-            copy.deepcopy(arguments),
+            approval_arguments,
             permission.reason,
         )
 
@@ -759,7 +839,10 @@ def execute_tool(
 
     command_results: list[CommandExecutionResult] = []
     try:
-        if tool_name == "run_command":
+        if tool_name in {"project_service", "project_browser"}:
+            result = handler(workspace=workspace, runtime=project_runtime,
+                             cancel_event=cancel_event, **arguments)
+        elif tool_name == "run_command":
             command_kwargs: dict[str, object] = {}
             if command_result_callback is not None:
                 command_kwargs["result_callback"] = command_results.append
@@ -795,6 +878,10 @@ def execute_tool(
             copy.deepcopy(arguments),
             result,
         )
+
+    if tool_name == "project_browser" and project_runtime is not None:
+        project_runtime.browser.request_failed = browser_failed_before
+        project_runtime.browser.note_result(result)
 
     # A completed process is not accepted evidence until the post-Hook succeeds.
     # Keep the external callback outside handler error conversion as well.

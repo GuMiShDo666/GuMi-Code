@@ -35,6 +35,10 @@ except ImportError:
 MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 MAX_DEPENDENCIES = 512
 PREPARE_TIMEOUT_SECONDS = 300
+# Runtime services and short checks share the same immutable environment lease.
+_ACTIVE_ENVIRONMENTS: dict[str, dict] = {}
+# ponytail: serialize preparation; use per-package locks if parallel writers arrive.
+_ACTIVE_LOCK = threading.RLock()
 # Fixed official-image families; labels are discovery, immutable IDs are execution.
 IMAGE_CANDIDATES = {
     "python": ("python:3.11-slim", "python:3.12-slim", "python:3.13-slim", "python:3.14-slim"),
@@ -87,6 +91,7 @@ class EnvironmentResult:
     identity: str = ""
     excluded_dirs: tuple[str, ...] = ()
     cleanup_required: tuple[str, ...] = ()
+    manifest_identity: str = ""
 
 
 def _digest(value: object) -> str:
@@ -422,10 +427,10 @@ def _candidate_images(project: ProjectSpec) -> tuple[str, ...]:
 
 
 @contextmanager
-def _lease(workspace: Path, scope: str):
+def _lease(workspace: Path, scope: str, *, namespace: str = "project-environments"):
     if fcntl is None or os.name != "posix":
         raise _Unavailable("environment_storage_unavailable")
-    directory = data_dir().absolute() / "project-environments"
+    directory = data_dir().absolute() / namespace
     if directory.is_relative_to(workspace.resolve()):
         raise _Unavailable("environment_storage_unsafe")
     # No source/config data is stored here; descriptors pin the private namespace.
@@ -628,15 +633,48 @@ def ensure_environment(workspace: Path, project: ProjectSpec, *, command_sandbox
         return
     scope = _digest([str(workspace.resolve()), project.root])
     entered = False
+    active = None
     try:
-        with _lease(workspace, scope) as fd:
-            result = _ensure_locked(workspace, project, scope, fd, command_sandbox, approval_callback, denied_scopes, cancel_event, change_callback)
-            entered = True
-            yield result
+        with _ACTIVE_LOCK:
+            active = _ACTIVE_ENVIRONMENTS.get(scope)
+            if active is not None:
+                result = active["result"]
+                current = _fresh(workspace, project)
+                if current.identity != active["manifest"] or (command_sandbox is not None and (command_sandbox.image_id != result.sandbox.image_id or command_sandbox.docker_path != result.sandbox.docker_path)):
+                    active = None
+                    raise _Unavailable("environment_in_use")
+                command._validate_docker_sandbox(result.sandbox)
+                command._validate_dependency_mount(result.sandbox, workspace)
+                active["users"] += 1
+            else:
+                lease = _lease(workspace, scope)
+                fd = lease.__enter__()
+                try:
+                    result = _ensure_locked(workspace, project, scope, fd, command_sandbox, approval_callback, denied_scopes, cancel_event, change_callback)
+                    if result.status == "ready":
+                        current = discover_project(workspace, project.root, ecosystem=project.ecosystem)
+                        if current.reason or current.identity != result.manifest_identity:
+                            raise _Unavailable("manifest_changed")
+                        active = {"result": result, "manifest": current.identity, "lease": lease, "users": 1}
+                        _ACTIVE_ENVIRONMENTS[scope] = active
+                    else:
+                        lease.__exit__(None, None, None)
+                except BaseException:
+                    lease.__exit__(None, None, None)
+                    raise
+        entered = True
+        yield result
     except (ValueError, OSError, TypeError) as exc:
         if entered:
             raise
         yield EnvironmentResult("unavailable", str(exc) if isinstance(exc, _Unavailable) else "environment_unavailable", cleanup_required=exc.cleanup_required if isinstance(exc, _Unavailable) else ())
+    finally:
+        if active is not None and entered:
+            with _ACTIVE_LOCK:
+                active["users"] -= 1
+                if active["users"] == 0:
+                    _ACTIVE_ENVIRONMENTS.pop(scope, None)
+                    active["lease"].__exit__(None, None, None)
 
 
 def _ensure_locked(workspace, project, scope, fd, explicit, approval, denied, cancel_event, change_callback):
@@ -680,7 +718,7 @@ def _ensure_locked(workspace, project, scope, fd, explicit, approval, denied, ca
     if sandbox and ready and ready.get("identity") == identity and _owned_volume(sandbox, ready["volume"], scope):
         return _environment_result(workspace, project, sandbox, scope, ready["volume"], identity)
     if sandbox and not project.has_dependencies:
-        return EnvironmentResult("ready", sandbox=sandbox, identity=identity)
+        return EnvironmentResult("ready", sandbox=sandbox, identity=identity, manifest_identity=project.identity)
     consent_scope = _digest([project.identity, sandbox.image_id if sandbox else candidates[0], runtime, missing])
     if denied is not None and consent_scope in denied:
         return EnvironmentResult("skipped", "user_declined")
@@ -708,7 +746,7 @@ def _ensure_locked(workspace, project, scope, fd, explicit, approval, denied, ca
         sandbox = DockerSandboxConfig(docker, command._inspect_local_image(docker, candidates[0]))
         runtime = _probe(sandbox, project, cancel_event)
     if not project.has_dependencies:
-        return EnvironmentResult("ready", sandbox=sandbox, identity=_digest([project.identity, sandbox.image_id, runtime]))
+        return EnvironmentResult("ready", sandbox=sandbox, identity=_digest([project.identity, sandbox.image_id, runtime]), manifest_identity=project.identity)
     staging = record.get("staging")
     if staging and not _remove_owned(sandbox, staging["volume"], scope):
         return EnvironmentResult("unavailable", "environment_cleanup_required", cleanup_required=(staging["volume"],))
@@ -779,4 +817,4 @@ def _environment_result(workspace, project, sandbox, scope, volume, identity):
     configured = replace(sandbox, dependency=dependency)
     command._validate_dependency_mount(configured, workspace)
     excluded = (str(Path(project.root) / "node_modules"),) if project.ecosystem == "node" else ()
-    return EnvironmentResult("ready", sandbox=configured, identity=identity, excluded_dirs=excluded)
+    return EnvironmentResult("ready", sandbox=configured, identity=identity, excluded_dirs=excluded, manifest_identity=project.identity)

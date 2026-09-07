@@ -53,8 +53,12 @@ decision-0001、code-0001、verification-0001、work-0001；新 ID 从 next_ids 
 source_ref 必须逐字复制本次 sources 中的 m0001 形式标签。
 sources 中只有 role=user 的当前请求可作为替代依据；historical_user、legacy_reference、
 assistant 和 tool 都只是历史参考。
-保留所有旧状态胶囊中 status=active 的条目及原文。只有新的 user 消息明确替代旧决定时，
+保留旧胶囊所有条目，不删除已完成历史。目标、需求、约束和决策的 active 条目保留原文。
+只有新的 user 消息明确替代旧决定时，
 才可将旧条目标记为 superseded，并用 superseded_by 指向来自该 user 消息的新 active 条目。
+code_state/work_items 的 active/blocked 条目可依据本次 user/assistant/tool 来源更新为 completed/blocked/active，
+但保留 id/text，以 reason 与 source_ref 记录本次更新依据；completed 不得回退。
+verification 仅可依据本次 tool 来源标记 blocked 说明失效；总结不能凭自身判断生成验证通过事实。
 只记录目标、需求/验收、禁止项、技术决策与原因、文件/符号/变更状态、验证/失败证据和待办/阻塞。
 保留相关 reading-output 的范围、版本、有效续读位置和缺口；捕获完整不表示模型已读，
 不能将未读页面或过期来源写成全量检查已完成。
@@ -677,13 +681,24 @@ def _validate_capsule_transition(
             raise _CapsuleValidationError("invalid_source")
 
     for item_id, old in prior_entries.items():
-        if old["status"] != "active":
-            continue
         new = current_entries.get(item_id)
         if new is None:
             raise _CapsuleValidationError("missing_active_id")
         if _canonical_json(new) == _canonical_json(old):
             continue
+        prefix = item_id.rsplit("-", 1)[0]
+        source_role = current_sources.get(str(new["source_ref"]))
+        if (prefix in {"code", "work"} and old["status"] in {"active", "blocked"}
+                and new["status"] in {"active", "completed", "blocked"}
+                and new["text"] == old["text"]
+                and new["reason"] and source_role in {"user", "assistant", "tool"}):
+            continue
+        if (prefix == "verification" and old["status"] in {"active", "completed"}
+                and new["status"] == "blocked" and new["text"] == old["text"]
+                and new["reason"] and source_role == "tool"):
+            continue
+        if old["status"] != "active":
+            raise _CapsuleValidationError("rewritten_historical_id")
         unchanged = all(
             new[key] == old[key]
             for key in ("id", "text", "reason", "source_ref")

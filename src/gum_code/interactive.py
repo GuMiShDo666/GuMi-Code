@@ -64,6 +64,9 @@ from gum_code.session import (
     migrate_session_to_v3,
     save_session,
     session_audit_entries,
+    iter_session_audit_entries,
+    session_internal_paths,
+    session_history_usage,
 )
 from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
@@ -71,6 +74,9 @@ from gum_code.tools.command import load_docker_sandbox
 from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
 from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
 from gum_code.vision import VisionRuntime
+from gum_code.todo import PlanRuntime
+from gum_code.project_runtime import ProjectRuntime
+from gum_code.project_browser import ProjectBrowser
 from gum_code.user_state import (
     SessionEntry,
     UserState,
@@ -733,8 +739,23 @@ class InteractiveRuntime:
     session_write_lock: object = field(default_factory=RLock, repr=False)
     self_check_runtime: SelfCheckRuntime | None = None
     last_task_outcome: dict[str, object] | None = None
+    plan_runtime: PlanRuntime = field(default_factory=PlanRuntime)
+    project_runtime: ProjectRuntime | None = None
+    history_warning_level: int = 0
 
-    def close(self) -> None:
+    def _close_project(self) -> bool:
+        if self.project_runtime is not None:
+            browser_failures = self.project_runtime.browser.close()
+            service_failures = self.project_runtime.close()
+            if browser_failures or service_failures:
+                self.console.print(Text("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", style="yellow"))
+                return False
+            self.project_runtime = None
+        return True
+
+    def close(self) -> bool:
+        if not self._close_project():
+            return False
         if self.vision_runtime is not None:
             self.vision_runtime.cancel()
         self.vision_runtime = None
@@ -745,12 +766,24 @@ class InteractiveRuntime:
         if self.lease is not None:
             self.lease.release()
             self.lease = None
+        return True
 
     def _ensure_session(self) -> None:
         if self.session_path is None:
             self.session_path = allocate_session_path()
         if self.lease is None:
             self.lease = SessionLease(self.session_path).acquire()
+
+    def _warn_history(self) -> None:
+        if self.session_path is None or not self.session_path.exists():
+            return
+        try:
+            usage = session_history_usage(self.session_path)
+        except (OSError, ValueError):
+            return  # Save/load owns persistence failures; this is an advisory only.
+        if usage["warning_level"] > self.history_warning_level:
+            self.console.print(Text("会话历史占用较大；旧记录已保留，可由你决定是否清理。", style="yellow"))
+            self.history_warning_level = usage["warning_level"]
 
     def _save(
         self, messages: list[dict[str, object]], *, user_request_id: str | None = None,
@@ -764,6 +797,8 @@ class InteractiveRuntime:
                 self.skill_runtime.sticky_names if self.skill_runtime is not None else self.sticky_skills,
                 **kwargs,
             )
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.set_internal_paths(session_internal_paths(self.session_path))
             self.messages = candidate
             self._flush_skill_activations()
 
@@ -772,6 +807,8 @@ class InteractiveRuntime:
             if self.session_path is None:
                 raise RuntimeError("Session 尚未建立")
             append_session_event(self.session_path, event_type, data)
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.set_internal_paths(session_internal_paths(self.session_path))
 
     def _persist_vision(self, state: dict[str, object]) -> None:
         # Called under the budget lock: never read runtime state or render here.
@@ -803,18 +840,16 @@ class InteractiveRuntime:
             if self.session_path is not None:
                 # A crash between a side effect and its fact event is not clean.
                 with self.session_write_lock:
-                    entries = session_audit_entries(self.session_path)
-                fact_seq = max(
-                    (entry["seq"] for entry in entries
-                     if entry["type"] == "self_check.state" and entry["seq"] > data.source_event_seq),
-                    default=data.source_event_seq,
-                )
-                if any(
-                    entry["seq"] > fact_seq
-                    and entry["type"] == "tool.execution_started"
-                    and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}
-                    for entry in entries
-                ):
+                    unknown = False
+                    for entry in iter_session_audit_entries(self.session_path):
+                        if entry["seq"] <= data.source_event_seq:
+                            continue
+                        if entry["type"] == "self_check.state":
+                            unknown = False
+                        elif (entry["type"] == "tool.execution_started"
+                              and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}):
+                            unknown = True
+                if unknown:
                     self.self_check_runtime.mark_unknown()
         self.last_task_outcome = None
 
@@ -848,12 +883,15 @@ class InteractiveRuntime:
         """Validate and lock a destination before releasing the current Session."""
         destination = Path(path).resolve()
         if self.session_path is not None and destination == self.session_path.resolve():
+            if not self._close_project():
+                raise RuntimeError("项目服务尚未停止，无法恢复会话")
             if destination.exists():
                 data = load_session(
                     destination, allow_incomplete_tool_batch=True, allow_pending_user_tail=True,
                 )
                 self._restore_vision(data)
                 self._restore_self_check(data)
+                self.plan_runtime = PlanRuntime(data.plan_state)
             elif self.vision_runtime is not None:
                 self.vision_runtime.cancel()
                 self.vision_runtime = None
@@ -884,13 +922,17 @@ class InteractiveRuntime:
         except BaseException:
             lease.release()
             raise
-        self.close()
+        if not self.close():
+            lease.release()
+            raise RuntimeError("项目服务尚未停止，无法切换会话")
         self.workspace = data.workspace.resolve()
         self.session_path = destination.resolve()
         self.lease = lease
         self.title = data.title
         self.sticky_skills = data.sticky_skills
         self.last_task_state = data.task_state
+        self.plan_runtime = PlanRuntime(data.plan_state)
+        self.history_warning_level = 0
         self._restore_vision(data)
         self._restore_self_check(data)
         self.first_task = next(
@@ -903,6 +945,7 @@ class InteractiveRuntime:
             None,
         )
         self.messages = self._recover_loaded_data(data)
+        self._warn_history()
 
     def _recover_failed_turn(
         self,
@@ -982,6 +1025,7 @@ class InteractiveRuntime:
         if resume_data is not None:
             self._restore_vision(resume_data)
             self._restore_self_check(resume_data)
+            self.plan_runtime = PlanRuntime(resume_data.plan_state)
             request_id = None if resume_data.user_request_id is not None else str(uuid.uuid4())
         else:
             if self.vision_runtime is not None:
@@ -1002,11 +1046,10 @@ class InteractiveRuntime:
                 # Legacy logs cannot distinguish an original request from a Stop
                 # continuation; past execution is uncertain, not a clean reset.
                 with self.session_write_lock:
-                    entries = session_audit_entries(self.session_path)
-                if any(entry["type"] == "tool.execution_started"
-                       and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}
-                       for entry in entries):
-                    self.self_check_runtime.mark_unknown()
+                    if any(entry["type"] == "tool.execution_started"
+                           and entry["tool_name"] not in READ_ONLY_TOOL_NAMES | {"task"}
+                           for entry in iter_session_audit_entries(self.session_path)):
+                        self.self_check_runtime.mark_unknown()
         first_snapshot = True
         if self.first_task is None:
             self.first_task = task
@@ -1021,7 +1064,8 @@ class InteractiveRuntime:
         self.task_type_consumed = True
         self.verification_runtime = None
         assert self.session_path is not None and self.lease is not None
-        self.self_check_runtime.set_internal_paths((self.session_path, self.lease.lock_path))
+        self.self_check_runtime.set_internal_paths((self.session_path, self.lease.lock_path,
+                                                  *session_internal_paths(self.session_path)))
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
         self.self_check_runtime.approval_callback = (
             renderer.paused(lambda summary: request_environment_preparation(
@@ -1029,6 +1073,22 @@ class InteractiveRuntime:
             ))
         ) if bool(getattr(self.args, "interactive_terminal", False)) else None
         self.last_task_outcome = None
+
+        if self.project_runtime is None:
+            self.project_runtime = ProjectRuntime(
+                self.workspace, session_key=str(self.session_path), command_sandbox=self.command_sandbox,
+            )
+            self.project_runtime.browser = ProjectBrowser(
+                self.project_runtime.browser_scope, redactor=self.project_runtime._redact,
+            )
+        self.project_runtime.environment_approval_callback = self.self_check_runtime.approval_callback
+        self.project_runtime.browser.approval_callback = self.self_check_runtime.approval_callback
+        self.project_runtime.browser.begin_request()
+        self.project_runtime.network_approval_callback = renderer.paused(lambda summary: (
+            make_interactive_approval(self.workspace, self.console)(
+                "project_network", {}, "允许当前服务启动配置访问外网；不同于依赖安装联网许可。"
+            ) if bool(getattr(self.args, "interactive_terminal", False)) else False
+        ))
 
         def snapshot(messages: list[dict[str, object]]) -> None:
             nonlocal latest, first_snapshot
@@ -1052,6 +1112,8 @@ class InteractiveRuntime:
             if event_type == "self_check_state":
                 assert self.session_path is not None
                 self._append_event("self_check.state", payload)
+            elif event_type == "plan_state":
+                self._append_event("plan.state", payload)
             elif event_type == "task_outcome":
                 self.last_task_outcome = validate_task_outcome(payload)
             renderer(event_type, payload)
@@ -1077,6 +1139,8 @@ class InteractiveRuntime:
                 initial_messages=self.messages,
                 token_counter=self.token_counter,
                 skill_runtime=self.skill_runtime,
+                plan_runtime=self.plan_runtime,
+                project_runtime=self.project_runtime,
                 self_check_runtime=self.self_check_runtime,
                 vision_runtime=self.vision_runtime,
                 on_vision_budget_exhausted=renderer.paused(lambda runtime: request_extra_vision_calls(
@@ -1113,6 +1177,8 @@ class InteractiveRuntime:
                 self.sticky_skills = self.skill_runtime.sticky_names
             renderer.close()
 
+            self._warn_history()
+
         if self.last_task_outcome is None or self.last_task_outcome.get("status") not in {
             "completed", "incomplete", "failed", "interrupted",
         }:
@@ -1136,7 +1202,8 @@ class InteractiveRuntime:
                 self._save(self.messages)
 
     def new_session(self) -> None:
-        self.close()
+        if not self.close():
+            raise RuntimeError("项目服务尚未停止，无法新建会话")
         self.messages = None
         self.session_path = None
         self.title = ""
@@ -1146,6 +1213,8 @@ class InteractiveRuntime:
         self.pending_skill_activations = None
         self.last_task_state = None
         self.last_task_outcome = None
+        self.plan_runtime = PlanRuntime()
+        self.history_warning_level = 0
 
     def compact_context(self) -> bool:
         if not self.messages:
@@ -1163,6 +1232,8 @@ class InteractiveRuntime:
             allow_run_command=bool(getattr(self.args, "allow_run_command", False)),
             allow_subagent=bool(getattr(self.args, "allow_subagent", True)),
             allow_self_check=True,
+            allow_plans=True,
+            allow_project_runtime=True,
         )
         before_tokens = self.token_counter.count_request(self.messages, tools)
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
@@ -1213,6 +1284,8 @@ class InteractiveRuntime:
                 allow_run_command=self.args.allow_run_command,
                 allow_subagent=self.args.allow_subagent,
                 allow_self_check=True,
+                allow_plans=True,
+                allow_project_runtime=True,
             )
             used_tokens = self.token_counter.count_request(self.messages, tools)
             percent = context_percentage(used_tokens, self.args.max_context_tokens)
@@ -1384,12 +1457,9 @@ def _manage_sessions(runtime: InteractiveRuntime) -> None:
                 runtime.console.print(
                     Text("不能删除当前正在使用的 Session。", style="red")
                 )
-            elif _confirm("仅删除该 Session 文件？"):
-                lease = SessionLease(entry.path).acquire()
-                try:
-                    delete_session(entry.path)
-                finally:
-                    lease.release()
+            elif _confirm("仅删除该 Session 及其分段历史？"):
+                # The shared deletion boundary owns the one non-reentrant lease.
+                delete_session(entry.path)
 
 
 def _manage_skills(runtime: InteractiveRuntime) -> None:
@@ -1538,6 +1608,7 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
     explicit_new_path: Path | None = args.session_file
     workspace: Path | None = args.workspace
     data: SessionData | None = None
+    runtime: InteractiveRuntime | None = None
 
     try:
         if session_path is not None:
@@ -1622,6 +1693,7 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
             title=data.title if data else "",
             sticky_skills=data.sticky_skills if data else (),
             last_task_state=data.task_state if data else None,
+            plan_runtime=PlanRuntime(data.plan_state if data else None),
             first_task=next(
                 (
                     str(message.get("content"))
@@ -1637,11 +1709,14 @@ def run_interactive(args: object, *, startup_directory: Path | None = None) -> i
             runtime._restore_vision(data)
             runtime._restore_self_check(data)
             runtime.messages = runtime._recover_loaded_data(data)
+            runtime._warn_history()
         try:
             return run_repl(runtime)
         except (KeyboardInterrupt, EOFError):
             runtime.close()
             return 0
     finally:
+        if runtime is not None:
+            runtime.close()
         if initial_lease is not None:
             initial_lease.release()
