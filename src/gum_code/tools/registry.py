@@ -507,26 +507,66 @@ SELF_CHECK_SCHEMA = {
     "function": {
         "name": "self_check",
         "description": (
-            "Check actual code changes in the current request using relevant project "
-            "syntax, build and test commands. Reports real results for repair and retest; "
-            "does nothing when no code changed. The host selects commands and asks "
-            "the user before preparing a missing environment. No check registration needed."
+            "Verify current changes using checks chosen for the user goal, changed code "
+            "and affected callers. Supply exact commands or a saved nonvisual browser "
+            "scenario; add and retain minimal tests when suitable tests are missing. "
+            "The host records execution facts in an isolated environment; missing "
+            "environment preparation still requires consent. Empty arguments report "
+            "current changes and evidence without selecting or running checks."
         ),
-        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        "parameters": {"type": "object", "properties": {
+            "checks": {"type": "array", "maxItems": 8, "items": {
+                "type": "object", "properties": {
+                    "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,63}$", "description": "Stable logical check ID; reuse it when repairing and retesting."},
+                    "purpose": {"type": "string", "maxLength": 1000, "description": "Behavior from the request that this check covers."},
+                    "paths": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 32,
+                              "description": "Workspace-relative changed or affected source/test paths."},
+                    "expected": {"type": "string", "maxLength": 1000, "description": "Expected behavior; this is not a claim that it passed."},
+                    "kind": {"type": "string", "enum": ["command", "browser"]},
+                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                             "description": "Command only: complete program name followed by exact arguments."},
+                    "cwd": {"type": "string", "description": "Command only: workspace-relative project directory."},
+                    "ecosystem": {"type": "string", "enum": ["python", "node", "prepared"]},
+                    "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+                    "runner": {"type": "string", "enum": ["pytest", "unittest"],
+                               "description": "Optional command adapter observing normal test cases at the exact supplied targets."},
+                    "service": {"type": "string", "description": "Browser only: current approved project service name."},
+                    "test_file": {"type": "string", "description": "Browser only: retained workspace-relative JSON scenario with path and bounded steps; include objective assertions, no visual checks."},
+                    "build_check": {"type": "string", "description": "Browser only: build check ID supplying current build evidence."},
+                    "artifact_paths": {"type": "array", "items": {"type": "string"}, "maxItems": 16,
+                                       "description": "Workspace-relative build outputs whose content must match current build evidence."},
+                }, "required": ["id", "purpose", "paths", "expected", "kind"],
+                "additionalProperties": False,
+            }},
+            "exclusions": {"type": "array", "maxItems": 256, "items": {
+                "type": "object", "properties": {
+                    "path": {"type": "string"},
+                    "reason": {"type": "string", "enum": ["visual"]},
+                }, "required": ["path", "reason"], "additionalProperties": False,
+            }, "description": "Propose purely visual scope to exclude; independent review must confirm it."},
+        }, "additionalProperties": False},
     },
 }
 
 
-def _validate_self_check(workspace: Path, *, runtime=None) -> None:
+def _validate_self_check(workspace: Path, *, runtime=None, **arguments) -> dict:
     if runtime is None or not callable(getattr(runtime, "execute", None)):
         raise ValueError("自检运行状态不可用")
     if Path(runtime.workspace).resolve() != workspace.resolve():
         raise ValueError("自检工作区不匹配")
+    from gum_code.self_check import validate_self_check_arguments
+    checked = validate_self_check_arguments(workspace, arguments)
+    if any(check.get("kind") == "command" and check_hard_deny("run_command", check)
+           for check in checked.get("checks", ())):
+        raise ValueError("自检命令被策略拒绝")
+    return checked
 
 
-def _run_self_check(workspace: Path, *, runtime, command_runner, cancel_event=None) -> str:
-    _validate_self_check(workspace, runtime=runtime)
-    return runtime.execute(command_runner=command_runner, cancel_event=cancel_event)
+def _run_self_check(workspace: Path, *, runtime, command_runner, browser_runner,
+                    cancel_event=None, **arguments) -> str:
+    checked = _validate_self_check(workspace, runtime=runtime, **arguments)
+    return runtime.execute(**checked, command_runner=command_runner,
+                           browser_runner=browser_runner, cancel_event=cancel_event)
 
 
 ALL_TOOL_SCHEMAS: dict[str, dict] = {
@@ -632,11 +672,13 @@ ALL_TOOL_SCHEMAS.update({
             "name": "project_browser",
             "description": "Observe and interact with a currently running project_service webpage in an isolated browser. Open by service name and relative path; read controls before click/fill. No arbitrary URLs or scripts. Results are observations, not a test-pass certificate. Missing environment requires preparation consent.",
             "parameters": {"type": "object", "properties": {
-                "action": {"type": "string", "enum": ["open", "read", "click", "fill"]},
+                "action": {"type": "string", "enum": ["open", "read", "click", "fill", "assert"]},
                 "service": {"type": "string", "maxLength": 32},
                 "path": {"type": "string", "maxLength": 2000},
                 "selector": {"type": "string", "maxLength": 500},
                 "value": {"type": "string", "maxLength": 4000},
+                "assertion": {"type": "string", "enum": ["count", "text", "value", "url", "resource_status", "no_errors"]},
+                "expected": {"type": ["string", "integer", "boolean"]},
             }, "required": ["action"], "additionalProperties": False},
         },
     },
@@ -710,13 +752,6 @@ def execute_tool(
     if handler is None:
         return f"Error: Unknown tool: {tool_name}"
 
-    # A requested browser check stays incomplete until the real action succeeds.
-    # Keep this host-only and independent of model text or persisted history.
-    if tool_name == "project_browser" and project_runtime is not None:
-        project_runtime.browser.request_attempted = True
-        browser_failed_before = project_runtime.browser.request_failed
-        project_runtime.browser.request_failed = True
-
     try:
         arguments = json.loads(arguments_json)
     except json.JSONDecodeError:
@@ -734,9 +769,6 @@ def execute_tool(
         ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
     ):
         return "Error: Invalid tool arguments"
-
-    if tool_name == "self_check" and arguments:
-        return "Error: self_check requires an empty JSON object"
 
     if tool_name in {"write_file", "edit_file", "delete_file"} and arguments.keys() - (
         ALL_TOOL_SCHEMAS[tool_name]["function"]["parameters"]["properties"].keys()
@@ -771,7 +803,8 @@ def execute_tool(
                 preflight(workspace=workspace, runtime=project_runtime,
                           browser=tool_name == "project_browser", **arguments)
             elif tool_name == "self_check":
-                preflight(workspace=workspace, runtime=self_check_runtime)
+                arguments = preflight(workspace=workspace, runtime=self_check_runtime,
+                                      **arguments)
             elif tool_name == "run_command":
                 preflight(
                     workspace=workspace,
@@ -817,7 +850,8 @@ def execute_tool(
     if tool_name == "self_check":
         def run_check(check_arguments, sandbox):
             outcomes: list[CommandExecutionResult] = []
-            # Only host-discovered commands enter this closure; model JSON has no argv.
+            # The runtime supplies the current change scope and leased offline sandbox.
+            # Exact-call approval cannot grant ordinary run_command broader permission.
             checked = copy.deepcopy(check_arguments)
             output = execute_tool(
                 workspace, "run_command", json.dumps(checked),
@@ -830,16 +864,66 @@ def execute_tool(
             )
             return output, outcomes[-1] if outcomes else None
 
+        def run_browser_check(check, input_version):
+            if project_runtime is None:
+                return "Error: Project runtime unavailable", {
+                    "started": False, "reason": "runtime_unavailable",
+                }
+            def service_snapshot(target, version):
+                project_runtime.internal_paths = tuple(self_check_runtime._internal_paths)
+                paths = target.get("artifact_paths", []) if target.get("build_check") else target["paths"]
+                return project_runtime.browser_evidence(target["service"], version, paths)
+
+            self_check_runtime.browser_evidence_callback = service_snapshot
+            service_evidence = service_snapshot(check, input_version)
+
+            def run_step(step):
+                current = service_snapshot(check, input_version)
+                if (not current.get("current") or current.get("service_identity")
+                        != service_evidence.get("service_identity")
+                        or current.get("source_version") != service_evidence.get("source_version")):
+                    return "Error: Browser service changed during verification"
+                checked = copy.deepcopy(step)
+                approval_values = copy.deepcopy(checked)
+                if "value" in approval_values:
+                    approval_values["value"] = "<REDACTED>"
+                return execute_tool(
+                    workspace, "project_browser", json.dumps(checked),
+                    approval_callback=lambda name, values, reason: (
+                        name == "project_browser" and values == approval_values
+                    ),
+                    pre_tool_use_callback=pre_tool_use_callback,
+                    post_tool_use_callback=post_tool_use_callback,
+                    cancel_event=cancel_event, project_runtime=project_runtime,
+                )
+
+            output, facts = project_runtime.browser.execute_check(
+                workspace, check, input_version, action_runner=run_step,
+                service_evidence=service_evidence, cancel_event=cancel_event,
+            )
+            current = service_snapshot(check, input_version)
+            if (service_evidence.get("current") is True
+                    and (not current.get("current") or current.get("service_identity")
+                         != service_evidence.get("service_identity")
+                         or current.get("source_version") != service_evidence.get("source_version"))):
+                facts = {**facts, "current": False, "reason": "service_changed"}
+                output = json.dumps({"status": "failed", "reason": "service_changed"})
+            return output, facts
+
         # Hook/callback exceptions inside a real check must escape, not become success text.
         result = handler(workspace=workspace, runtime=self_check_runtime,
-                         command_runner=run_check, cancel_event=cancel_event)
+                         command_runner=run_check, browser_runner=run_browser_check,
+                         cancel_event=cancel_event, **arguments)
         if post_tool_use_callback is not None:
-            post_tool_use_callback(tool_name, {}, result)
+            post_tool_use_callback(tool_name, copy.deepcopy(arguments), result)
         return result
 
     command_results: list[CommandExecutionResult] = []
     try:
         if tool_name in {"project_service", "project_browser"}:
+            if (self_check_runtime is not None
+                    and Path(self_check_runtime.workspace).resolve() == workspace.resolve()):
+                project_runtime.internal_paths = tuple(self_check_runtime._internal_paths)
             result = handler(workspace=workspace, runtime=project_runtime,
                              cancel_event=cancel_event, **arguments)
         elif tool_name == "run_command":
@@ -878,10 +962,6 @@ def execute_tool(
             copy.deepcopy(arguments),
             result,
         )
-
-    if tool_name == "project_browser" and project_runtime is not None:
-        project_runtime.browser.request_failed = browser_failed_before
-        project_runtime.browser.note_result(result)
 
     # A completed process is not accepted evidence until the post-Hook succeeds.
     # Keep the external callback outside handler error conversion as well.

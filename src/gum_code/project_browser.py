@@ -1,9 +1,12 @@
 """Bounded current-project browser actions in an optional Docker environment."""
 
+import hashlib
 import json
+import os
 import queue
 import re
 import secrets
+import stat
 import subprocess
 import threading
 import time
@@ -13,6 +16,7 @@ from urllib.parse import urlsplit
 
 from gum_code.tools.command import DockerSandboxConfig, _inspect_local_image, _stop_process, _run_docker_control
 from gum_code.project_environment import _absent_resource
+from gum_code.tools.common import _reject_symlinks, _resolve_workspace_path
 
 BROWSER_VERSION = "1.58.0"
 BROWSER_BASE = f"mcr.microsoft.com/playwright/python:v{BROWSER_VERSION}-noble"
@@ -21,15 +25,18 @@ MAX_BROWSER_RESULT = 32_000
 MAX_BROWSER_WIRE = 256_000
 MAX_BROWSER_VALUE = 4_000
 BROWSER_TIMEOUT = 30
+MAX_SCENARIO_BYTES = 32_000
+MAX_SCENARIO_STEPS = 32
 
 # The worker has no workspace mount, arbitrary script API or user browser profile.
 _WORKER = r'''
 import json, sys
 from urllib.parse import urlsplit
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, expect
 
 allowed = set()
 errors = []
+resources = {}
 def origin(url):
     p = urlsplit(url)
     return p.scheme + "://" + p.netloc
@@ -45,9 +52,28 @@ def emit(value):
         wire = json.dumps({"status":"failed","reason":"browser_output_limit"}) + "\n"
     sys.stdout.write(wire)
     sys.stdout.flush()
+def response_result(response):
+    if response.status >= 400 and len(errors) < 12: errors.append("http_error")
+    if len(resources) < 128: resources[response.url] = response.status
+def assert_result(request, page):
+    kind, expected = request["assertion"], request["expected"]
+    if kind in {"count", "text", "value"}:
+        target = page.locator(request["selector"])
+        if kind == "count": expect(target).to_have_count(expected)
+        elif kind == "text": expect(target).to_have_text(expected)
+        else: expect(target).to_have_value(expected)
+    elif kind == "url":
+        expect(page).to_have_url(origin(page.url) + expected)
+    elif kind == "resource_status":
+        if resources.get(origin(page.url) + request["path"]) != expected: raise AssertionError()
+    elif kind == "no_errors":
+        if errors: raise AssertionError()
+    else: raise ValueError()
+    return {"assertion":kind,"passed":True}
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
-    context = browser.new_context(accept_downloads=False, service_workers="block")
+    context = browser.new_context(accept_downloads=False, service_workers="block",
+        extra_http_headers={"Cache-Control":"no-cache"})
     context.route("**/*", route)
     context.route_web_socket("**/*", lambda socket: socket.close())
     page = context.new_page()
@@ -56,30 +82,33 @@ with sync_playwright() as p:
     page.on("dialog", lambda dialog: dialog.dismiss())
     page.on("pageerror", lambda error: errors.append("page_script_error") if len(errors) < 12 else None)
     page.on("console", lambda message: errors.append("page_console_error") if message.type == "error" and len(errors) < 12 else None)
-    page.on("response", lambda response: errors.append("http_error") if response.status >= 400 and len(errors) < 12 else None)
+    page.on("response", response_result)
     page.on("requestfailed", lambda request: errors.append("request_failed") if len(errors) < 12 else None)
     emit({"status":"ready"})
     for line in sys.stdin:
         try:
             request = json.loads(line)
             allowed = set(request["origins"])
-            errors.clear()
             action = request["action"]
+            assertion = None
             if action == "open":
+                errors.clear()
+                resources.clear()
                 if origin(request["url"]) not in allowed: raise ValueError()
-                page.goto(request["url"], wait_until="domcontentloaded")
+                page.goto(request["url"], wait_until="load")
             else:
                 if origin(page.url) not in allowed: raise ValueError()
                 if action == "click": page.locator(request["selector"]).click()
                 elif action == "fill": page.locator(request["selector"]).fill(request["value"])
+                elif action == "assert": assertion = assert_result(request, page)
                 elif action != "read": raise ValueError()
             if origin(page.url) not in allowed: raise ValueError()
             text = page.locator("body").inner_text(timeout=5000)
             controls = page.locator("input,button,textarea,select,a").evaluate_all(
                 "els => els.slice(0,60).map(e => ({tag:e.tagName.toLowerCase(),id:e.id,name:e.getAttribute('name')||'',type:e.getAttribute('type')||'',text:e.innerText||''}))")
-            emit({"status":"observed","url":page.url,"text":text,
+            emit({"status":"asserted" if assertion else "observed","assertion":assertion,"url":page.url,"text":text,
                   "truncated":False,"controls":controls,"errors":errors[:12],
-                  "coverage":"interaction_observation_not_test_pass"})
+                  "coverage":"nonvisual_assertion" if assertion else "interaction_observation_not_test_pass"})
         except Exception:
             emit({"status":"failed","reason":"browser_action_failed","errors":errors[:12]})
     context.close()
@@ -106,50 +135,130 @@ class ProjectBrowser:
 
     def begin_request(self) -> None:
         self.denied = False
-        self.request_attempted = False
-        self.request_failed = False
-
-    def note_result(self, result: str) -> None:
-        self.request_attempted = True
-        try:
-            value = json.loads(result)
-            failed = not isinstance(value, dict) or value.get("status") != "observed" or bool(value.get("errors"))
-        except (TypeError, ValueError):
-            failed = True
-        self.request_failed = self.request_failed or failed
-
-    def completion_notice(self) -> str | None:
-        if not self.request_attempted:
-            return None
-        if self.request_failed:
-            return "浏览器检查存在失败或未完成项；后续成功操作不能证明这些缺口已全部解决。"
-        return "浏览器已执行本轮操作并返回观测结果；这不代表所有业务流程均已验证。"
 
     def validate(self, arguments: dict) -> None:
         if not isinstance(arguments, dict) or arguments.keys() - {
-            "action", "service", "path", "selector", "value",
+            "action", "service", "path", "selector", "value", "assertion", "expected",
         }:
             raise ValueError("Invalid browser arguments")
         action = arguments.get("action")
-        if action not in {"open", "read", "click", "fill"}:
+        if action not in {"open", "read", "click", "fill", "assert"}:
             raise ValueError("Invalid browser action")
+        keys = {"open": {"service", "path"}, "read": set(), "click": {"selector"},
+                "fill": {"selector", "value"}, "assert": {"assertion", "expected", "selector", "path"}}
+        if arguments.keys() - {"action"} - keys[action]:
+            raise ValueError("Unexpected browser action fields")
         if action == "open":
             service = arguments.get("service")
             if not isinstance(service, str) or not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", service):
                 raise ValueError("Invalid project service")
-            path = arguments.get("path", "/")
+        if action == "open" or (action == "assert" and arguments.get("assertion") in {"url", "resource_status"}):
+            path = arguments.get("expected") if arguments.get("assertion") == "url" else arguments.get("path", "/")
             if (not isinstance(path, str) or len(path) > 2000 or not path.startswith("/")
                     or path.startswith("//") or "\\" in path
                     or any(ord(c) < 32 for c in path) or urlsplit(path).netloc):
                 raise ValueError("Browser path must stay in the project")
-        if action in {"click", "fill"}:
+        if action in {"click", "fill"} or (action == "assert" and arguments.get("assertion") in {"count", "text", "value"}):
             selector = arguments.get("selector")
             if not isinstance(selector, str) or not selector.strip() or len(selector) > 500:
                 raise ValueError("Invalid browser selector")
+            if action == "assert" and re.search(r":(?:visible|hidden)\b", selector):
+                raise ValueError("Visual assertions are excluded")
         if action == "fill":
             value = arguments.get("value")
             if not isinstance(value, str) or len(value) > MAX_BROWSER_VALUE:
                 raise ValueError("Invalid browser value")
+        if action == "assert":
+            kind, expected = arguments.get("assertion"), arguments.get("expected")
+            if kind not in {"count", "text", "value", "url", "resource_status", "no_errors"}:
+                raise ValueError("Invalid nonvisual assertion")
+            extra = {"selector"} if kind in {"count", "text", "value"} else {"path"} if kind == "resource_status" else set()
+            if arguments.keys() - {"action", "assertion", "expected"} - extra:
+                raise ValueError("Unexpected assertion fields")
+            if kind in {"count", "resource_status"}:
+                low, high = (0, 10000) if kind == "count" else (100, 599)
+                if type(expected) is not int or not low <= expected <= high:
+                    raise ValueError("Invalid assertion expected count/status")
+            elif kind == "no_errors":
+                if expected is not True:
+                    raise ValueError("no_errors expects true")
+            elif not isinstance(expected, str) or len(expected) > MAX_BROWSER_VALUE:
+                raise ValueError("Invalid assertion expected text")
+
+    def load_scenario(self, workspace: Path, test_file: str) -> tuple[dict, str]:
+        """Read the retained test, never executable code or an arbitrary file URL."""
+        path = _resolve_workspace_path(workspace, test_file)
+        _reject_symlinks(workspace, test_file)
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > MAX_SCENARIO_BYTES:
+                raise ValueError("Browser scenario must be a bounded regular JSON file")
+            content = stream.read(MAX_SCENARIO_BYTES + 1)
+            after = os.fstat(stream.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError("Browser scenario changed while reading")
+        if len(content) > MAX_SCENARIO_BYTES:
+            raise ValueError("Browser scenario exceeds limit")
+        scenario = json.loads(content)
+        if not isinstance(scenario, dict) or set(scenario) != {"path", "steps"}:
+            raise ValueError("Browser scenario requires path and steps")
+        self.validate({"action": "open", "service": "scenario", "path": scenario["path"]})
+        steps = scenario["steps"]
+        if not isinstance(steps, list) or not 1 <= len(steps) <= MAX_SCENARIO_STEPS:
+            raise ValueError("Browser scenario requires 1–32 steps")
+        for step in steps:
+            self.validate(step)
+            if step["action"] == "open":
+                raise ValueError("Browser scenario has one service-bound entry path")
+        if not any(step["action"] == "assert" for step in steps):
+            raise ValueError("Browser scenario requires a nonvisual assertion")
+        return scenario, hashlib.sha256(content).hexdigest()
+
+    def execute_check(self, workspace: Path, check: dict, input_version: str, *, action_runner,
+                      service_evidence: dict, cancel_event=None) -> tuple[str, dict]:
+        """Replay bounded retained steps through the registry's ordinary tool gates."""
+        facts = {"started": False, "reason": "browser_unverified", "assertions": [],
+                 "input_version": input_version, "service_identity": service_evidence.get("service_identity"),
+                 "service": service_evidence, "visual": "excluded"}
+        if service_evidence.get("current") is not True:
+            facts["reason"] = service_evidence.get("reason", "service_unverified")
+            return json.dumps(facts, ensure_ascii=False), facts
+        try:
+            scenario, digest = self.load_scenario(workspace, check["test_file"])
+        except (OSError, ValueError, TypeError, KeyError):
+            facts["reason"] = "invalid_browser_scenario"
+            return json.dumps(facts, ensure_ascii=False), facts
+        facts["scenario_version"] = digest
+        steps = [{"action": "open", "service": check["service"], "path": scenario["path"]}, *scenario["steps"]]
+        for index, step in enumerate(steps):
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt
+            output = action_runner(step)
+            try:
+                result = json.loads(output.removeprefix("Error: 浏览器检查失败 "))
+            except (OSError, ValueError, TypeError, AttributeError):
+                result = {}
+            if not isinstance(result, dict):
+                result = {}
+            facts["started"] = facts["started"] or result.get("status") in {"observed", "asserted", "failed"}
+            assertion = result.get("assertion")
+            if step["action"] == "assert":
+                passed = (result.get("status") == "asserted" and isinstance(assertion, dict)
+                          and assertion.get("assertion") == step["assertion"] and assertion.get("passed") is True)
+                facts["assertions"].append({"step": index, "assertion": step["assertion"], "passed": passed})
+            else:
+                passed = result.get("status") == "observed"
+            if not passed or result.get("errors"):
+                facts["reason"] = "browser_check_failed"
+                facts["failed_step"] = index
+                return json.dumps(facts, ensure_ascii=False), facts
+        try:
+            _, current = self.load_scenario(workspace, check["test_file"])
+        except (OSError, ValueError, TypeError):
+            current = None
+        facts["reason"] = "exited" if current == digest else "scenario_changed"
+        return json.dumps(facts, ensure_ascii=False), facts
 
     def _prepare(self, docker: Path, cancel_event=None) -> str | None:
         if cancel_event is not None and cancel_event.is_set():
