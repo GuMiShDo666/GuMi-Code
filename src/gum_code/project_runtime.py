@@ -21,6 +21,7 @@ from gum_code.permissions.policy import PermissionDecision
 from gum_code.tools import command
 from gum_code.tools.command_logs import CommandCapture, _OMITTED, _open_private_file
 from gum_code.tools.common import _resolve_workspace_path
+from gum_code.verification import workspace_snapshot
 
 MAX_SERVICES = 8
 MAX_SERVICE_LOG_CHARS = 18000
@@ -88,6 +89,8 @@ class ProjectRuntime:
         self._secrets: set[str] = set()
         self._closed = False
         self._lock = threading.RLock()
+        self.internal_paths: tuple[Path, ...] = ()
+        self._start_failures: dict[str, dict] = {}
 
     def validate(self, arguments: dict) -> dict:
         """No Docker or storage side effects; handler repeats validation after gates."""
@@ -121,6 +124,7 @@ class ProjectRuntime:
                 or any(not isinstance(arg, str) or not arg or len(arg) > 4096 or "\x00" in arg for arg in argv)
                 or not isinstance(cwd, str) or not isinstance(ecosystem, str) or ecosystem not in {"python", "node", "prepared"}):
             raise ValueError("项目服务命令或环境无效")
+        command._validate_program(argv)
         if port is not None and (type(port) is not int or not 1024 <= port <= 65535):
             raise ValueError("应用端口必须在 1024–65535 之间")
         if database is not None and (not isinstance(database, str) or not re.fullmatch(SERVICE_NAME_PATTERN, database)):
@@ -162,16 +166,28 @@ class ProjectRuntime:
             if action in {"start", "stop", "restart"} and approved is not True and not self.approved_restart(args):
                 raise ValueError("项目服务操作需要批准")
             if action == "start":
-                result = self._start(args, cancel_event)
+                result = self._attempt_start(args, cancel_event)
             elif action == "status":
                 result = self._status(name) if name else {"services": [self._status(key) for key in self.services]}
+                for status in [result] if name else result["services"]:
+                    if status.get("status") in {"exited", "dead"}:
+                        self._remember_failure(self.services[status["name"]]["config"])
             elif action == "logs":
                 item = self._item(name)
+                if item.get("container") and self._status(name, probe=False).get("status") in {"exited", "dead"}:
+                    self._remember_failure(item["config"])
                 text, truncated = item["capture"].render("service output", MAX_SERVICE_LOG_CHARS)
                 text = self._redact(text, truncated=truncated, service_logs=True)
                 truncated = truncated or len(text) > MAX_SERVICE_LOG_CHARS
                 result = {"name": name, "output": text[:MAX_SERVICE_LOG_CHARS], "truncated": truncated,
                           "capture_complete": item["capture_done"].is_set(), "capture_error": item.get("capture_error", False)}
+                if item.get("config"):
+                    failure = self._start_failures.get(self._failure_key(item["config"]))
+                    if failure is not None and text and not result["capture_error"]:
+                        digest = environment._digest([text])
+                        failure["diagnosed"] = digest != failure.get("diagnosis")
+                        failure["diagnosis"] = digest
+                        failure["port_conflict"] = bool(re.search(r"address already in use|eaddrinuse", text, re.I))
             elif action == "stop":
                 result = self._stop(name)
             else:
@@ -182,10 +198,63 @@ class ProjectRuntime:
                     raise ValueError("服务配置已变化，需要重新批准")
                 item["reuse_environment"] = reuse
                 self._stop(name)
-                result = self._start(config, cancel_event)
+                result = self._attempt_start(config, cancel_event)
             if self._environment_cleanup or self._preparations:
                 result["cleanup_required"] = sorted(self._environment_cleanup | self._preparations)
             return json.dumps(result, ensure_ascii=False)
+
+    def _snapshot(self) -> dict | None:
+        try:
+            return workspace_snapshot(self.workspace, internal_paths=self.internal_paths)
+        except (OSError, ValueError, RuntimeError):
+            return None
+
+    @staticmethod
+    def _failure_key(config: dict) -> str:
+        # Names and equivalent port substitutions are not a new executable.
+        value = {key: data for key, data in config.items() if key not in {"name", "port", "action"}}
+        if config.get("port"):
+            port = str(config["port"])
+            value["argv"] = ["<port>" if arg == port else arg.rsplit("=", 1)[0] + "=<port>"
+                             if "=" in arg and arg.rsplit("=", 1)[1] == port else arg
+                             for arg in config.get("argv", [])]
+        return environment._digest(value)
+
+    def _remember_failure(self, config: dict) -> None:
+        key = self._failure_key(config)
+        item = self.services.get(config["name"], {})
+        snapshot = item.get("source_snapshot") if item.get("container") else self._snapshot()
+        signature = environment._digest(snapshot) if snapshot is not None else None
+        previous = self._start_failures.get(key, {})
+        self._start_failures[key] = {**previous, "source": signature, "diagnosed": False,
+                                     "port": config.get("port")}
+        # ponytail: bounded recent launch failures; use durable history only if a
+        # single invocation needs more than the existing service configuration cap.
+        if len(self._start_failures) > MAX_SERVICES:
+            del self._start_failures[next(iter(self._start_failures))]
+
+    def _attempt_start(self, config: dict, cancel_event) -> dict:
+        if self.services.get(config["name"], {}).get("container"):
+            raise ValueError("该服务已登记；请使用 restart 或先 stop")
+        key = self._failure_key(config)
+        previous = self._start_failures.get(key)
+        snapshot = self._snapshot()
+        source = environment._digest(snapshot) if snapshot is not None else None
+        if previous and previous["source"] == source:
+            port_changed = previous["port"] != config.get("port")
+            if not previous.get("diagnosed") or (port_changed and not previous.get("port_conflict")):
+                raise ValueError("同一服务启动失败后必须先读取状态/日志并修正原因；换名称或无关端口不能重试")
+            previous["diagnosed"] = False
+        try:
+            result = self._start(config, cancel_event)
+        except (ValueError, OSError, subprocess.SubprocessError):
+            self._remember_failure(config)
+            raise
+        if result.get("status") in {"exited", "dead"} or result.get("running") is False:
+            self._remember_failure(config)
+        else:
+            self._start_failures.pop(key, None)
+        return result
 
     def _item(self, name: str) -> dict:
         if name not in self.services:
@@ -428,6 +497,7 @@ class ProjectRuntime:
                         "--env-file", str(env_file), sandbox.image_id, "postgres"]
             item = {"config": copy.deepcopy(config), "sandbox": sandbox, "container": container, "stack": stack,
                     "identity": identity, "approved": True, "network_approved": online,
+                    "source_snapshot": self._snapshot(),
                     "capture": CommandCapture(), "capture_done": threading.Event(), "threads": [], "process": None, "preview": None}
             self.services[name] = item
             self._control(argv, cancel_event=cancel_event)
@@ -605,6 +675,94 @@ class ProjectRuntime:
                 if status["running"] and status["origin"]:
                     origins[name] = status["origin"]
             return {"docker_path": self.docker_path, "network": self.network, "origins": origins}
+
+    def browser_evidence(self, service: str, input_version: str, paths: list[str]) -> dict:
+        """Bind checks to a real launch; a fresh digest never updates an old process."""
+        with self._lock:
+            item = self.services.get(service)
+            if not item or not item.get("approved"):
+                return {"current": False, "reason": "service_unapproved"}
+            config = item["config"]
+            try:
+                status = self._status(service, probe=False)
+                identity_current = self._launch_identity(config, item["sandbox"]) == item["identity"]
+            except (ValueError, OSError, subprocess.SubprocessError):
+                return {"current": False, "reason": "service_unavailable"}
+            if not status.get("running") or not status.get("origin") or not identity_current:
+                return {"current": False, "reason": "service_unavailable_or_changed"}
+            current, started = self._snapshot(), item.get("source_snapshot")
+            document_root = self._static_root(config)
+            facts = {"current": False, "reason": "service_source_changed", "cwd": config["cwd"],
+                     "document_root": document_root, "static": document_root is not None,
+                     "service_identity": environment._digest([item["container"], item["identity"]]),
+                     "input_version": input_version,
+                     "source_version": environment._digest(current) if current is not None else None,
+                     "start_version": environment._digest(started) if started is not None else None}
+            if current is None or started is None:
+                facts["reason"] = "service_source_unknown"
+                return facts
+            if document_root is not None:
+                try:
+                    root = _resolve_workspace_path(self.workspace, document_root)
+                    # Static proof only applies to files actually served from this root.
+                    if any(not _resolve_workspace_path(self.workspace, path).is_relative_to(root) for path in paths):
+                        facts["reason"] = "static_scope_mismatch"
+                        return facts
+                except ValueError:
+                    facts["reason"] = "static_scope_mismatch"
+                    return facts
+            elif current != started:
+                return facts
+            related = {}
+            # ponytail: conservatively check all live apps, including a frontend's
+            # proxy backends; add dependency scoping only if restart cost warrants it.
+            for name, other in self.services.items():
+                if name == service or other["config"]["kind"] != "app" or not other.get("container"):
+                    continue
+                try:
+                    running = self._status(name, probe=False).get("running") is True
+                    unchanged = self._launch_identity(other["config"], other["sandbox"]) == other["identity"]
+                except (ValueError, OSError, subprocess.SubprocessError):
+                    running = unchanged = False
+                snapshot = other.get("source_snapshot")
+                if (not running or not unchanged or snapshot is None
+                        or (self._static_root(other["config"]) is None and snapshot != current)):
+                    facts["reason"] = "related_service_source_changed"
+                    return facts
+                related[name] = environment._digest([other["container"], other["identity"]])
+            facts["related_services"] = related
+            facts["service_identity"] = environment._digest([item["container"], item["identity"], related])
+            facts.update(current=True, reason="current")
+            return facts
+
+    def _static_root(self, config: dict) -> str | None:
+        """Recognize only stdlib static serving; other processes require restart."""
+        argv = config.get("argv", [])
+        if (len(argv) < 3 or not re.fullmatch(r"python(?:3(?:\.\d+)?)?", argv[0])
+                or argv[1:3] != ["-m", "http.server"]):
+            return None
+        # A local module can replace stdlib http.server under python -m.
+        cwd = self.workspace / config["cwd"]
+        if any((cwd / path).exists() for path in ("http", "http.py", "sitecustomize.py", "usercustomize.py")):
+            return None
+        directory, index = config["cwd"], 3
+        while index < len(argv):
+            arg = argv[index]
+            if arg in {"-d", "--directory", "--bind", "-b", "--protocol", "-p"} and index + 1 < len(argv):
+                if arg in {"-d", "--directory"}:
+                    directory = (Path(config["cwd"]) / argv[index + 1]).as_posix()
+                index += 2
+            elif arg.startswith("--directory="):
+                directory = (Path(config["cwd"]) / arg.split("=", 1)[1]).as_posix()
+                index += 1
+            elif arg.isdecimal() or arg.startswith(("--bind=", "--protocol=")):
+                index += 1
+            else:
+                return None
+        try:
+            return _resolve_workspace_path(self.workspace, directory).relative_to(self.workspace).as_posix()
+        except ValueError:
+            return None
 
     def has_active_services(self) -> bool:
         """Conservative local hint: Docker disconnect is not evidence of shutdown."""

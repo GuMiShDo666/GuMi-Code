@@ -212,6 +212,13 @@ def _validate_argument_paths(
             _reject_bad_path_argument(workspace, cwd_path, arg)
 
 
+def _validate_program(argv: list[str]) -> None:
+    if not argv or not isinstance(argv[0], str) or not argv[0].strip():
+        raise ValueError("命令不能为空")
+    if argv[0].lstrip().startswith("-"):
+        raise ValueError("argv 首项必须是程序名，例如 python3 -m http.server；不能以 -m 等选项开头")
+
+
 def _validate_run_command(
     workspace: Path,
     argv: list[str],
@@ -226,8 +233,7 @@ def _validate_run_command(
     if not all(isinstance(arg, str) for arg in argv):
         raise ValueError("argv 必须是字符串列表")
 
-    if not argv[0].strip():
-        raise ValueError("命令不能为空")
+    _validate_program(argv)
 
     if _launches_shell(argv):
         raise ValueError("禁止通过 run_command 启动 Shell 解释器")

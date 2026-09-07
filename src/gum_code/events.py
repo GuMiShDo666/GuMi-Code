@@ -213,6 +213,9 @@ def task_outcome_text(payload: dict[str, object]) -> str | None:
             "tests": "实际执行的测试已通过；仅代表此次检查范围。",
             "basic": "基础检查已通过；功能测试未验证。",
             "none": "自检未取得足够验证证据，已保留本轮结果。",
+            "execution": "所选命令与独立复核已完成；仅代表此次检查范围。",
+            "browser": "本次非视觉浏览器检查与独立复核已完成；视觉效果未验证。",
+            "excluded": "本轮适用检查仅涉及已排除的视觉范围；视觉效果未验证。",
         }
         return labels.get(coverage, "当前自检覆盖范围未确认，不能报告通过。") if isinstance(coverage, str) else "当前自检覆盖范围未确认，不能报告通过。"
     if check_status == "not_run" and "coverage" in payload:

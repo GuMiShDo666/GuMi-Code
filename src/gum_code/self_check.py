@@ -1,7 +1,6 @@
 """Track actual request-local changes and run bounded checks, never model verdicts."""
 
 import copy
-import ast
 import hashlib
 import json
 import os
@@ -10,13 +9,14 @@ import stat
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
 
 from gum_code.tools.command import CommandExecutionResult, DockerSandboxConfig
 from gum_code.tools.common import _is_sensitive_path, _reject_symlinks, _resolve_workspace_path
 from gum_code.tools.filesystem import FileChange
-from gum_code.verification import MAX_CHECKS, MAX_SCAN_FILES, MAX_SCAN_SECONDS, _ScanError
+from gum_code.verification import MAX_CHECKS, MAX_SCAN_SECONDS, _ScanError
 
 MAX_SELF_CHECK_STATE_BYTES = 64_000
 MAX_CHANGED_PATHS = 256
@@ -37,15 +37,14 @@ _DOCUMENT_NAMES = {"readme", "license", "licence", "notice", "authors", "changel
 _RESULT_STATUSES = {"not_needed", "passed", "failed", "not_run", "source_changed", "unknown"}
 _CHECK_STATUSES = {"passed", "failed", "not_run", "stale", "no_tests"}
 _BASIC_CHECKS = {"syntax", "build", "typecheck"}
-_COVERAGE = {"tests", "basic", "none"}
+_COVERAGE = {"tests", "basic", "none", "execution", "browser", "excluded"}
 _NO_TESTS_EXIT = 5
-# Fixed host-only programs use short argv lines because preflight checks them as
-# paths too. Model arguments cannot supply or replace this wrapper's source.
+# Observe normal test cases for explicit targets; these adapters never choose scope.
 _CHECK_BOOTSTRAP = "import sys; source='\\n'.join(sys.argv[1:-1]); sys.argv=sys.argv[:1]+sys.argv[-1:]; exec(source)"
-_PYTEST_CHECK = """import sys, traceback
+_PYTEST_CHECK = """import sys, traceback, json
 try:
     import pytest
-    sys.argv = ['pytest', '-q', '-p', 'no:cacheprovider']
+    sys.argv = ['pytest', *json.loads(sys.argv[-1])]
     class Results:
         passed = False
         interrupted = False
@@ -66,15 +65,16 @@ except (Exception, SystemExit):
     traceback.print_exc()
     code = 1
 sys.exit(code)"""
-_UNITTEST_CHECK = """import runpy, sys, traceback, types, unittest as u
+_UNITTEST_CHECK = """import sys, traceback, json, unittest as u
 try:
-    suite = u.defaultTestLoader.loadTestsFromModule(types.SimpleNamespace(**runpy.run_path(sys.argv[-1])))
     class Results(u.TextTestResult):
         passed = False
         def addSuccess(self, test):
             self.passed = True
             super().addSuccess(test)
-    result = u.TextTestRunner(resultclass=Results).run(suite)
+    runner = u.TextTestRunner(resultclass=Results)
+    result = u.TestProgram(module=None, argv=['unittest', *json.loads(sys.argv[-1])],
+                           testRunner=runner, exit=False).result
     code = 1 if not result.wasSuccessful() else 0 if result.passed else 5
 except KeyboardInterrupt:
     code = 130
@@ -84,15 +84,17 @@ except (Exception, SystemExit):
 sys.exit(code)"""
 
 SELF_CHECK_INSTRUCTION = (
-    "仅当前请求实际修改源码、测试或运行/构建配置后，在完成一组修改时调用 self_check。"
-    "读取、搜索、问答和纯文档修改无需自检。self_check 无参数，不登记计划或提交审阅。"
-    "根据真实失败在任务范围内修复后复测；不得弱化已有正确测试来制造通过。"
-    "相同输入的失败不要重复空跑；不能把静态阅读、安装成功或语法检查说成测试通过。"
-    "coverage=basic 仅表示基础检查通过，须说明功能测试未验证；smoke 只表示脚本运行。"
-    "no_tests 表示没有正常测试用例通过，不是功能测试成功；不得据此宣称全部需求已验证。"
-    "缺环境时由宿主询问准备，拒绝或缺输入后保留工作并说明未验证。"
-    "开发项目时维护原生依赖及版本清单和简短运行说明，优先更新已有清单与锁文件；"
-    "只记录实际依赖，不从宿主全局包生成清单，不为无依赖或无依赖变化的任务生成重复空文件。"
+    "实际修改代码后，按用户需求、当前差异、相关调用关系与项目规范选择最小适用检查。"
+    "self_check(checks=[...]) 只执行你选定的命令或已保存的非视觉浏览器场景；空参数只查询状态。"
+    "每项说明 purpose、paths 和 expected，指定完整 argv/cwd/ecosystem 或 service/test_file。"
+    "不要因上层有依赖清单而测试无关项目；缺适用测试就补最小测试并保留到项目。"
+    "浏览器场景保存为 JSON {path,steps}，步骤使用 open/read/click/fill/assert 的受限操作。"
+    "全部视觉检查排除；不得调用视觉模型或截图判断，页面结果说明视觉效果未验证。"
+    "纯视觉文件可提议 exclusions=[{path,reason:'visual'}]，由独立复核确认。"
+    "命令成功不等于功能覆盖；读取真实失败，修复后用同一 id 复测，不削弱正确断言。"
+    "需要构建产物时，命令声明 artifact_paths，浏览器引用 build_check 和相同 artifact_paths。"
+    "宿主在完成前独立复核原始需求、代码、测试和当前执行事实；不要自行提交通过结论。"
+    "缺环境由宿主请求准备；拒绝、预算不足或验证缺失时保留工作并说明未验证。"
 )
 
 
@@ -113,23 +115,12 @@ def _reason(value: object) -> str:
     return value
 
 
-def _check_coverage(checks: list[dict[str, object]]) -> str:
+def _legacy_coverage(checks: list[dict[str, object]]) -> str:
     passed = {check["name"] for check in checks if check["status"] == "passed"}
     return "tests" if "test" in passed else "basic" if passed & _BASIC_CHECKS else "none"
 
 
-def _test_command(script: str, root: str, path: str = "") -> dict[str, object]:
-    return {"argv": ["python", "-c", _CHECK_BOOTSTRAP, *script.splitlines(), path],
-            "cwd": root, "timeout_seconds": 300}
-
-
-def _is_test_adapter(arguments: dict[str, object]) -> bool:
-    argv = arguments.get("argv")
-    return (isinstance(argv, list) and argv[:3] == ["python", "-c", _CHECK_BOOTSTRAP]
-            and argv[3:-1] in (_PYTEST_CHECK.splitlines(), _UNITTEST_CHECK.splitlines()))
-
-
-def validate_self_check_state(value: object) -> dict[str, object]:
+def _validate_legacy_self_check_state(value: object) -> dict[str, object]:
     """Validate historical facts, not authority or a restored passing verdict."""
     keys = {"version", "request_id", "source_event_seq", "changed_paths", "ambiguous_paths",
             "generation", "unknown", "last_result"}
@@ -198,7 +189,7 @@ def validate_self_check_state(value: object) -> dict[str, object]:
                     check["name"] == "test" and check["started"] is True and check["reason"] == "exited"
                     and check["exit_code"] == _NO_TESTS_EXIT and "no_tests" in result["uncovered"]):
                 raise ValueError("零测试缺少执行事实")
-        if classified and result["coverage"] != _check_coverage(result["checks"]):
+        if classified and result["coverage"] != _legacy_coverage(result["checks"]):
             raise ValueError("自检覆盖类别与检查不符")
         accepted = {"passed", "no_tests"} if classified else {"passed"}
         if result["status"] == "passed" and (not result["checks"] or any(c["status"] not in accepted or c["input_version"] != result["input_version"] for c in result["checks"]) or result["generation"] != value["generation"] or value["unknown"] is not None or value["ambiguous_paths"]):
@@ -263,32 +254,12 @@ def _read_text(workspace: Path, name: str) -> str:
     return content.decode("utf-8")
 
 
-def _project_files(workspace: Path, package: Path) -> list[Path]:
-    """Discover entries with a streaming bound; dependency trees are not test discovery."""
-    pending, found = [package], []
-    count, started = 0, time.monotonic()
-    while pending:
-        directory = pending.pop()
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                count += 1
-                if count > MAX_SCAN_FILES or time.monotonic() - started > MAX_SCAN_SECONDS:
-                    raise _ScanError("scan_limit")
-                path = Path(entry.path)
-                if entry.is_symlink() or _is_sensitive_path(path.relative_to(workspace)):
-                    continue
-                if entry.is_dir(follow_symlinks=False):
-                    if entry.name != "node_modules":
-                        pending.append(path)
-                elif entry.is_file(follow_symlinks=False):
-                    found.append(path)
-    return sorted(found)
-
-
 def _code_kind(name: str, head: bytes | None, executable: bool, entries: set[str]) -> str:
     path = Path(name)
     if name in entries or path.name in _CONFIG_NAMES or path.suffix.lower() in _SOURCE_SUFFIXES:
         return "code"
+    if (path.name == ".gitkeep" and head == b"" and not executable):
+        return "other"
     if (path.name == "CACHEDIR.TAG" or
             (path.name in {"nodeids", "lastfailed", "stepwise"} and
              path.parent.parts[-3:] == (".pytest_cache", "v", "cache"))):
@@ -302,6 +273,227 @@ def _code_kind(name: str, head: bytes | None, executable: bool, entries: set[str
     return "ambiguous" if not path.suffix and head is not None and b"\x00" not in head else "other"
 
 
+def _text(value: object, limit: int = 1000) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > limit or "\x00" in value:
+        raise ValueError("验证说明无效或超过限制")
+    return value
+
+
+def _identifier(value: object) -> str:
+    if not isinstance(value, str) or re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", value) is None:
+        raise ValueError("验证目标 ID 无效")
+    return value
+
+
+def _paths(value: object, limit: int = 32) -> list[str]:
+    if not isinstance(value, list) or not 1 <= len(value) <= limit:
+        raise ValueError("验证路径列表无效")
+    result = [_path(item) for item in value]
+    if len(result) != len(set(result)):
+        raise ValueError("验证路径重复")
+    return result
+
+
+def _check_definition(value: object) -> dict:
+    common = {"id", "purpose", "paths", "expected", "kind"}
+    if not isinstance(value, dict) or not common <= value.keys():
+        raise ValueError("验证目标缺少 id/purpose/paths/expected/kind")
+    _identifier(value["id"])
+    _text(value["purpose"])
+    _text(value["expected"])
+    _paths(value["paths"])
+    kind = value["kind"]
+    if kind == "command":
+        required = common | {"argv", "cwd", "ecosystem"}
+        if not required <= value.keys() or value.keys() - required - {"timeout_seconds", "runner", "artifact_paths"}:
+            raise ValueError("命令验证参数无效")
+        argv = value["argv"]
+        if not isinstance(argv, list) or not 1 <= len(argv) <= 128 or any(
+                not isinstance(item, str) or len(item) > 8000 or "\x00" in item for item in argv):
+            raise ValueError("验证 argv 无效")
+        if not argv[0].strip() or argv[0].lstrip().startswith("-"):
+            raise ValueError("argv 首项必须是程序名，例如 python3 -m http.server")
+        _path(value["cwd"])
+        if value["ecosystem"] not in ("python", "node", "prepared"):
+            raise ValueError("验证环境无效")
+        timeout = value.get("timeout_seconds", 120)
+        if type(timeout) is not int or not 1 <= timeout <= 300:
+            raise ValueError("验证超时无效")
+        if "runner" in value and value["runner"] not in ("pytest", "unittest"):
+            raise ValueError("测试观测器无效")
+        if "runner" in value and not (len(argv) >= 3 and Path(argv[0]).name in ("python", "python3")
+                                      and argv[1:3] == ["-m", value["runner"]]):
+            raise ValueError("测试观测器需要显式 python -m pytest/unittest 及目标参数")
+    elif kind == "browser":
+        required = common | {"service", "test_file"}
+        if not required <= value.keys() or value.keys() - required - {"build_check", "artifact_paths"}:
+            raise ValueError("浏览器验证参数无效")
+        if not isinstance(value["service"], str) or re.fullmatch(r"[a-z][a-z0-9-]{0,31}", value["service"]) is None:
+            raise ValueError("浏览器服务名称无效")
+        _path(value["test_file"])
+        if "build_check" in value:
+            _identifier(value["build_check"])
+    else:
+        raise ValueError("验证类型只能是 command 或 browser")
+    if "artifact_paths" in value:
+        _paths(value["artifact_paths"], 16)
+    return copy.deepcopy(value)
+
+
+def validate_self_check_arguments(workspace: Path, arguments: object) -> dict:
+    """Validate model choices without granting execution or accepting verdicts."""
+    if not isinstance(arguments, dict) or arguments.keys() - {"checks", "exclusions"}:
+        raise ValueError("验证参数仅允许 checks 和 exclusions")
+    if len(json.dumps(arguments, ensure_ascii=True).encode()) > 24000:
+        raise ValueError("验证计划超过限制，请缩小本次检查范围")
+    result = {}
+    if "checks" in arguments:
+        checks = arguments["checks"]
+        if not isinstance(checks, list) or len(checks) > MAX_CHECKS:
+            raise ValueError("验证目标数量超过限制")
+        result["checks"] = [_check_definition(item) for item in checks]
+        if len({item["id"] for item in checks}) != len(checks):
+            raise ValueError("验证目标 ID 重复")
+        for item in checks:
+            for name in item["paths"] + item.get("artifact_paths", []) + [item.get("cwd", "."), item.get("test_file", ".")]:
+                _resolve_workspace_path(workspace, name)
+                _reject_symlinks(workspace, name)
+    if "exclusions" in arguments:
+        exclusions = arguments["exclusions"]
+        if not isinstance(exclusions, list) or len(exclusions) > MAX_CHANGED_PATHS:
+            raise ValueError("视觉排除列表无效")
+        for item in exclusions:
+            if not isinstance(item, dict) or set(item) != {"path", "reason"} or item["reason"] != "visual":
+                raise ValueError("只能提议排除视觉检查，不能取消功能验证")
+            _path(item["path"])
+        if len({item["path"] for item in exclusions}) != len(exclusions):
+            raise ValueError("视觉排除路径重复")
+        result["exclusions"] = copy.deepcopy(exclusions)
+    return result
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _bounded_output(value: str, limit: int = 2000) -> str:
+    # Bound the serialized form too: non-ASCII diagnostics expand in Session JSON.
+    while len(json.dumps(value, ensure_ascii=True).encode()) > limit:
+        value = value[:len(value) // 2]
+    return value
+
+
+def validate_self_check_state(value: object) -> dict:
+    """Read v1 facts only; current v2 receipts never restore approval or a pass."""
+    if isinstance(value, dict) and value.get("version") == 1:
+        return _validate_legacy_self_check_state(value)
+    base_keys = {"version", "request_id", "source_event_seq", "changed_paths", "ambiguous_paths",
+                 "generation", "unknown", "last_result"}
+    if not isinstance(value, dict) or set(value) != base_keys | {"checks", "exclusions", "review", "unresolved"} or type(value["version"]) is not int or value["version"] != 2:
+        raise ValueError("验证状态无效")
+    _validate_legacy_self_check_state({**{k: value[k] for k in base_keys}, "version": 1, "last_result": None})
+    for key in ("checks", "unresolved"):
+        records = value[key]
+        if not isinstance(records, list) or len(records) > MAX_CHECKS:
+            raise ValueError("验证记录超过限制")
+        for record in records:
+            if not isinstance(record, dict) or set(record) != {
+                    "definition", "evidence_id", "generation", "input_version", "status", "started",
+                    "exit_code", "reason", "evidence_kind", "environment", "output", "output_truncated", "artifacts", "browser"}:
+                raise ValueError("验证事实记录无效")
+            _check_definition(record["definition"])
+            if not isinstance(record["evidence_id"], str) or re.fullmatch(r"[0-9a-f]{32}", record["evidence_id"]) is None:
+                raise ValueError("验证事实 ID 无效")
+            if type(record["generation"]) is not int or not 0 <= record["generation"] <= value["generation"]:
+                raise ValueError("验证事实版本无效")
+            if not isinstance(record["input_version"], str) or re.fullmatch(r"[0-9a-f]{64}", record["input_version"]) is None:
+                raise ValueError("验证输入版本无效")
+            if (not isinstance(record["status"], str) or record["status"] not in _CHECK_STATUSES
+                    or not isinstance(record["evidence_kind"], str) or record["evidence_kind"] not in {"execution", "tests", "browser"}):
+                raise ValueError("验证结果类别无效")
+            if record["started"] is not None and type(record["started"]) is not bool:
+                raise ValueError("验证启动事实无效")
+            if record["exit_code"] is not None and (type(record["exit_code"]) is not int or not -255 <= record["exit_code"] <= 65535):
+                raise ValueError("验证退出事实无效")
+            _reason(record["reason"])
+            if record["status"] == "passed" and not (record["started"] is True and record["reason"] == "exited" and record["exit_code"] == 0):
+                raise ValueError("验证通过缺少执行事实")
+            if record["status"] == "no_tests" and not (record["evidence_kind"] == "tests" and record["started"] is True and record["exit_code"] == 5):
+                raise ValueError("零用例事实无效")
+            if type(record["output_truncated"]) is not bool:
+                raise ValueError("验证输出完整性无效")
+            if not isinstance(record["output"], str) or len(json.dumps(record["output"]).encode()) > 2200:
+                raise ValueError("验证输出摘要超过限制")
+            if not isinstance(record["environment"], str) or len(record["environment"]) > 200:
+                raise ValueError("验证环境事实无效")
+            if not isinstance(record["artifacts"], dict) or len(record["artifacts"]) > 16:
+                raise ValueError("构建产物事实无效")
+            for path, digest in record["artifacts"].items():
+                _path(path)
+                if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+                    raise ValueError("构建产物摘要无效")
+            if record["browser"] is not None and not isinstance(record["browser"], dict):
+                raise ValueError("浏览器事实无效")
+    if len({r["definition"]["id"] for r in value["checks"]}) != len(value["checks"]):
+        raise ValueError("验证目标重复")
+    validate_self_check_arguments(Path.cwd(), {"exclusions": value["exclusions"]})
+    review = value["review"]
+    if review is not None:
+        if not isinstance(review, dict) or set(review) != {"status", "input_version", "generation", "report"}:
+            raise ValueError("复核状态无效")
+        if not isinstance(review["status"], str) or review["status"] not in {"passed", "changes_requested", "unavailable"}:
+            raise ValueError("复核状态无效")
+        if type(review["generation"]) is not int or not 0 <= review["generation"] <= value["generation"]:
+            raise ValueError("复核版本无效")
+        if not isinstance(review["input_version"], str) or re.fullmatch(r"[0-9a-f]{64}", review["input_version"]) is None:
+            raise ValueError("复核输入无效")
+        if not isinstance(review["report"], dict):
+            raise ValueError("复核报告无效")
+    result = value["last_result"]
+    if result is not None:
+        if not isinstance(result, dict) or set(result) - {"cleanup_required"} != {
+                "status", "reason", "generation", "input_version", "checks", "uncovered", "coverage"}:
+            raise ValueError("验证汇总无效")
+        if (not isinstance(result["status"], str) or result["status"] not in _RESULT_STATUSES
+                or not isinstance(result["coverage"], str) or result["coverage"] not in _COVERAGE):
+            raise ValueError("验证汇总状态无效")
+        _reason(result["reason"])
+        if type(result["generation"]) is not int or result["generation"] != value["generation"] or not isinstance(result["checks"], list) or len(result["checks"]) > MAX_CHECKS:
+            raise ValueError("验证汇总版本无效")
+        if result["status"] == "passed" and (not review or review["status"] != "passed"
+                or review["generation"] != value["generation"] or review["input_version"] != result["input_version"]
+                or value["unknown"] or value["ambiguous_paths"]):
+            raise ValueError("完成缺少当前复核事实")
+        if result["status"] == "passed":
+            resolved = review["report"].get("resolved_checks", [])
+            if not isinstance(resolved, list) or any(not isinstance(i, str) for i in resolved):
+                raise ValueError("已解决检查引用无效")
+            if value["unresolved"] or result["uncovered"] or review["report"].get("verdict") != "passed":
+                raise ValueError("验证完成仍有未解决范围")
+            for record in value["checks"]:
+                if record["evidence_id"] in resolved:
+                    continue
+                if (record["status"] != "passed" or record["input_version"] != result["input_version"]
+                        or record["generation"] != value["generation"]):
+                    raise ValueError("验证完成缺少当前输入版本事实")
+            facts = [{key: record[key] for key in (
+                "evidence_id", "status", "started", "exit_code", "reason", "input_version")} for record in value["checks"]]
+            if result["checks"] != facts:
+                raise ValueError("验证汇总与宿主记录不符")
+            covered = [path for record in value["checks"] if record["status"] == "passed"
+                       for path in record["definition"]["paths"]]
+            covered += [record["definition"]["test_file"] for record in value["checks"]
+                        if record["status"] == "passed" and record["definition"]["kind"] == "browser"]
+            proposed = {item["path"] for item in value["exclusions"]}
+            approved = {item.get("path") for item in review["report"].get("excluded_paths", []) if isinstance(item, dict)}
+            if proposed != approved or any(path not in approved and not any(Path(path).is_relative_to(p) for p in covered)
+                                           for path in value["changed_paths"]):
+                raise ValueError("验证完成遗漏本轮变化路径")
+    if len(json.dumps(value, ensure_ascii=True).encode()) > MAX_SELF_CHECK_STATE_BYTES:
+        raise ValueError("验证状态超过限制")
+    return copy.deepcopy(value)
+
+
 class SelfCheckRuntime:
     """One original request's changes and latest bounded execution facts."""
 
@@ -312,29 +504,29 @@ class SelfCheckRuntime:
                  internal_paths: tuple[Path, ...] = ()) -> None:
         self.workspace = workspace.resolve()
         self.command_sandbox = command_sandbox
+        self.browser_evidence_callback = None
         self.approval_callback = approval_callback
         self._internal_paths = tuple(Path(p).resolve() for p in internal_paths)
         self._cancel = Event()
         self._denied_scopes: set[str] = set()
         self._entries: set[str] = set()
-        self._entry_ecosystems: dict[str, str] = {}
         self._excluded_dirs: set[str] = set()
         self._output_dirs: set[str] = set()
         self._generated_outputs: dict[str, str] = {}
         self._cleanup_required: set[str] = set()
         self._before_command = None
         self._checked_snapshot = None
-        self._last_key = None
-        self._group_cache: dict[tuple, list[dict]] = {}
-        self._state = {"version": 1, "request_id": request_id or str(uuid.uuid4()),
+        self._state = {"version": 2, "request_id": request_id or str(uuid.uuid4()),
                        "source_event_seq": None, "changed_paths": [], "ambiguous_paths": [],
-                       "generation": 0, "unknown": None, "last_result": None}
+                       "generation": 0, "unknown": None, "last_result": None,
+                       "checks": [], "exclusions": [], "review": None, "unresolved": []}
         if initial_state is not None:
             restored = validate_self_check_state(initial_state)
             if request_id is not None and restored["request_id"] != request_id:
                 raise ValueError("自检状态与原始请求不匹配")
-            self._state = restored
-            self._state["last_result"] = None
+            self._state.update({key: restored[key] for key in (
+                "request_id", "source_event_seq", "changed_paths", "ambiguous_paths", "generation", "unknown")})
+            # Historical receipts remain in the Session; none is current execution authority.
         validate_self_check_state(self._state)
 
     def bind_source(self, source_event_seq: int) -> None:
@@ -382,7 +574,8 @@ class SelfCheckRuntime:
         if kind == "code" and name in self._state["ambiguous_paths"]:
             self._state["ambiguous_paths"].remove(name)
         self._state["generation"] += 1
-        self._group_cache.clear()
+        self._state["review"] = None
+        self._state["last_result"] = None
         if self._state["last_result"] is not None and self._state["last_result"]["status"] == "passed":
             self._state["last_result"]["status"] = "source_changed"
             self._state["last_result"]["reason"] = "source_changed"
@@ -440,7 +633,6 @@ class SelfCheckRuntime:
                     try:
                         entry = _path((Path(cwd) / argv[1]).as_posix())
                         self._entries.add(entry)
-                        self._entry_ecosystems[entry] = "python" if Path(argv[0]).name.startswith("python") else "node"
                         for directory in tuple(self._excluded_dirs):
                             if Path(entry).is_relative_to(directory):
                                 self._excluded_dirs.discard(directory)
@@ -466,331 +658,396 @@ class SelfCheckRuntime:
                 identity = after.get(name, before.get(name))
                 self._add_path(name, identity[-1])
 
-    def needs_check(self) -> bool:
-        result = self._state["last_result"]
-        return bool(self._state["changed_paths"]) and (result is None or result["generation"] != self._state["generation"])
+    def _current(self) -> list[dict]:
+        version = self._version(self._checked_snapshot)
+        return [r for r in self._state["checks"] if r["generation"] == self._state["generation"]
+                and r["input_version"] == version]
 
-    def _result(self, status: str, reason: str, checks: list | None = None,
-                version: str | None = None, uncovered: list[str] | None = None) -> dict[str, object]:
-        if status == "passed" and (self._state["unknown"] or self._state["ambiguous_paths"]):
+    def _uncovered_paths(self) -> list[str]:
+        covered = [p for r in self._current() if r["status"] == "passed" for p in r["definition"]["paths"]]
+        covered += [r["definition"]["test_file"] for r in self._current()
+                    if r["status"] == "passed" and r["definition"]["kind"] == "browser"]
+        proposed = {item["path"] for item in self._state["exclusions"]}
+        return [p for p in self._state["changed_paths"] if p not in proposed
+                and not any(Path(p).is_relative_to(parent) for parent in covered)]
+
+    def _checks_ready(self) -> bool:
+        review = self._state["review"]
+        resolved = set(review["report"].get("resolved_checks", [])) if review and review["status"] == "passed" else set()
+        current = self._current()
+        return (self._review_ready() and all(
+            r["status"] == "passed" and r in current or r["evidence_id"] in resolved
+            for r in self._state["checks"]))
+
+    def _review_ready(self) -> bool:
+        return (not self._state["unknown"] and not self._state["ambiguous_paths"]
+                and not self._uncovered_paths() and all(
+                    r in self._current() or r["status"] in {"failed", "no_tests", "not_run"}
+                    for r in self._state["checks"]))
+
+    def needs_check(self) -> bool:
+        self.recheck_final()
+        if not self._state["changed_paths"]:
+            return False
+        review = self._state["review"]
+        return not self._checks_ready() or (review is not None and review["status"] == "changes_requested")
+
+    def needs_review(self) -> bool:
+        self.recheck_final()
+        return bool(self._state["changed_paths"]) and self._review_ready() and self._state["review"] is None
+
+    def _coverage(self) -> str:
+        kinds = {r["evidence_kind"] for r in self._current() if r["status"] == "passed"}
+        if not kinds:
+            return "excluded" if self._state["exclusions"] else "none"
+        return "tests" if "tests" in kinds else "browser" if "browser" in kinds else "execution"
+
+    def _refresh_result(self) -> dict:
+        changed = bool(self._state["changed_paths"])
+        review = self._state["review"]
+        if self._state["unknown"] or self._state["ambiguous_paths"]:
             status, reason = "unknown", "change_unknown"
+        elif not changed:
+            status, reason = "not_needed", "no_code_changes"
+        elif any(r["status"] in {"failed", "no_tests", "not_run"} and not (review and review["status"] == "passed" and r["evidence_id"] in review["report"].get("resolved_checks", [])) for r in self._current()):
+            status, reason = "failed", "checks_failed"
+        elif not self._checks_ready():
+            status, reason = "not_run", "missing_current_evidence"
+        elif not review:
+            status, reason = "not_run", "review_pending"
+        elif review["status"] != "passed":
+            status, reason = "not_run", "review_" + review["status"]
+        elif self._state["unresolved"]:
+            status, reason = "failed", "unresolved_checks"
+        else:
+            status, reason = "passed", "verified_scope"
         result = {"status": status, "reason": reason, "generation": self._state["generation"],
-                  "input_version": version, "checks": checks or [], "uncovered": list(uncovered or []),
-                  "coverage": _check_coverage(checks or [])}
-        if any(check["status"] == "no_tests" for check in result["checks"]) and "no_tests" not in result["uncovered"]:
-            result["uncovered"].append("no_tests")
+                  "input_version": self._version(self._checked_snapshot), "checks": [
+                      {k: r[k] for k in ("evidence_id", "status", "started", "exit_code", "reason", "input_version")}
+                      for r in self._state["checks"]],
+                  "uncovered": self._uncovered_paths()[:MAX_CHANGED_PATHS], "coverage": self._coverage()}
         if self._cleanup_required:
             result["cleanup_required"] = sorted(self._cleanup_required)[:16]
         self._state["last_result"] = result
-        validate_self_check_state(self._state)
         return result
 
     def summary(self) -> str:
-        text = self._check_summary()
-        result = self._state["last_result"]
-        if result and result.get("cleanup_required"):
-            text += "环境资源清理未确认，需人工检查：" + "、".join(result["cleanup_required"])
+        result = self._refresh_result()
+        if result["status"] == "not_needed":
+            return ""
+        if result["status"] == "passed":
+            count = sum(r["status"] == "passed" for r in self._current())
+            text = f"验证：{count} 项当前检查及独立复核完成，仅代表本次覆盖范围。"
+            if result["coverage"] == "execution":
+                text += "命令已执行成功；未取得正常测试用例计数，不代表功能测试全部通过。"
+        else:
+            text = {"review_pending": "验证：已有执行结果，独立复核尚未完成。",
+                    "review_changes_requested": "验证：独立复核发现问题，尚未修复复测。",
+                    "review_unavailable": "验证：独立复核不可用，当前交付未完成验收。",
+                    "checks_failed": "验证：相关检查失败或未执行，需诊断、修复及复测。",
+                    "change_unknown": "验证：当前改动或输入无法确认，不能报告通过。"}.get(
+                        result["reason"], "验证：当前代码仍缺少适用证据，已发生的改动保留。")
+        if self._state["exclusions"] or any(r["definition"]["kind"] == "browser" for r in self._state["checks"]):
+            text += "视觉效果未验证。"
+        if self._cleanup_required:
+            text += "环境资源清理未确认：" + "、".join(sorted(self._cleanup_required)[:16])
         return text
 
-    def _check_summary(self) -> str:
-        result = self._state["last_result"]
-        if not self._state["changed_paths"] and not self._state["ambiguous_paths"] and not self._state["unknown"]:
-            return ""
-        if self._state["unknown"] or self._state["ambiguous_paths"]:
-            return "自检：改动范围或当前输入无法确认，未验证；已发生的改动保留。"
-        if result is not None and result["status"] == "source_changed":
-            return "自检：检查之后或期间源码发生变化，需对当前代码复测。"
-        if result is None or result["generation"] != self._state["generation"]:
-            return "自检：当前代码改动尚未检查。"
-        passed = sum(check["status"] == "passed" for check in result["checks"])
-        if result["status"] == "passed":
-            if result.get("coverage") == "tests":
-                suffix = "；实际执行的测试已通过，仅代表此次检查范围"
-                if "no_tests" in result["uncovered"]:
-                    suffix += "；部分入口没有正常测试用例通过"
-            elif result.get("coverage") == "basic":
-                suffix = "；仅覆盖语法/类型/编译或构建，功能测试未验证"
-            else:
-                suffix = "；仅代表实际运行的检查范围"
-            return f"自检：实际运行并通过 {passed} 项{suffix}。"
-        if result["reason"] == "no_test_evidence":
-            return "自检：仅有脚本运行结果或没有正常测试用例通过，尚无足够验证证据。"
-        return {"failed": "自检：实际检查失败，尚未修复通过。", "source_changed": "自检：检查期间源码发生变化，需对当前代码复测。"}.get(result["status"], "自检：检查未运行或未覆盖完整范围，已完成的改动保留。")
-
-    def outcome(self, *, step: int, status: str | None = None, reason: str | None = None) -> dict[str, object]:
-        result = self._state["last_result"]
-        changed = bool(self._state["changed_paths"])
-        check_status = "unknown" if self._state["unknown"] or self._state["ambiguous_paths"] else result["status"] if result else "pending" if changed else "not_needed"
-        complete = not self._state["unknown"] and not self._state["ambiguous_paths"] and (
-            not changed or (result is not None and result["status"] == "passed" and result["generation"] == self._state["generation"]))
+    def outcome(self, *, step: int, status: str | None = None, reason: str | None = None) -> dict:
+        result = self._refresh_result()
+        complete = result["status"] in {"passed", "not_needed"}
         return validate_task_outcome({"status": status or ("completed" if complete else "incomplete"),
-            "reason": reason or ("answered" if not changed and complete else result["reason"] if result else "not_checked"),
-            "step": step, "self_check_status": check_status, "changed": changed, "summary": self.summary(),
-            "coverage": result.get("coverage", "none") if result else "none"})
+            "reason": reason or result["reason"], "step": step, "self_check_status": result["status"],
+            "changed": bool(self._state["changed_paths"]), "summary": self.summary(),
+            "coverage": result["coverage"]})
 
     def recheck_final(self) -> None:
-        result = self._state["last_result"]
-        if result and result["status"] == "passed":
+        if self.browser_evidence_callback is not None:
+            for record in self._state["checks"]:
+                if record["definition"]["kind"] != "browser" or record["status"] != "passed":
+                    continue
+                try:
+                    current_service = self.browser_evidence_callback(record["definition"], record["input_version"])
+                    previous_service = (record["browser"] or {}).get("service", {})
+                    current = (current_service.get("current") is True
+                               and current_service.get("service_identity") == (record["browser"] or {}).get("service_identity")
+                               and current_service.get("source_version") == previous_service.get("source_version"))
+                except (ValueError, OSError, RuntimeError):
+                    current = False
+                if not current:
+                    record["status"] = "stale"
+                    self._state["review"] = None
+                    self._state["last_result"] = None
+        if self._checked_snapshot is not None:
             current = self._scan()
-            if self._version(current) != result["input_version"]:
+            if current != self._checked_snapshot:
                 self._observe(self._checked_snapshot, current)
-                result["status"], result["reason"] = "source_changed", "source_changed"
+                self._checked_snapshot = current
+                self._state["review"] = None
+                self._state["last_result"] = None
 
-    def execute(self, *, command_runner: Callable | None = None, cancel_event: Event | None = None,
-                allow_prepare: bool = True) -> str:
-        self._check_cancel(cancel_event)
-        if not self._state["changed_paths"]:
-            return json.dumps(self._result("not_needed", "no_code_changes"), ensure_ascii=False)
-        if command_runner is None:
-            return json.dumps(self._result("not_run", "command_unavailable"), ensure_ascii=False)
-        return self._execute_checks(command_runner, cancel_event, allow_prepare)
+    def review_context(self, user_query: str) -> dict:
+        self.recheck_final()
+        if not self._review_ready():
+            raise ValueError("当前验证证据尚不足以复核")
+        context = {"user_query": user_query, "input_version": self._version(self._checked_snapshot),
+                   "generation": self._state["generation"], "changed_paths": self._state["changed_paths"],
+                   "deleted_paths": [p for p in self._state["changed_paths"] if not (self.workspace / p).exists()],
+                   "checks": copy.deepcopy(self._state["checks"]),
+                   "exclusions": copy.deepcopy(self._state["exclusions"]),
+                   "unresolved": copy.deepcopy(self._state["unresolved"]),
+                   "visual_checks": "excluded", "uncovered_paths": self._uncovered_paths()}
+        if len(json.dumps(context, ensure_ascii=True).encode()) > MAX_SELF_CHECK_STATE_BYTES:
+            raise ValueError("复核上下文超过限制，不能静默截断")
+        return context
 
-    def _execute_checks(self, command_runner: Callable, cancel_event: Event | None, allow_prepare: bool) -> str:
-        from gum_code.project_environment import discover_project, ensure_environment
+    def mark_review_unavailable(self, reason: str) -> None:
+        version = self._version(self._checked_snapshot or self._scan())
+        if version is None:
+            self.mark_unknown("scan_unknown")
+            return
+        self._state["review"] = {"status": "unavailable", "input_version": version,
+                                 "generation": self._state["generation"], "report": {"reason": _reason(reason)}}
+        self._refresh_result()
+
+    def record_review(self, report: dict, *, input_version: str) -> None:
+        self.recheck_final()
+        if input_version != self._version(self._checked_snapshot) or not self._review_ready():
+            raise ValueError("复核期间输入变化，需重新验证")
+        if not isinstance(report, dict) or report.get("verdict") not in {"passed", "changes_requested"}:
+            raise ValueError("复核缺少明确结论")
+        evidence = report.get("evidence", [])
+        if not isinstance(evidence, list) or (not evidence and report["verdict"] == "passed"):
+            raise ValueError("复核通过必须引用实际读取的代码、测试或相关调用方")
+        for item in evidence:
+            if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+                raise ValueError("复核文件引用无效")
+            path = _path(item["path"])
+            if not _resolve_workspace_path(self.workspace, path).is_file():
+                raise ValueError("复核文件引用不存在")
+            _reject_symlinks(self.workspace, path)
+        if len(json.dumps(report, ensure_ascii=True).encode()) > 12000:
+            self.mark_review_unavailable("report_limit")
+            return
+        proposed = {item["path"] for item in self._state["exclusions"]}
+        accepted = report.get("excluded_paths", [])
+        if not isinstance(accepted, list) or any(not isinstance(item, dict) or set(item) != {"path", "reason"}
+                or item["path"] not in proposed or not isinstance(item["reason"], str) or not item["reason"].strip() for item in accepted):
+            raise ValueError("复核不能扩展视觉排除范围")
+        resolved = report.get("resolved_checks", [])
+        unresolved = {r["evidence_id"]: r for r in self._state["unresolved"]}
+        if not isinstance(resolved, list) or len(set(resolved)) != len(resolved) or set(resolved) - unresolved.keys():
+            raise ValueError("复核引用的失败事实无效")
+        verdict = report["verdict"]
+        if verdict == "passed" and (proposed != {item["path"] for item in accepted} or set(resolved) != unresolved.keys()):
+            raise ValueError("复核未处理排除范围或旧失败")
+        if verdict == "passed":
+            self._state["unresolved"] = []
+        self._state["review"] = {"status": verdict, "input_version": input_version,
+                                 "generation": self._state["generation"], "report": copy.deepcopy(report)}
+        self._refresh_result()
+        validate_self_check_state(self._state)
+
+    def _observed_command(self, check: dict) -> tuple[dict, str]:
+        argv = check["argv"]
+        runner = check.get("runner")
+        if len(argv) >= 3 and Path(argv[0]).name in ("python", "python3") and argv[1] == "-m" and argv[2] in ("pytest", "unittest"):
+            runner = argv[2]
+        if runner:
+            source = _PYTEST_CHECK if runner == "pytest" else _UNITTEST_CHECK
+            argv = [argv[0], "-c", _CHECK_BOOTSTRAP, *source.splitlines(), json.dumps(argv[3:])]
+        return {"argv": argv, "cwd": check["cwd"], "timeout_seconds": check.get("timeout_seconds", 120)}, "tests" if runner else "execution"
+
+    def _artifact_receipts(self, paths: list[str]) -> dict:
+        if not paths:
+            return {}
+        from gum_code.verification import workspace_snapshot
+        full = workspace_snapshot(self.workspace, tuple(sorted(p for p in self._excluded_dirs
+                     if not any(Path(target).is_relative_to(p) or Path(p).is_relative_to(target) for target in paths))), self._internal_paths)
+        result = {}
+        for path in paths:
+            selected = {p: identity for p, identity in full.items() if Path(p).is_relative_to(path)}
+            if not selected:
+                raise ValueError("构建产物未生成")
+            result[path] = _digest(selected)
+        return result
+
+    def _prepare_outputs(self, check: dict) -> None:
+        # Only native, verified compiler output configuration can omit generated files.
+        # Arbitrary scripts/artifact declarations never hide a newly created source tree.
+        root = Path(check["cwd"])
+        argv = check["argv"]
+        program = " ".join(argv)
+        package = self.workspace / root / "package.json"
+        if argv[:2] == ["npm", "run"] and len(argv) == 3 and package.is_file():
+            data = json.loads(_read_text(self.workspace, (root / "package.json").as_posix()))
+            program = data.get("scripts", {}).get(argv[2], "")
+        declared, identity = None, None
+        if program in {"tsc", "tsc -b", "node node_modules/typescript/bin/tsc"}:
+            config_path = root / "tsconfig.json"
+            if (self.workspace / config_path).is_file():
+                config = json.loads(_read_text(self.workspace, config_path.as_posix()))
+                if isinstance(config, dict) and "extends" not in config:
+                    options = config.get("compilerOptions", {})
+                    if isinstance(options, dict) and isinstance(options.get("outDir"), str):
+                        declared = _path((root / options["outDir"]).as_posix())
+                        identity = _digest(config)
+        elif program == "vite build" and not any((self.workspace / root).glob("vite.config.*")):
+            declared, identity = (root / "dist").as_posix(), _digest(program)
+        if declared not in check.get("artifact_paths", []):
+            return
+        target = self.workspace / declared
+        protected = self._state["changed_paths"] + list(self._entries) + check["paths"]
+        if declared == "." or any(Path(p).is_relative_to(declared) for p in protected):
+            raise ValueError("不能把受检源码声明为构建输出")
+        if target.is_file() or (target.is_dir() and any(target.iterdir())
+                               and self._generated_outputs.get(declared) != identity):
+            return
+        self._excluded_dirs.add(declared)
+        self._output_dirs.add(declared)
+        self._generated_outputs[declared] = identity
+
+    def _store_record(self, record: dict) -> None:
+        original = copy.deepcopy(self._state)
+        checks = self._state["checks"]
+        previous = next((r for r in checks if r["definition"]["id"] == record["definition"]["id"]), None)
+        if previous is not None:
+            checks.remove(previous)
+        checks.append(record)
+        unresolved = self._state["unresolved"]
+        unresolved[:] = [r for r in unresolved if r["definition"] != record["definition"]
+                         or (record["definition"]["kind"] == "browser"
+                             and (r.get("browser") or {}).get("scenario_version")
+                             != (record.get("browser") or {}).get("scenario_version"))]
+        if record["status"] != "passed":
+            unresolved.append(copy.deepcopy(record))
+        self._state["review"] = None
+        self._state["last_result"] = None
         try:
-            groups, uncovered = self._discover()
-        except (ValueError, OSError, RuntimeError) as error:
-            self.mark_unknown(getattr(error, "code", "discovery_unavailable"))
-            return json.dumps(self._result("unknown", "discovery_unavailable"), ensure_ascii=False)
-        if not groups:
-            return json.dumps(self._result("not_run", "no_check_entry", uncovered=uncovered), ensure_ascii=False)
-        checks, outputs = [], []
-        version = None
-        identity_parts = []
-        for root, ecosystem, commands in groups:
+            validate_self_check_state(self._state)
+        except ValueError:
+            # Never discard a failure to manufacture a successful bounded state.
+            self._state = original
+            self.mark_unknown("evidence_limit")
+
+    def execute(self, *, checks: list | None = None, exclusions: list | None = None,
+                command_runner: Callable | None = None, browser_runner: Callable | None = None,
+                cancel_event: Event | None = None, allow_prepare: bool = True) -> str:
+        from gum_code.project_environment import discover_project, ensure_environment, EnvironmentResult
+        arguments = {}
+        if checks is not None:
+            arguments["checks"] = checks
+        if exclusions is not None:
+            arguments["exclusions"] = exclusions
+        selected = validate_self_check_arguments(self.workspace, arguments)
+        self._check_cancel(cancel_event)
+        self.recheck_final()
+        if not self._state["changed_paths"] or not selected:
+            return json.dumps({**self._refresh_result(), "changed_paths": self._state["changed_paths"],
+                               "review": self._state["review"]}, ensure_ascii=False)
+        if exclusions is not None and exclusions != self._state["exclusions"]:
+            if any(item["path"] not in self._state["changed_paths"] for item in exclusions):
+                raise ValueError("只能提议排除本轮实际变化路径")
+            self._state["exclusions"] = copy.deepcopy(exclusions)
+            self._state["review"] = None
+        for check in selected.get("checks", []):
             self._check_cancel(cancel_event)
-            project = discover_project(self.workspace, root, ecosystem=ecosystem)
-            with ensure_environment(self.workspace, project, command_sandbox=self.command_sandbox,
-                    approval_callback=self.approval_callback if allow_prepare else None,
-                    denied_scopes=self._denied_scopes, cancel_event=cancel_event or self._cancel,
-                    change_callback=self.record_path) as environment:
+            if len({r["definition"]["id"] for r in self._state["checks"]} | {check["id"]}) > MAX_CHECKS:
+                raise ValueError("本轮验证目标超过限制")
+            if check["kind"] == "command":
+                if check["ecosystem"] == "prepared":
+                    env = EnvironmentResult("ready", sandbox=self.command_sandbox, identity=_digest(str(self.command_sandbox))) if self.command_sandbox else EnvironmentResult("unavailable", "prepared_environment_required")
+                    lease = nullcontext(env)
+                else:
+                    project = discover_project(self.workspace, check["cwd"], ecosystem=check["ecosystem"])
+                    lease = ensure_environment(self.workspace, project, command_sandbox=self.command_sandbox,
+                        approval_callback=self.approval_callback if allow_prepare else None,
+                        denied_scopes=self._denied_scopes, cancel_event=cancel_event or self._cancel,
+                        change_callback=self.record_path)
+            else:
+                lease = nullcontext(EnvironmentResult("ready", identity="current_project_browser"))
+            with lease as environment:
                 self._cleanup_required.update(getattr(environment, "cleanup_required", ()))
                 self._excluded_dirs.update(getattr(environment, "excluded_dirs", ()))
-                if environment.status != "ready":
-                    reason = getattr(environment, "reason", "environment_unavailable")
-                    if reason == "cancelled" or environment.status == "cancelled":
-                        raise KeyboardInterrupt
-                    self._result("not_run", reason if re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason or "") else "environment_unavailable", checks, version, uncovered)
-                    return json.dumps(self._state["last_result"], ensure_ascii=False)
-                identity_parts.append(environment.identity)
-                current = self._scan()
-                version = self._version(current)
-                if current is None:
-                    return json.dumps(self._result("unknown", "scan_unknown", checks), ensure_ascii=False)
-                key = (version, tuple(identity_parts), json.dumps(groups, sort_keys=True))
-                if len(groups) == 1 and key == self._last_key and self._state["last_result"] is not None:
-                    if self._cleanup_required:
-                        self._state["last_result"]["cleanup_required"] = sorted(self._cleanup_required)[:16]
-                    return json.dumps({**self._state["last_result"], "reused": True}, ensure_ascii=False)
-                group_key = (version, environment.identity, json.dumps(commands, sort_keys=True))
-                if group_key in self._group_cache:
-                    checks.extend(copy.deepcopy(self._group_cache[group_key]))
-                    continue
-                group_start = current
-                group_offset = len(checks)
-                for name, arguments in commands:
-                    self._check_cancel(cancel_event)
-                    before = self._scan()
-                    before_version = self._version(before)
-                    if before is None:
-                        return json.dumps(self._result("unknown", "scan_unknown", checks), ensure_ascii=False)
+                if check["kind"] == "command":
                     try:
-                        output, fact = command_runner(arguments, environment.sandbox)
-                    finally:
-                        after = self._scan()
-                        self._observe(before, after)
-                    stable = before == after and after is not None
-                    fact = fact if isinstance(fact, CommandExecutionResult) else CommandExecutionResult(None, None, "unknown")
-                    passed = stable and fact.started is True and fact.reason == "exited" and fact.exit_code == 0
-                    no_tests = (stable and name == "test" and _is_test_adapter(arguments)
-                                and fact.started is True and fact.reason == "exited" and fact.exit_code == _NO_TESTS_EXIT)
-                    checks.append({"name": name, "status": "passed" if passed else "no_tests" if no_tests else "stale" if not stable else "failed" if fact.started else "not_run",
-                        "started": fact.started, "exit_code": fact.exit_code, "reason": fact.reason,
-                        "input_version": before_version})
-                    outputs.append({"name": name, "output": output[:12000]})
-                    if not stable or group_start != after:
-                        for check in checks:
-                            if check["status"] == "passed":
-                                check["status"] = "stale"
-                        result = self._result("source_changed", "source_changed", checks, self._version(after), uncovered)
-                        self._last_key = None
-                        return json.dumps({**result, "diagnostics": outputs}, ensure_ascii=False)
-                self._last_key = key
-                self._group_cache[group_key] = copy.deepcopy(checks[group_offset:])
-        end = self._scan()
-        if end is None:
-            result = self._result("unknown", "scan_unknown", checks)
-        elif any(check["input_version"] != self._version(end) for check in checks):
-            for check in checks:
-                check["status"] = "stale"
-            result = self._result("source_changed", "source_changed", checks, self._version(end), uncovered)
-        elif any(check["status"] not in {"passed", "no_tests"} for check in checks):
-            result = self._result("failed", "checks_failed", checks, self._version(end), uncovered)
-        elif any(item != "no_tests" for item in uncovered):
-            result = self._result("not_run", "partial_coverage", checks, self._version(end), uncovered)
-        elif _check_coverage(checks) == "none":
-            result = self._result("not_run", "no_test_evidence", checks, self._version(end), uncovered)
-        else:
-            self._checked_snapshot = end
-            result = self._result("passed", "checked", checks, self._version(end), uncovered)
-        return json.dumps({**result, "diagnostics": outputs}, ensure_ascii=False)
-
-    def _discover(self) -> tuple[list, list[str]]:
-        self._excluded_dirs.difference_update(self._output_dirs)
-        self._output_dirs.clear()
-        groups: dict[tuple[str, str], list[str]] = {}
-        uncovered: list[str] = []
-        for name in self._state["changed_paths"]:
-            path = self.workspace / name
-            ecosystem = "python" if path.suffix in {".py", ".pyi"} or path.name in {"pyproject.toml", "requirements.txt", "setup.cfg", "pytest.ini"} else "node" if path.suffix in {".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts"} or path.name in {"package.json", "package-lock.json", "tsconfig.json"} else None
-            ecosystem = ecosystem or self._entry_ecosystems.get(name)
-            if ecosystem is None and path.exists():
-                head, _ = _head(self.workspace, name)
-                if head.startswith(b"#!"):
-                    ecosystem = "python" if b"python" in head.splitlines()[0] else "node" if b"node" in head.splitlines()[0] else None
-            root = self.workspace
-            for parent in (path.parent, *path.parent.parents):
-                if not parent.is_relative_to(self.workspace):
+                        self._prepare_outputs(check)
+                    except ValueError:
+                        return json.dumps({**self._refresh_result(), "error": "invalid_artifact_scope"}, ensure_ascii=False)
+                before = self._scan()
+                version = self._version(before)
+                if before is None:
                     break
-                if (parent / "package.json").is_file():
-                    ecosystem, root = "node", parent
+                old = next((r for r in self._state["checks"] if r["definition"] == check
+                            and r["input_version"] == version and r["environment"] == environment.identity), None)
+                if old is not None and old["status"] == "passed" and check["kind"] == "command":
+                    continue
+                if old is not None and old["status"] in {"failed", "no_tests"} and check["kind"] == "command":
+                    continue  # Same failed inputs and command cannot acquire new evidence.
+                # A fresh attempt supersedes its old receipt even if a hook or runner raises.
+                self._state["checks"] = [r for r in self._state["checks"] if r["definition"]["id"] != check["id"]]
+                self._state["review"] = None
+                self._state["last_result"] = None
+                output, browser, artifacts = "", None, {}
+                fact = CommandExecutionResult(False, None, "command_unavailable")
+                evidence_kind = "execution"
+                try:
+                    if environment.status != "ready":
+                        reason = environment.reason or "environment_unavailable"
+                        if reason == "cancelled":
+                            raise KeyboardInterrupt
+                        fact = CommandExecutionResult(False, None, _reason(reason))
+                    elif check["kind"] == "command" and command_runner is not None:
+                        args, evidence_kind = self._observed_command(check)
+                        output, fact = command_runner(args, environment.sandbox)
+                        if not isinstance(fact, CommandExecutionResult):
+                            fact = CommandExecutionResult(None, None, "unknown")
+                        if fact.started is True and fact.exit_code == 0 and fact.reason == "exited":
+                            try:
+                                artifacts = self._artifact_receipts(check.get("artifact_paths", []))
+                            except ValueError:
+                                fact = CommandExecutionResult(True, fact.exit_code, "artifact_unavailable")
+                    elif check["kind"] == "browser" and browser_runner is not None:
+                        evidence_kind = "browser"
+                        build = check.get("build_check")
+                        if build:
+                            receipt = next((r for r in self._current() if r["definition"]["id"] == build and r["status"] == "passed"), None)
+                            try:
+                                artifacts_match = bool(check.get("artifact_paths")) and receipt is not None and receipt["artifacts"] == self._artifact_receipts(check["artifact_paths"])
+                            except ValueError:
+                                artifacts_match = False
+                            if not artifacts_match:
+                                return json.dumps({**self._refresh_result(), "error": "current_build_evidence_required"}, ensure_ascii=False)
+                        output, browser = browser_runner(check, version)
+                        service = browser.get("service", {}) if isinstance(browser, dict) else {}
+                        if not build and any(part in {"dist", "build"} for part in Path(service.get("document_root") or ".").parts):
+                            browser["reason"] = "build_evidence_required"
+                        assertions = browser.get("assertions", []) if isinstance(browser, dict) else []
+                        passed = (browser.get("started") is True and browser.get("reason") == "exited"
+                                  and bool(assertions) and all(a.get("passed") is True for a in assertions)
+                                  and bool(browser.get("service_identity"))) if isinstance(browser, dict) else False
+                        fact = CommandExecutionResult(browser.get("started") if isinstance(browser, dict) else None,
+                                                      0 if passed else None, "exited" if passed else "browser_unverified")
+                finally:
+                    after = self._scan()
+                    self._observe(before, after)
+                stable = before == after and after is not None
+                status = ("stale" if not stable else "passed" if fact.started is True and fact.reason == "exited" and fact.exit_code == 0
+                          else "no_tests" if evidence_kind == "tests" and fact.started is True and fact.reason == "exited" and fact.exit_code == 5
+                          else "failed" if fact.started else "not_run")
+                record = {"definition": check, "evidence_id": uuid.uuid4().hex,
+                          "generation": self._state["generation"], "input_version": version,
+                          "status": status, "started": fact.started, "exit_code": fact.exit_code,
+                          "reason": fact.reason, "evidence_kind": evidence_kind,
+                          "environment": environment.identity, "output": _bounded_output(output),
+                          "output_truncated": _bounded_output(output) != output,
+                          "artifacts": artifacts, "browser": browser}
+                self._checked_snapshot = after
+                self._store_record(record)
+                if not stable:
                     break
-                if (parent / "pyproject.toml").is_file() or (parent / "requirements.txt").is_file():
-                    ecosystem, root = "python", parent
-                    break
-            if ecosystem is None:
-                uncovered.append("unsupported_code")
-                continue
-            groups.setdefault((root.relative_to(self.workspace).as_posix(), ecosystem), []).append(name)
-        result, total = [], 0
-        for (root, ecosystem), paths in sorted(groups.items()):
-            commands = []
-            package = self.workspace / root
-            project_files = _project_files(self.workspace, package)
-            if ecosystem == "python":
-                commands = self._python_checks(root, package, paths, project_files, uncovered)
-            else:
-                target = package / "package.json"
-                scripts = {}
-                if target.is_file():
-                    data = json.loads(_read_text(self.workspace, target.relative_to(self.workspace).as_posix()))
-                    if not isinstance(data, dict):
-                        raise ValueError("项目清单格式无效")
-                    scripts = data.get("scripts", {}) if isinstance(data, dict) else {}
-                    if not isinstance(scripts, dict):
-                        raise ValueError("项目脚本格式无效")
-                    self._typescript_outputs(package, project_files)
-                for kind in ("typecheck", "build", "test"):
-                    script = scripts.get(kind)
-                    if isinstance(script, str) and script.strip() and not re.search(r"(?:--watch\b|\bwatch\b|\bdev\b|\bserve\b)", script):
-                        # ponytail: exact entries only; add adapters for more script evidence.
-                        basic = kind in {"typecheck", "build"} and script.strip() in {
-                            "tsc", "tsc --noEmit", "tsc -b", "vite build", "next build",
-                        }
-                        commands.append((kind if basic else "smoke", {"argv": ["npm", "run", kind], "cwd": root, "timeout_seconds": 300}))
-                if not commands:
-                    dependencies = {}
-                    if target.is_file():
-                        for field in ("dependencies", "devDependencies"):
-                            declared = data.get(field, {})
-                            if not isinstance(declared, dict):
-                                raise ValueError("项目依赖格式无效")
-                            dependencies.update(declared)
-                    if "typescript" in dependencies and (package / "tsconfig.json").is_file():
-                        commands.append(("typecheck", {"argv": ["node", "node_modules/typescript/bin/tsc", "--noEmit"], "cwd": root, "timeout_seconds": 300}))
-                    for name in paths:
-                        if Path(name).suffix in {".js", ".mjs", ".cjs"} and (self.workspace / name).is_file():
-                            relative = (self.workspace / name).relative_to(package).as_posix()
-                            commands.append(("syntax", {"argv": ["node", "--check", relative], "cwd": root, "timeout_seconds": 60}))
-                    if any(".test." in path.name or path.name.startswith("test-") for path in project_files if path.suffix in {".js", ".cjs", ".mjs"}):
-                        commands.append(("smoke", {"argv": ["node", "--test"], "cwd": root, "timeout_seconds": 300}))
-                if not any(kind == "test" for kind, _ in commands):
-                    uncovered.append("no_tests")
-            if len(commands) + total > MAX_CHECKS:
-                uncovered.append("check_limit")
-            commands = commands[:MAX_CHECKS - total]
-            total += len(commands)
-            if commands:
-                result.append((root, ecosystem, commands))
-        return result, list(dict.fromkeys(uncovered))[:MAX_CHECKS]
-
-    def _python_checks(self, root: str, package: Path, paths: list[str],
-                       project_files: list[Path], uncovered: list[str]) -> list:
-        """Select Python commands and append coverage gaps in discovery order."""
-        commands = []
-        files = [str(Path(name).relative_to(root)) if root != "." else name for name in paths if (self.workspace / name).is_file() and (Path(name).suffix in {".py", ".pyi"} or not Path(name).suffix)]
-        if files:
-            script = "import pathlib,sys; [compile(pathlib.Path(p).read_bytes(), p, 'exec') for p in sys.argv[1:]]"
-            commands.append(("syntax", {"argv": ["python", "-c", script, *files], "cwd": root, "timeout_seconds": 60}))
-        candidates = [p for p in project_files if (p.name.startswith("test_") or p.name.startswith("check_")) and p.suffix == ".py"]
-        pytest_declared = (package / "pytest.ini").is_file()
-        for filename in ("requirements.txt", "pyproject.toml"):
-            target = package / filename
-            if target.is_file():
-                pytest_declared = pytest_declared or bool(re.search(r"\bpytest\b", _read_text(self.workspace, target.relative_to(self.workspace).as_posix())))
-        unittest_files, direct_files = [], []
-        for candidate in candidates[:MAX_CHANGED_PATHS]:
-            try:
-                tree = ast.parse(_read_text(self.workspace, candidate.relative_to(self.workspace).as_posix()))
-            except SyntaxError:
-                pytest_declared = True
-                continue
-            has_unittest = any(isinstance(node, ast.ClassDef) and any(
-                (isinstance(base, ast.Attribute) and base.attr == "TestCase") or (isinstance(base, ast.Name) and base.id == "TestCase") for base in node.bases) for node in ast.walk(tree))
-            has_functions = any(isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("test_") for node in ast.iter_child_nodes(tree))
-            if has_functions:
-                pytest_declared = True
-            elif has_unittest:
-                unittest_files.append(candidate)
-            else:
-                direct_files.append(candidate)
-        if len(candidates) > MAX_CHANGED_PATHS:
-            uncovered.append("check_limit")
-        if pytest_declared:
-            commands.append(("test", _test_command(_PYTEST_CHECK, root)))
-        elif unittest_files:
-            # Explicit modules prevent a zero-test directory discovery from looking like coverage.
-            for candidate in unittest_files[:MAX_CHECKS]:
-                relative = candidate.relative_to(package).as_posix()
-                commands.append(("test", _test_command(_UNITTEST_CHECK, root, relative)))
-        elif direct_files:
-            for candidate in direct_files[:MAX_CHECKS]:
-                commands.append(("smoke", {"argv": ["python", candidate.relative_to(package).as_posix()], "cwd": root, "timeout_seconds": 300}))
-            uncovered.append("no_tests")
-        else:
-            uncovered.append("no_tests")
-        return commands
-
-    def _typescript_outputs(self, package: Path, files: list[Path]) -> None:
-        target = package / "tsconfig.json"
-        if not target.is_file():
-            return
-        try:
-            config_text = _read_text(self.workspace, target.relative_to(self.workspace).as_posix())
-            config = json.loads(config_text)
-        except json.JSONDecodeError:
-            return  # JSONC/extends need compiler-specific discovery; do not guess an exclusion.
-        if not isinstance(config, dict) or "extends" in config:
-            return
-        options = config.get("compilerOptions", {})
-        if not isinstance(options, dict) or not isinstance(options.get("outDir"), str):
-            return
-        name = _path((package.relative_to(self.workspace) / options["outDir"]).as_posix())
-        output = _resolve_workspace_path(self.workspace, name)
-        _reject_symlinks(self.workspace, name)
-        if output == package or package.is_relative_to(output):
-            return
-        protected = [self.workspace / path for path in self._state["changed_paths"]] + [self.workspace / path for path in self._entries]
-        root_dir = options.get("rootDir")
-        if isinstance(root_dir, str):
-            protected.append(_resolve_workspace_path(self.workspace, (package.relative_to(self.workspace) / root_dir).as_posix()))
-        if any(path == output or path.is_relative_to(output) for path in protected):
-            return
-        # Existing JavaScript may be source. Only an empty output root first observed
-        # under this exact config, then generated by our checks, is safely reusable.
-        identity = hashlib.sha256(config_text.encode()).hexdigest()
-        if any(path.is_relative_to(output) for path in files) and self._generated_outputs.get(name) != identity:
-            return
-        self._generated_outputs[name] = identity
-        self._excluded_dirs.add(name)
-        self._output_dirs.add(name)
+        if self._checked_snapshot is None:
+            self._checked_snapshot = self._scan()
+        result = self._refresh_result()
+        validate_self_check_state(self._state)
+        return json.dumps({**result, "evidence": self._state["checks"], "review": self._state["review"]}, ensure_ascii=False)

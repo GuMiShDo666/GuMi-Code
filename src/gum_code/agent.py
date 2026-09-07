@@ -8,6 +8,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError, Event, RLock
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from openai import OpenAI
@@ -239,6 +240,11 @@ def build_agent_tool_schemas(
 
 def _with_system_instructions(content: str) -> str:
     content = content.replace("\n\n" + VERIFICATION_INSTRUCTION, "")
+    # Restored system messages may retain the retired host-discovery instruction.
+    content = "\n\n".join(part for part in content.split("\n\n") if not (
+        part.startswith("仅当前请求实际修改源码、测试或运行/构建配置后，")
+        and "self_check 无参数，不登记计划或提交审阅。" in part
+    ))
     parts = [content]
     if TODO_SYSTEM_INSTRUCTION not in content:
         parts.append(TODO_SYSTEM_INSTRUCTION)
@@ -432,11 +438,6 @@ def _finish_answer(
     project_runtime: object | None = None,
 ) -> str:
     """Save a final message and trusted outcome before rendering the answer."""
-    browser = getattr(project_runtime, "browser", None)
-    if browser is not None:
-        notice = browser.completion_notice()
-        if notice:
-            answer += "\n\n" + notice
     if not messages or messages[-1] != {"role": "assistant", "content": answer}:
         messages.append({"role": "assistant", "content": answer})
     _send_message_snapshot(message_snapshot_callback, messages)
@@ -640,6 +641,8 @@ def _execute_task_batch(
     pre_tool_use_callback: Callable[[str, dict[str, object]], str | None] | None,
     post_tool_use_callback: Callable[[str, dict[str, object], str], None] | None,
     vision_runtime: "VisionRuntime | None",
+    review_context: dict[str, object] | None = None,
+    delegation_limit: int = MAX_DELEGATIONS_PER_RUN,
 ) -> int:
     """Join and persist one adjacent task group before returning its count.
 
@@ -685,7 +688,7 @@ def _execute_task_batch(
                         "duplicate_task",
                         "An equivalent task already started in this run.",
                     )
-                elif delegations_started >= MAX_DELEGATIONS_PER_RUN:
+                elif delegations_started >= delegation_limit:
                     result = error_result(
                         "delegation_limit",
                         "The per-run subagent delegation limit was reached.",
@@ -779,6 +782,7 @@ def _execute_task_batch(
             post_tool_use_callback=post_tool_use_callback,
             cancel_event=cancel_event,
             **({"vision_runtime": vision_runtime} if vision_runtime is not None else {}),
+            **({"review_context": review_context} if review_context is not None else {}),
         )
 
     if len(accepted_offsets) == 1:
@@ -1068,7 +1072,7 @@ def _run_agent_loop(
     denied_tool_calls: set[tuple[str, str]] = set()
     delegations_started = 0
     started_descriptions: set[str] = set()
-    host_check_pending = False
+    review_pending = False
     candidate_answer = ""
     candidate_finish_reason: object = None
     recovery_reminders = 0
@@ -1119,7 +1123,14 @@ def _run_agent_loop(
             return "completion_stalled"
         recovery_reminders += 1
         recovery_checkpoint = progress_epoch
-        detail = "输出被截断，请继续剩余正文或重新规划合法工具调用。" if reason == "response_length" else "当前 Todo 仍有未完成项，请推进工作并据实更新，不要只重复完成结论。"
+        if reason == "verification_missing":
+            detail = (
+                "本轮改动仍缺适用当前版本的验证证据。根据原始需求、实际差异及相关调用者选择最小检查，"
+                "用 self_check 提交明确目标；缺测试时补充并保留。先诊断失败再修复复测，不要重复完成结论。"
+                + (self_check_runtime.outcome(step=step)["summary"] if self_check_runtime is not None else "")
+            )
+        else:
+            detail = "输出被截断，请继续剩余正文或重新规划合法工具调用。" if reason == "response_length" else "当前 Todo 仍有未完成项，请推进工作并据实更新，不要只重复完成结论。"
         messages.append({"role": "assistant", "content": "[Harness completion recovery] " + detail})
         _send_message_snapshot(message_snapshot_callback, messages)
         return "continue"
@@ -1155,32 +1166,53 @@ def _run_agent_loop(
         if step > 1 and event_callback is not None:
             event_callback("request_prepare", {"step": step})
 
-        if host_check_pending:
-            host_check_pending = False
-            call_id = "host_self_check_" + uuid.uuid4().hex
-            messages.append({"role": "assistant", "content": "[Harness self_check] 自动检查当前请求的代码改动。",
-                "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "self_check", "arguments": "{}"}}]})
+        if review_pending:
+            review_pending = False
+            if not self_check_runtime.needs_review():
+                decision = recover("verification_missing", step)
+                if decision != "continue":
+                    return finish_incomplete(decision, step)
+                continue
+            try:
+                context = self_check_runtime.review_context(user_query)
+            except (ValueError, OSError):
+                self_check_runtime.mark_review_unavailable("review_context_unavailable")
+                return _finish_answer(
+                    messages, candidate_answer, status="completed", reason="answered", step=step,
+                    event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
+                    self_check_runtime=self_check_runtime, background_observer=background_observer,
+                    project_runtime=project_runtime,
+                )
+            call_id = "host_review_" + uuid.uuid4().hex
+            description = "独立复核当前需求、代码、测试及宿主执行事实；输入版本 " + context["input_version"]
+            arguments = json.dumps({"description": description}, ensure_ascii=False)
+            review_call = SimpleNamespace(id=call_id, function=SimpleNamespace(name="task", arguments=arguments))
+            messages.append({"role": "assistant", "content": "[Harness review] 只读复核当前变更与验证范围。",
+                "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "task", "arguments": arguments}}]})
             _send_message_snapshot(message_snapshot_callback, messages)
-            in_flight = copy.deepcopy(messages)
-            in_flight.append({"role": "tool", "tool_call_id": call_id, "content": "", IN_FLIGHT_MARKER_KEY: True})
-            _send_message_snapshot(message_snapshot_callback, in_flight)
-            if event_callback is not None:
-                event_callback("tool_call", {"step": step, "tool_name": "self_check", "source": "host"})
-            result = execute_tool(
-                workspace=workspace, tool_name="self_check", arguments_json="{}",
-                approval_callback=approval_callback, pre_tool_use_callback=pre_tool_use_callback,
-                post_tool_use_callback=post_tool_use_callback,
-                before_execute_callback=lambda: _emit_tool_execution(event_callback, step, "self_check"),
-                command_sandbox=command_sandbox, self_check_runtime=self_check_runtime,
-                file_change_callback=file_changed,
+            delegations_started = _execute_task_batch(
+                task_calls=[review_call], messages=messages, delegations_started=delegations_started,
+                started_descriptions=started_descriptions, client=client, model=model, workspace=workspace,
+                base_token_counter=base_token_counter, max_context_tokens=max_context_tokens,
+                step=step, allow_subagent=allow_subagent, event_callback=event_callback,
+                message_snapshot_callback=message_snapshot_callback,
+                pre_tool_use_callback=pre_tool_use_callback, post_tool_use_callback=post_tool_use_callback,
+                vision_runtime=None, review_context=context,
             )
-            messages.append({"role": "tool", "tool_call_id": call_id, "content": result})
-            _send_message_snapshot(message_snapshot_callback, messages)
+            if background_observer is not None:
+                background_observer()
+            report = json.loads(messages[-1]["content"])
+            if report.get("status") == "completed":
+                try:
+                    self_check_runtime.record_review(report, input_version=context["input_version"])
+                except ValueError:
+                    self_check_runtime.mark_review_unavailable("invalid_report")
+            else:
+                self_check_runtime.mark_review_unavailable(report.get("code", "review_unavailable"))
             if event_callback is not None:
-                event_callback("tool_result", {"step": step, "tool_name": "self_check", "result": result})
                 event_callback("self_check_state", self_check_runtime.export_state())
-            outcome = self_check_runtime.outcome(step=step)
-            if outcome["status"] == "completed" or outcome["self_check_status"] not in {"failed", "source_changed"}:
+            observe_progress(("review", context["input_version"], report))
+            if self_check_runtime.outcome(step=step)["status"] == "completed" or report.get("status") != "completed":
                 blocker = _completion_blocker(candidate_finish_reason, todo_manager)
                 if blocker is not None:
                     observe_check()
@@ -1346,13 +1378,23 @@ def _run_agent_loop(
                     return finish_incomplete(decision, step)
                 continue
 
-            if self_check_runtime is not None and self_check_runtime.needs_check():
-                if step == max_steps:
-                    break
-                candidate_answer = answer
-                candidate_finish_reason = finish_reason
-                host_check_pending = True
-                continue
+            if self_check_runtime is not None:
+                if self_check_runtime.needs_review():
+                    if step == max_steps:
+                        self_check_runtime.mark_review_unavailable("step_budget")
+                        break
+                    if not allow_subagent or delegations_started >= MAX_DELEGATIONS_PER_RUN:
+                        self_check_runtime.mark_review_unavailable("subagent_disabled" if not allow_subagent else "delegation_limit")
+                    else:
+                        candidate_answer = answer
+                        candidate_finish_reason = finish_reason
+                        review_pending = True
+                        continue
+                elif self_check_runtime.needs_check():
+                    decision = recover("verification_missing", step)
+                    if decision != "continue":
+                        return finish_incomplete(decision, step)
+                    continue
             return _finish_answer(
                 messages, answer, status="completed", reason="answered", step=step,
                 event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
@@ -1414,6 +1456,8 @@ def _run_agent_loop(
                     pre_tool_use_callback=pre_tool_use_callback,
                     post_tool_use_callback=post_tool_use_callback,
                     vision_runtime=vision_runtime,
+                    # Keep one existing delegation slot for host verification review.
+                    delegation_limit=MAX_DELEGATIONS_PER_RUN - int(self_check_runtime is not None),
                 )
                 for call, result_message in zip(task_calls, messages[-len(task_calls):]):
                     observe_progress(_reading_progress("task", call.function.arguments, result_message["content"]))
