@@ -64,6 +64,11 @@ MAX_STEPS = 512
 MAX_REACTIVE_RETRIES = 1
 MAX_COMPLETION_REMINDERS = 2
 TODO_REMINDER_INTERVAL = 3
+PAUSED_SELF_CHECK_INSTRUCTION = (
+    "本轮不要求自动自检或强制复核，不沿用历史自检门槛。"
+    "仅在用户明确要求测试时使用当前可用工具执行，不主动补做自动测试，也不额外说明此设置。"
+    "没有实际执行的检查不得声称通过。"
+)
 TODO_REMINDER = "<reminder>Update your todos.</reminder>"
 
 COMPLETION_RECOVERY_INSTRUCTION = (
@@ -218,7 +223,7 @@ def build_agent_tool_schemas(
     allow_subagent: bool = True,
     allow_skills: bool = False,
     allow_verification: bool = False,
-    allow_self_check: bool = True,
+    allow_self_check: bool = False,
     allow_plans: bool = False,
     allow_project_runtime: bool = False,
 ) -> list[dict[str, object]]:
@@ -240,6 +245,8 @@ def build_agent_tool_schemas(
 
 def _with_system_instructions(content: str) -> str:
     content = content.replace("\n\n" + VERIFICATION_INSTRUCTION, "")
+    content = content.replace(SELF_CHECK_INSTRUCTION, "")
+    content = content.replace(PAUSED_SELF_CHECK_INSTRUCTION, "")
     # Restored system messages may retain the retired host-discovery instruction.
     content = "\n\n".join(part for part in content.split("\n\n") if not (
         part.startswith("仅当前请求实际修改源码、测试或运行/构建配置后，")
@@ -480,7 +487,7 @@ def _finish_answer(
             event_callback("task_outcome", outcome)
     elif event_callback is not None:
         event_callback("task_outcome", {"status": status, "reason": reason, "step": step,
-            "self_check_status": "not_needed", "changed": False, "summary": ""})
+            "self_check_status": "disabled", "changed": False, "summary": ""})
     if event_callback is not None:
         event_callback("final_answer", {"step": step, "answer": answer})
     return answer
@@ -1006,12 +1013,12 @@ def _run_agent_loop(
                 message["content"] = skill_runtime.apply_to_system(message["content"])
                 break
 
-    if self_check_runtime is not None:
-        for message in messages:
-            if message.get("role") == "system" and isinstance(message.get("content"), str):
-                if SELF_CHECK_INSTRUCTION not in message["content"]:
-                    message["content"] += "\n\n" + SELF_CHECK_INSTRUCTION
-                break
+    instruction = SELF_CHECK_INSTRUCTION if self_check_runtime is not None else PAUSED_SELF_CHECK_INSTRUCTION
+    for message in messages:
+        if message.get("role") == "system" and isinstance(message.get("content"), str):
+            if instruction not in message["content"]:
+                message["content"] += "\n\n" + instruction
+            break
 
     _send_message_snapshot(message_snapshot_callback, messages)
 

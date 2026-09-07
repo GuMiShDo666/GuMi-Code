@@ -72,7 +72,11 @@ from gum_code.skills import SKILL_SECTION_END, SKILL_SECTION_START, SkillRuntime
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.tools.registry import READ_ONLY_TOOL_NAMES
-from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
+from gum_code.self_check import (
+    AUTOMATIC_SELF_CHECK_ENABLED,
+    SelfCheckRuntime,
+    validate_task_outcome,
+)
 from gum_code.vision import VisionRuntime
 from gum_code.todo import PlanRuntime
 from gum_code.project_runtime import ProjectRuntime
@@ -797,8 +801,11 @@ class InteractiveRuntime:
                 self.skill_runtime.sticky_names if self.skill_runtime is not None else self.sticky_skills,
                 **kwargs,
             )
+            internal_paths = session_internal_paths(self.session_path)
             if self.self_check_runtime is not None:
-                self.self_check_runtime.set_internal_paths(session_internal_paths(self.session_path))
+                self.self_check_runtime.set_internal_paths(internal_paths)
+            if self.project_runtime is not None:
+                self.project_runtime.internal_paths = internal_paths
             self.messages = candidate
             self._flush_skill_activations()
 
@@ -807,8 +814,11 @@ class InteractiveRuntime:
             if self.session_path is None:
                 raise RuntimeError("Session 尚未建立")
             append_session_event(self.session_path, event_type, data)
+            internal_paths = session_internal_paths(self.session_path)
             if self.self_check_runtime is not None:
-                self.self_check_runtime.set_internal_paths(session_internal_paths(self.session_path))
+                self.self_check_runtime.set_internal_paths(internal_paths)
+            if self.project_runtime is not None:
+                self.project_runtime.internal_paths = internal_paths
 
     def _persist_vision(self, state: dict[str, object]) -> None:
         # Called under the budget lock: never read runtime state or render here.
@@ -833,7 +843,7 @@ class InteractiveRuntime:
             SelfCheckRuntime(
                 self.workspace, request_id=data.user_request_id,
                 initial_state=data.self_check_state, command_sandbox=self.command_sandbox,
-            ) if data.user_request_id is not None else None
+            ) if AUTOMATIC_SELF_CHECK_ENABLED and data.user_request_id is not None else None
         )
         if self.self_check_runtime is not None and data.source_event_seq is not None:
             self.self_check_runtime.bind_source(data.source_event_seq)
@@ -1036,7 +1046,11 @@ class InteractiveRuntime:
                 persist_callback=self._persist_vision,
                 settings_loader=lambda: load_vision_settings(),
             )
-        if resume_data is None or self.self_check_runtime is None:
+        if not AUTOMATIC_SELF_CHECK_ENABLED:
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.cancel()
+            self.self_check_runtime = None
+        elif resume_data is None or self.self_check_runtime is None:
             if self.self_check_runtime is not None:
                 self.self_check_runtime.cancel()
             self.self_check_runtime = SelfCheckRuntime(
@@ -1060,18 +1074,21 @@ class InteractiveRuntime:
             activation_callback=self._record_skill_activation,
         )
         if not self.task_type_consumed and getattr(self.args, "task_type", None) is not None:
-            self.console.print(Text("提示：--task-type 已弃用；自检由本轮实际代码变化触发。"))
+            self.console.print(Text("提示：--task-type 已弃用。"))
         self.task_type_consumed = True
         self.verification_runtime = None
         assert self.session_path is not None and self.lease is not None
-        self.self_check_runtime.set_internal_paths((self.session_path, self.lease.lock_path,
-                                                  *session_internal_paths(self.session_path)))
+        internal_paths = (self.session_path, self.lease.lock_path,
+                          *session_internal_paths(self.session_path))
         renderer = RichEventRenderer(self.console, verbose=self.verbose)
-        self.self_check_runtime.approval_callback = (
+        environment_approval_callback = (
             renderer.paused(lambda summary: request_environment_preparation(
                 summary, console=self.console, interactive=True,
             ))
         ) if bool(getattr(self.args, "interactive_terminal", False)) else None
+        if self.self_check_runtime is not None:
+            self.self_check_runtime.set_internal_paths(internal_paths)
+            self.self_check_runtime.approval_callback = environment_approval_callback
         self.last_task_outcome = None
 
         if self.project_runtime is None:
@@ -1081,8 +1098,9 @@ class InteractiveRuntime:
             self.project_runtime.browser = ProjectBrowser(
                 self.project_runtime.browser_scope, redactor=self.project_runtime._redact,
             )
-        self.project_runtime.environment_approval_callback = self.self_check_runtime.approval_callback
-        self.project_runtime.browser.approval_callback = self.self_check_runtime.approval_callback
+        self.project_runtime.internal_paths = internal_paths
+        self.project_runtime.environment_approval_callback = environment_approval_callback
+        self.project_runtime.browser.approval_callback = environment_approval_callback
         self.project_runtime.browser.begin_request()
         self.project_runtime.network_approval_callback = renderer.paused(lambda summary: (
             make_interactive_approval(self.workspace, self.console)(
@@ -1106,7 +1124,8 @@ class InteractiveRuntime:
                     # Budget -> Session lock ordering; do not bind while saving.
                     if self.vision_runtime is not None:
                         self.vision_runtime.bind_source(saved.source_event_seq)
-                    self.self_check_runtime.bind_source(saved.source_event_seq)
+                    if self.self_check_runtime is not None:
+                        self.self_check_runtime.bind_source(saved.source_event_seq)
 
         def event_callback(event_type: str, payload: dict[str, object]) -> None:
             if event_type == "self_check_state":
@@ -1150,7 +1169,8 @@ class InteractiveRuntime:
                 **kwargs,
             )
         except KeyboardInterrupt as error:
-            self.self_check_runtime.cancel()
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.cancel()
             if self.vision_runtime is not None:
                 self.vision_runtime.cancel()
             renderer.close()
@@ -1166,7 +1186,8 @@ class InteractiveRuntime:
             )
             return
         except Exception:
-            self.self_check_runtime.cancel()
+            if self.self_check_runtime is not None:
+                self.self_check_runtime.cancel()
             if self.vision_runtime is not None:
                 self.vision_runtime.cancel()
             renderer.close()
@@ -1231,7 +1252,7 @@ class InteractiveRuntime:
         tools = build_agent_tool_schemas(
             allow_run_command=bool(getattr(self.args, "allow_run_command", False)),
             allow_subagent=bool(getattr(self.args, "allow_subagent", True)),
-            allow_self_check=True,
+            allow_self_check=self.self_check_runtime is not None,
             allow_plans=True,
             allow_project_runtime=True,
         )
@@ -1277,13 +1298,13 @@ class InteractiveRuntime:
         table.add_row("Session", Text(_safe_terminal_text(session)))
         table.add_row("Sandbox", "on" if self.args.allow_run_command else "off")
         table.add_row("Subagent", "on" if self.args.allow_subagent else "off")
-        if self.last_task_outcome is not None:
+        if self.self_check_runtime is not None and self.last_task_outcome is not None:
             table.add_row("自检", task_outcome_text(self.last_task_outcome) or "状态未确认")
         if self.messages:
             tools = build_agent_tool_schemas(
                 allow_run_command=self.args.allow_run_command,
                 allow_subagent=self.args.allow_subagent,
-                allow_self_check=True,
+                allow_self_check=self.self_check_runtime is not None,
                 allow_plans=True,
                 allow_project_runtime=True,
             )
