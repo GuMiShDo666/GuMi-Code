@@ -19,6 +19,8 @@ from gum_code.tools.filesystem import FileChange
 from gum_code.verification import MAX_CHECKS, MAX_SCAN_SECONDS, _ScanError
 
 MAX_SELF_CHECK_STATE_BYTES = 64_000
+# Temporary product pause; keep the explicit runtime for repair and regression tests.
+AUTOMATIC_SELF_CHECK_ENABLED = False
 MAX_CHANGED_PATHS = 256
 _SOURCE_SUFFIXES = {
     ".py", ".pyi", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts",
@@ -210,10 +212,12 @@ def validate_task_outcome(value: object) -> dict[str, object]:
     _reason(value["reason"])
     if type(value["step"]) is not int or value["step"] < 0 or type(value["changed"]) is not bool:
         raise ValueError("任务结束事实无效")
-    if not isinstance(value["self_check_status"], str) or value["self_check_status"] not in _RESULT_STATUSES | {"pending"}:
+    if not isinstance(value["self_check_status"], str) or value["self_check_status"] not in _RESULT_STATUSES | {"pending", "disabled"}:
         raise ValueError("任务自检状态无效")
     if not isinstance(value["summary"], str) or len(value["summary"]) > 2000:
         raise ValueError("任务摘要无效")
+    if value["self_check_status"] == "disabled" and ("coverage" in value or value["summary"] or value["changed"]):
+        raise ValueError("停用的自检不能声明覆盖或变化事实")
     if "coverage" in value:
         if not isinstance(value["coverage"], str) or value["coverage"] not in _COVERAGE:
             raise ValueError("任务自检覆盖类别无效")

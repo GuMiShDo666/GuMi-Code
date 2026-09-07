@@ -46,7 +46,11 @@ from gum_code.skills import SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
 from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
-from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
+from gum_code.self_check import (
+    AUTOMATIC_SELF_CHECK_ENABLED,
+    SelfCheckRuntime,
+    validate_task_outcome,
+)
 from gum_code.vision import VisionRuntime
 from gum_code.todo import PlanRuntime
 from gum_code.project_runtime import ProjectRuntime
@@ -76,7 +80,7 @@ def parse_args(
     parser.add_argument("--workspace", help="工作区目录路径")
     parser.add_argument(
         "--task-type", choices=("development", "read-only"),
-        help="已弃用；接受旧参数，但不再改变自检或工具行为",
+        help="已弃用；接受旧参数，但不再改变工具行为",
     )
     parser.add_argument(
         "--max-steps", type=_positive_int, default=MAX_STEPS,
@@ -89,7 +93,7 @@ def parse_args(
     )
     parser.add_argument(
         "--allow-run-command", action="store_true",
-        help="允许模型请求在 Docker Sandbox 中执行普通命令；自检无需此参数",
+        help="允许模型请求在 Docker Sandbox 中执行普通命令",
     )
     parser.add_argument(
         "--no-subagent", dest="allow_subagent", action="store_false",
@@ -251,8 +255,11 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             with session_write_lock:
                 if session_file is not None:
                     append_session_event(session_file, event_type, payload)
+                    internal_paths = session_internal_paths(session_file)
                     if self_check_runtime is not None:
-                        self_check_runtime.set_internal_paths(session_internal_paths(session_file))
+                        self_check_runtime.set_internal_paths(internal_paths)
+                    if project_runtime is not None:
+                        project_runtime.internal_paths = internal_paths
 
         def flush_activations() -> None:
             if session_file is None or not Path(session_file).exists():
@@ -284,7 +291,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         # A one-shot task is always new explicit user input, even with --resume.
         request_id = str(uuid.uuid4())
         if args.task_type is not None:
-            print("提示：--task-type 已弃用；自检由本轮实际代码变化触发。", flush=True)
+            print("提示：--task-type 已弃用。", flush=True)
         renderer = RichEventRenderer(
             create_console(), persistent_callback=print_terminal_event,
         )
@@ -305,17 +312,17 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                                                 redactor=project_runtime._redact,
                                                 approval_callback=project_runtime.environment_approval_callback)
         project_runtime.browser.begin_request()
-        self_check_runtime = SelfCheckRuntime(
-            args.workspace, request_id=request_id, command_sandbox=command_sandbox,
-            approval_callback=renderer.paused(lambda summary: request_environment_preparation(
-                summary, interactive=args.interactive_terminal,
-            )) if args.interactive_terminal else None,
-            internal_paths=(
-                (Path(session_file), lease.lock_path, *session_internal_paths(session_file))
-                if session_file is not None and lease is not None
-                else ()
-            ),
+        project_runtime.internal_paths = (
+            (Path(session_file), lease.lock_path, *session_internal_paths(session_file))
+            if session_file is not None and lease is not None else ()
         )
+        if AUTOMATIC_SELF_CHECK_ENABLED:
+            self_check_runtime = SelfCheckRuntime(
+                args.workspace, request_id=request_id, command_sandbox=command_sandbox,
+                approval_callback=project_runtime.environment_approval_callback
+                if args.interactive_terminal else None,
+                internal_paths=project_runtime.internal_paths,
+            )
         vision_runtime = VisionRuntime(
             load_vision_settings(), request_id=request_id,
             persist_callback=(lambda state: append_event("vision.state", state))
@@ -357,7 +364,11 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                         session_file, workspace, model, messages, title, skill_runtime.sticky_names,
                         **({"user_request_id": request_id} if first_snapshot else {}),
                     )
-                    self_check_runtime.set_internal_paths(session_internal_paths(session_file))
+                    internal_paths = session_internal_paths(session_file)
+                    if self_check_runtime is not None:
+                        self_check_runtime.set_internal_paths(internal_paths)
+                    if project_runtime is not None:
+                        project_runtime.internal_paths = internal_paths
                     flush_activations()
                     if first_snapshot:
                         saved = load_session(session_file, allow_incomplete_tool_batch=True,
@@ -369,7 +380,8 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 # Never acquire the budget lock while holding the Session lock.
                 if source_event_seq is not None:
                     vision_runtime.bind_source(source_event_seq)
-                    self_check_runtime.bind_source(source_event_seq)
+                    if self_check_runtime is not None:
+                        self_check_runtime.bind_source(source_event_seq)
 
         kwargs: dict[str, object] = {}
         if command_sandbox is not None:
