@@ -126,7 +126,8 @@ def request_environment_preparation(
     ecosystem = details.get("ecosystem")
     if not isinstance(ecosystem, str):
         return False
-    language = {"python": "Python", "node": "Node.js"}.get(ecosystem)
+    language = {"python": "Python", "node": "Node.js", "browser": "Chromium 浏览器",
+                "postgres": "PostgreSQL 测试数据库"}.get(ecosystem)
     if language is None:
         return False
     source = "PyPI" if ecosystem == "python" else "npm 公共仓库"
@@ -144,6 +145,17 @@ def request_environment_preparation(
         f"{language}{version} 自检：{missing_text}创建项目专属环境将从公共镜像及 {source} 下载，"
         "占用本地空间，并可能执行第三方依赖安装代码；不会创建数据库或云服务。"
     )
+    if ecosystem == "browser":
+        text = (
+            "浏览器检查环境未准备。将下载固定版本的公开浏览器镜像和 Playwright，"
+            "可能占用较多空间并运行安装代码；仅用于当前项目检查，不修改宿主 Python 环境。"
+            "拒绝后仍可开发，但浏览器检查未完成。"
+        )
+    elif ecosystem == "postgres":
+        text = (
+            "测试数据库镜像未准备。将下载公开 PostgreSQL 镜像，用独立测试数据卷运行；"
+            "正常退出停止服务但保留数据，不接入生产数据库。"
+        )
     if console is None:
         print(text, flush=True)
     else:

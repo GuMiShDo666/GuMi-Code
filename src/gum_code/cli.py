@@ -39,6 +39,8 @@ from gum_code.session import (
     load_session,
     migrate_session_to_v3,
     save_session,
+    session_internal_paths,
+    session_history_usage,
 )
 from gum_code.skills import SkillRuntime, SkillSnapshot
 from gum_code.token_counting import load_token_counter
@@ -46,6 +48,9 @@ from gum_code.tools.command import load_docker_sandbox
 from gum_code.user_state import allocate_session_path, migrate_legacy_user_data
 from gum_code.self_check import SelfCheckRuntime, validate_task_outcome
 from gum_code.vision import VisionRuntime
+from gum_code.todo import PlanRuntime
+from gum_code.project_runtime import ProjectRuntime
+from gum_code.project_browser import ProjectBrowser
 
 
 def _positive_int(value: str) -> int:
@@ -145,6 +150,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
     vision_runtime: VisionRuntime | None = None
     self_check_runtime: SelfCheckRuntime | None = None
     renderer: RichEventRenderer | None = None
+    project_runtime: ProjectRuntime | None = None
     session_write_lock = RLock()
     try:
         session_file = args.session_file or args.resume_session
@@ -245,6 +251,8 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             with session_write_lock:
                 if session_file is not None:
                     append_session_event(session_file, event_type, payload)
+                    if self_check_runtime is not None:
+                        self_check_runtime.set_internal_paths(session_internal_paths(session_file))
 
         def flush_activations() -> None:
             if session_file is None or not Path(session_file).exists():
@@ -280,13 +288,30 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         renderer = RichEventRenderer(
             create_console(), persistent_callback=print_terminal_event,
         )
+        plan_runtime = PlanRuntime(resumed.plan_state if resumed is not None else None)
+        project_runtime = ProjectRuntime(
+            args.workspace, session_key=str(session_file) if session_file else request_id,
+            command_sandbox=command_sandbox,
+            environment_approval_callback=renderer.paused(lambda summary: request_environment_preparation(
+                summary, interactive=args.interactive_terminal,
+            )),
+            network_approval_callback=renderer.paused(lambda summary: (
+                request_terminal_approval("project_network", {},
+                    "允许当前服务启动配置访问外网；这不同于依赖安装联网许可。")
+                if args.interactive_terminal else False
+            )),
+        )
+        project_runtime.browser = ProjectBrowser(project_runtime.browser_scope,
+                                                redactor=project_runtime._redact,
+                                                approval_callback=project_runtime.environment_approval_callback)
+        project_runtime.browser.begin_request()
         self_check_runtime = SelfCheckRuntime(
             args.workspace, request_id=request_id, command_sandbox=command_sandbox,
             approval_callback=renderer.paused(lambda summary: request_environment_preparation(
                 summary, interactive=args.interactive_terminal,
             )) if args.interactive_terminal else None,
             internal_paths=(
-                (Path(session_file), lease.lock_path)
+                (Path(session_file), lease.lock_path, *session_internal_paths(session_file))
                 if session_file is not None and lease is not None
                 else ()
             ),
@@ -304,6 +329,9 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             if event_type == "self_check_state":
                 if session_file is not None:
                     append_event("self_check.state", payload)
+            elif event_type == "plan_state":
+                if session_file is not None:
+                    append_event("plan.state", payload)
             elif event_type == "task_outcome":
                 last_task_outcome = validate_task_outcome(payload)
             elif event_type == "final_answer" and (
@@ -329,6 +357,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                         session_file, workspace, model, messages, title, skill_runtime.sticky_names,
                         **({"user_request_id": request_id} if first_snapshot else {}),
                     )
+                    self_check_runtime.set_internal_paths(session_internal_paths(session_file))
                     flush_activations()
                     if first_snapshot:
                         saved = load_session(session_file, allow_incomplete_tool_batch=True,
@@ -361,6 +390,8 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             initial_messages=initial_messages,
             token_counter=token_counter,
             skill_runtime=skill_runtime,
+            plan_runtime=plan_runtime,
+            project_runtime=project_runtime,
             self_check_runtime=self_check_runtime,
             vision_runtime=vision_runtime,
             on_vision_budget_exhausted=renderer.paused(lambda runtime: request_extra_vision_calls(
@@ -368,12 +399,26 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             )),
             **kwargs,
         )
+        if session_file is not None and session_history_usage(session_file)["warning_level"]:
+            print("会话历史占用较大；旧记录已保留，可由你决定是否清理。")
+        if project_runtime is not None:
+            browser_failures = project_runtime.browser.close()
+            service_failures = project_runtime.close()
+            if browser_failures or service_failures:
+                print("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", file=sys.stderr)
+                return 1
+            project_runtime = None
         if last_task_outcome is not None and last_task_outcome.get("status") == "completed":
             return 0
         return 1
     finally:
         if renderer is not None:
             renderer.close()
+        if project_runtime is not None:
+            browser_failures = project_runtime.browser.close()
+            service_failures = project_runtime.close()
+            if browser_failures or service_failures:
+                print("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", file=sys.stderr)
         if vision_runtime is not None:
             vision_runtime.cancel()
         if self_check_runtime is not None:

@@ -19,7 +19,7 @@
 - Git.
 - Python 3.11 or newer.
 - An OpenAI-compatible model service that supports Chat Completions and `tool_calls`.
-- Docker only if you enable the optional `run_command` tool.
+- Docker for optional command execution, self-checks, and project services; ordinary chat and file tools do not require it.
 
 ### macOS / Linux
 
@@ -101,7 +101,7 @@ The request budget defaults to 80% of the resolved model context window. Use `--
 
 ### Optional: enable the Docker command sandbox
 
-Start Docker and prepare a trusted local image first. Gum Code does not pull or build an image for you.
+Start Docker and prepare a trusted local image first. This explicit command-sandbox configuration does not pull or build images.
 
 ```bash
 .venv/bin/gum-code \
@@ -124,11 +124,21 @@ A completed one-shot task exits with `0`; incomplete work, failed/unavailable ch
 
 ### Missing environments
 
-An available isolated environment needs no per-check prompt. Downloading a runtime or installing project dependencies requires consent after a short risk explanation; refusal, empty input, or non-interactive execution does not approve preparation. Preparation supports standard public Python/pip and Node.js/npm manifests and compatible locks, using project-specific Docker dependency volumes. Network-enabled preparation containers receive selected dependency metadata, not workspace source or user configuration. Dependency installation scripts can still execute third-party code and use the network. Checks run offline with read-only dependencies and a writable workspace. Gum Code does not install/start Docker, provision databases or cloud services, or install global host packages. Other package managers and unsupported dependencies report an unavailable environment. Preparation requires POSIX locking and safe file operations; Windows is not supported yet.
+An available isolated environment needs no per-check prompt. Downloading a runtime or installing project dependencies requires consent after a short risk explanation; refusal, empty input, or non-interactive execution does not approve preparation. Preparation supports standard public Python/pip and Node.js/npm manifests and compatible locks, using project-specific Docker dependency volumes. Network-enabled preparation containers receive selected dependency metadata, not workspace source or user configuration. Dependency installation scripts can still execute third-party code and use the network. Checks run offline with read-only dependencies and a writable workspace. Gum Code does not install/start Docker or install global host packages. Project services can provision an approved, separate test PostgreSQL database; other databases, Redis, and cloud services are not provisioned. Other package managers and unsupported dependencies report an unavailable environment. Preparation requires POSIX locking and safe file operations; Windows is not supported yet.
 
 Existing dirty files are not attributed to the current request. Input scans remain bounded to 20,000 entries, 128 MiB, and 5 seconds, and fail closed on unsafe or uncertain inputs. Only verified managed dependencies and known outputs are excluded; Git-ignore status alone does not exclude source.
 
 The `self_check.state` Session event stores request-local change facts. Resume/fork clears current passing evidence and preparation permission; old `task.state` entries remain historical. Older binaries may reject new fields or events. Preserve original logs and use a compatible or new Session when downgrading.
+
+### Project services and browser checks
+
+The root Agent can use `project_service` to start, inspect, read logs, restart, and stop project services. Python/pip and Node.js/npm reuse approved dependency environments; other languages require a prepared trusted Docker image. Services can span tool calls and conversation turns. Restarting an unchanged approved configuration in the same invocation and Session needs no new approval. Session resume/new Session clears these grants and does not replay service starts.
+
+Services communicate on an internal project network by default. Runtime internet access needs approval separate from dependency downloads. A fixed-target relay publishes previews only on `127.0.0.1`, requiring Docker 28 or newer; the application stays on the internal network. Test PostgreSQL has no published host port, and the runtime generates and passes private credentials. Normal exit or Session switching stops owned services; cleanup failure blocks switching. Database volumes survive and require separate explicit handling to erase. Containers and internal networks do not protect against malicious images or a compromised Docker daemon.
+
+`project_browser` supports only opening, reading, clicking, and filling current-project pages. On first use, you can approve preparation of a separate Playwright/Chromium Docker image. The download is large but is absent from ordinary startup and installs nothing into host Python. Declining still permits code development; browser checks remain incomplete. The browser exposes no arbitrary scripts, external browsing, or file uploads/downloads. It returns bounded page text and errors; a reachable page or a successful action is not business acceptance.
+
+An invocation retains up to eight service configurations; application ports range from 1024 to 65535. Running services hold dependency leases. After dependency manifests change, stop users of the old environment before preparing dependencies again. Service logs retain bounded in-memory head/tail output, without cross-process recovery; database persistence does not imply persistent logs.
 
 ### Build logs
 
@@ -164,7 +174,11 @@ Use `$skill-name` in a task to load a Codex user Skill before the first model re
 
 Skills are read-only instructions and text resources. Gum Code does not execute or install Skill scripts, and Subagents receive neither Skill tools nor Skill content.
 
-New Sessions use private append-only v3 JSONL event logs with the existing 5 MiB total-file limit. The first resume/import of v1 or v2 creates a migrated copy while preserving the source. `/sessions` can show a structural audit timeline without prompts, arguments, results, or Skill bodies, and can fork an independently replayable child from a completed turn. Context compaction appends a replacement projection without deleting earlier events.
+New Sessions use private append-only v3 JSONL logs. Each file holds up to 5 MiB, then rolls over into another segment within the same logical Session. Total history has no automatic eviction or hard capacity limit; each additional 100 MiB prompts a disk-usage warning, and `/sessions` can delete an entire logical Session. The current message projection still has a 5 MiB limit, separate from the model context budget. Retained history does not all enter the model. The first resume/import of v1 or v2 creates a migrated copy while preserving the source. Audit and completed-turn forks read across segments.
+
+`plan.state` preserves plans. An explicit new task pauses and retains the old plan; an explicit resume restores it. Ordinary follow-up questions should not switch tasks. Each plan allows 20 items, with a 1 MiB total plan-state projection; exceeding it produces an error. Compaction can update sourced execution progress but cannot rewrite user constraints or invent passing checks. Resume never replays historical tools.
+
+Keep the entry file and its segment directory together. Loading and saving still replay history linearly, so larger histories can take longer. Older binaries may reject new events or see only the first segment: do not continue writing segmented Sessions with an older release. Preserve originals and use an older compatible or new Session when downgrading.
 
 Verification plans and historical outcomes use a separate `task.state` event; `turn.completed` remains a conversation boundary. The new reader accepts older logs without verification state and treats them as unverified. Older releases cannot read logs containing `task.state`. Preserve those logs when downgrading and use an older readable Session or a new one; do not delete historical events to force compatibility.
 
@@ -182,7 +196,7 @@ Adjacent `task` calls in one model step form a parallel group. Non-`task` tools 
 | Command execution | Runs one argv command in a network-disabled Docker container after explicit enablement. | `run_command` is disabled by default. Ordinary commands need per-call approval; fixed checks can receive explicit stage-scoped repeat permission. The container can modify the workspace and cannot protect against malicious images, a compromised Docker daemon, or runtime vulnerabilities. |
 | Self-checks | Runs project checks after actual code changes, binds evidence to current inputs, and repairs/reruns within the remaining steps. | Requires an available isolated environment and distinguishes tests from basic checks. It cannot guarantee repair of every error or full business coverage. |
 | Context | Bounds tool results, performs structured compaction, supports manual compaction, and retries once after a context-length error. The terminal reports only the percentage of the configured context limit. | Compaction state belongs to the current Session. Gum Code does not provide cross-Session long-term memory. |
-| Sessions | Stores interactive history in v3 JSONL event logs and supports structural audit, completed-turn forks, listing, renaming, resuming, and safe interrupted-batch closure. | Each file is capped at 5 MiB. Start or fork a Session at the limit. Inspect current state when an in-flight tool may have produced side effects; the harness does not replay it. |
+| Sessions | Stores history and plans in segmented v3 JSONL logs, with audit, completed-turn forks, naming, resume, and safe interrupted-batch closure. | Each segment holds 5 MiB; the current projection and model context remain bounded. Unknown side effects require inspection, not tool replay. Users manage retained disk history. |
 | Skills | Reuses the top-level Codex user Skill library through explicit sticky activation and progressive root-Agent reads. | `.system`, plugin, and project Skills are excluded. Scripts never execute, and Subagents receive no Skills. |
 | Subagents | Adjacent `task` calls run in parallel. A root run starts at most four single-level, read-only subagents, each with at most eight model requests. | Each Subagent has isolated context and no Skills. It cannot write, run commands, delegate recursively, or persist; ordinary tools remain serial. |
 | Hooks | The Python API supports `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. | Hooks support synchronous in-process registration only. Gum Code has no hook configuration file, external-command hooks, async callbacks, or automatic discovery. |
