@@ -233,6 +233,9 @@ def _validate_run_command(
     if not all(isinstance(arg, str) for arg in argv):
         raise ValueError("argv 必须是字符串列表")
 
+    from gum_code.local_command import LocalCommandConfig, validate_local
+    if isinstance(sandbox, LocalCommandConfig):
+        validate_local(workspace, argv, cwd, sandbox)
     _validate_program(argv)
 
     if _launches_shell(argv):
@@ -263,6 +266,8 @@ def _validate_run_command(
 
     _validate_argument_paths(workspace, cwd_path, argv)
 
+    if isinstance(sandbox, LocalCommandConfig):
+        return
     _validate_docker_sandbox(sandbox)
     if sandbox is not None:
         _validate_dependency_mount(sandbox, workspace)
@@ -918,10 +923,15 @@ def run_command(
     Tool Result is returned when recording execution evidence fails.
     """
     try:
-        result = _run_command(
-            workspace, argv, cwd, timeout_seconds, sandbox=sandbox,
-            **({"cancel_event": cancel_event} if cancel_event is not None else {}),
-        )
+        from gum_code.local_command import LocalCommandConfig, run_local
+        if isinstance(sandbox, LocalCommandConfig):
+            _validate_run_command(workspace, argv, cwd, timeout_seconds, sandbox=sandbox)
+            result = run_local(workspace, argv, cwd, timeout_seconds, sandbox, cancel_event)
+        else:
+            result = _run_command(
+                workspace, argv, cwd, timeout_seconds, sandbox=sandbox,
+                **({"cancel_event": cancel_event} if cancel_event is not None else {}),
+            )
     except KeyboardInterrupt as exc:
         if result_callback is not None:
             result_callback(

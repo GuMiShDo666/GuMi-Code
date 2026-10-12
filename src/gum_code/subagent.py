@@ -18,8 +18,10 @@ from gum_code.context import (
 )
 from gum_code.events import AgentEventCallback
 from gum_code.model_protocol import (
+    thinking_options,
     assistant_message_to_dict as _assistant_message_to_dict,
     is_context_length_error as _is_context_length_error,
+    truncated_tool_results,
 )
 from gum_code.session import TASK_INTERRUPTED_RESULT
 from gum_code.token_counting import RequestTokenCounter, TokenBudgetTracker
@@ -668,7 +670,7 @@ def run_read_only_subagent(
                         messages=messages,
                         tools=child_tool_schemas,
                         tool_choice="auto",
-                        extra_body={"thinking": {"type": "enabled"}},
+                        **thinking_options(client, True),
                     )
                     reactive_retries = 0
                 except KeyboardInterrupt:
@@ -753,6 +755,14 @@ def run_read_only_subagent(
                         "child_model_error",
                         "The subagent model returned an invalid response.",
                     )
+
+                rejected_results = truncated_tool_results(message, getattr(response.choices[0], "finish_reason", None))
+                if rejected_results:
+                    messages.extend(rejected_results)
+                    for call in tool_calls:
+                        check_cancelled()
+                        emit_tool(main_step, call.function.name)
+                    continue
 
                 has_submit = any(
                     call.function.name == "submit_report"

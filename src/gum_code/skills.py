@@ -15,7 +15,13 @@ MAX_RESOURCE_CHARS = 20_000
 MAX_RESOURCE_PATHS = 100
 SKILL_SECTION_START = "<gum-code-skills>"
 SKILL_SECTION_END = "</gum-code-skills>"
-_MENTION = re.compile(r"(?<![\w.-])\$([A-Za-z0-9][A-Za-z0-9._-]{0,127})")
+SKILL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+# Slash mentions start a whitespace-delimited token; do not match a path prefix.
+# Keep dollar mentions readable in existing conversations.
+_MENTION = re.compile(
+    r"(?<!\S)/([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?![\w./-])"
+    r"|(?<![\w.-])\$([A-Za-z0-9][A-Za-z0-9._-]{0,127})(?![\w.-])"
+)
 
 
 SKILL_TOOL_SCHEMAS = [
@@ -143,7 +149,7 @@ def _read_skill_file(path: Path) -> str:
 
 
 def _skill_info(directory: Path, *, strict: bool) -> SkillInfo | None:
-    if directory.is_symlink() or not directory.is_dir() or directory.name.startswith("."):
+    if directory.is_symlink() or not directory.is_dir() or SKILL_NAME.fullmatch(directory.name) is None:
         if strict:
             raise ValueError("Skill 目录无效")
         return None
@@ -263,7 +269,9 @@ class SkillRuntime:
         return snapshot
 
     def start_task(self, user_query: str) -> None:
-        explicit = tuple(dict.fromkeys(_MENTION.findall(user_query)))
+        explicit = tuple(dict.fromkeys(
+            match.group(1) or match.group(2) for match in _MENTION.finditer(user_query)
+        ))
         sticky = tuple(dict.fromkeys((*self.sticky_names, *explicit)))
         if len(sticky) > MAX_ACTIVE_SKILLS:
             raise ValueError("Session 显式 Skills 不能超过 3 个")

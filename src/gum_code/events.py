@@ -118,6 +118,10 @@ def _command_failure(payload: dict[str, object]) -> str | None:
         if isinstance(code, int) and not isinstance(code, bool) and code != 0:
             return "命令非零退出；尚未通过检查。"
         return None
+    if metadata.get("backend") == "local":
+        return {"timeout": "本机命令超时；进程已停止，尚未通过检查。",
+                "output_limit": "本机命令输出超过上限；进程已停止，尚未通过检查。",
+                "interrupted": "本机命令已中断。", "unknown": "本机命令状态未确认。"}.get(reason)
     return {
         "timeout": "命令超时；请检查 Sandbox 是否已清理。",
         "interrupted": "命令已中断；请检查 Sandbox 是否已清理。",

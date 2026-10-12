@@ -1,4 +1,4 @@
-<p align="center">
+# GuMi-Code
   <img src="docs/assets/gum-code-logo.png" alt="Gum Code" width="180" />
 </p>
 
@@ -203,3 +203,7 @@ Skills 只作为只读指令与文本资源加载。Gum Code 不执行 Skill 脚
 | Subagent | 相邻 `task` 默认并行；每次根 Agent 运行最多启动 4 个单层、只读子 Agent，每个最多使用 8 次模型请求。 | 子 Agent 使用独立上下文且不接收 Skills，不能写入、执行命令或递归委派，也不会持久化。普通工具仍串行。 |
 | Hooks | Python API 支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse` 和 `Stop`。 | Hooks 只支持同步、进程内注册；没有配置文件、外部命令、异步回调或自动发现。 |
 | 尚未实现 | 项目当前不包含 MCP、Goal Loop、长期 Memory、递归 Subagent 或子 Agent 持久化。 | 不要把 README 中的边界当作未来版本承诺。 |
+
+## 桌面端
+
+独立桌面端位于 [desktop](desktop/README.md)，仅包含 GuMi-Code 对话与设置，可从工作台复制本机会话、记忆和 API 配置。现有 `gum-code` CLI 用法保持兼容。
