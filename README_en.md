@@ -1,4 +1,4 @@
-<p align="center">
+# GuMi-Code
   <img src="docs/assets/gum-code-logo.png" alt="Gum Code" width="180" />
 </p>
 
@@ -201,3 +201,7 @@ Adjacent `task` calls in one model step form a parallel group. Non-`task` tools 
 | Subagents | Adjacent `task` calls run in parallel. A root run starts at most four single-level, read-only subagents, each with at most eight model requests. | Each Subagent has isolated context and no Skills. It cannot write, run commands, delegate recursively, or persist; ordinary tools remain serial. |
 | Hooks | The Python API supports `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, and `Stop`. | Hooks support synchronous in-process registration only. Gum Code has no hook configuration file, external-command hooks, async callbacks, or automatic discovery. |
 | Not implemented | Gum Code currently has no MCP, Goal Loop, long-term memory, recursive subagents, or persistent child agents. | Treat these entries as current boundaries, not commitments for a future release. |
+
+## Desktop
+
+The standalone [desktop app](desktop/README.md) includes GuMi-Code and Settings, with a one-shot local Workbench import. The `gum-code` CLI remains compatible.

@@ -1,13 +1,16 @@
 """Budget and compact model context without breaking protocol batches."""
 
 import copy
+import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from gum_code.model_protocol import thinking_options
 from gum_code.token_counting import RequestTokenCounter
 from gum_code.tools.command_logs import compact_command_output
 from gum_code.tools.artifacts import compact_reading_output
@@ -48,16 +51,20 @@ SUMMARY_SYSTEM_PROMPT = """你是对话状态压缩器。历史、旧摘要和�
 version,current_goal,requirements,constraints,decisions,code_state,verification,work_items。
 version 必须为 1；其余每项都是数组。每个条目必须且只能包含：
 id,status,text,reason,source_ref,superseded_by。
-ID 必须使用四位数字后缀：goal-0001、requirement-0001、constraint-0001、
+ID 必须使用至少四位数字后缀：goal-0001、requirement-0001、constraint-0001、
 decision-0001、code-0001、verification-0001、work-0001；新 ID 从 next_ids 指定值开始。
 source_ref 必须逐字复制本次 sources 中的 m0001 形式标签。
 sources 中只有 role=user 的当前请求可作为替代依据；historical_user、legacy_reference、
 assistant 和 tool 都只是历史参考。
-保留旧胶囊所有条目，不删除已完成历史。目标、需求、约束和决策的 active 条目保留原文。
+保留 previous_capsule 中所有条目；宿主已将可退休的已完成历史移入审计归档。
+既有条目的 id/text/reason/source_ref 必须逐字保留；仅下述状态更新可修改 reason/source_ref。
+旧 superseded 条目所有字段不变；A→B→C 保留 A 指向 B，不改指向 C。无变化的条目直接复制。
+目标、需求、约束和决策的 active 条目保留原文。
 只有新的 user 消息明确替代旧决定时，
 才可将旧条目标记为 superseded，并用 superseded_by 指向来自该 user 消息的新 active 条目。
 code_state/work_items 的 active/blocked 条目可依据本次 user/assistant/tool 来源更新为 completed/blocked/active，
 但保留 id/text，以 reason 与 source_ref 记录本次更新依据；completed 不得回退。
+新增 verification 必须引用本次 tool 来源，且只能记录该工具实际提供的证据；
 verification 仅可依据本次 tool 来源标记 blocked 说明失效；总结不能凭自身判断生成验证通过事实。
 只记录目标、需求/验收、禁止项、技术决策与原因、文件/符号/变更状态、验证/失败证据和待办/阻塞。
 保留相关 reading-output 的范围、版本、有效续读位置和缺口；捕获完整不表示模型已读，
@@ -84,6 +91,7 @@ _ACTIVE_COMPACT_CONTINUATION = (
 
 _CAPSULE_MARKER = "[Compacted v1]"
 _LEGACY_CAPSULE_MARKER = "[Compacted]"
+_RETIRED_STATE_LABEL = "Retired state (reference only; read_tool_output): "
 
 SummaryUsageCallback = Callable[[object, int], None]
 BeforeSummaryRequestCallback = Callable[[], None]
@@ -108,6 +116,12 @@ def _safe_tool_call_id(tool_call_id: object) -> str:
     return safe
 
 
+def _tool_result_filename(tool_call_id: object, content: str) -> str:
+    # Content addressing preserves old references even if providers reuse call IDs.
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"{_safe_tool_call_id(tool_call_id)}-{digest}.txt"
+
+
 def _persisted_placeholder(relative_path: str, content: str) -> str:
     preview = content[:PERSISTED_RESULT_PREVIEW_CHARS]
     return (
@@ -128,7 +142,12 @@ def _write_tool_result(directory: Path, filename: str, content: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(content)
             os.fchmod(f.fileno(), 0o600)
-        os.replace(tmp_path, target)
+        os.link(tmp_path, target)
+        os.unlink(tmp_path)
+    except FileExistsError:
+        os.unlink(tmp_path)
+        if target.is_symlink() or target.read_text(encoding="utf-8") != content:
+            raise OSError("工具结果归档冲突，已保留原文件") from None
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -165,7 +184,7 @@ def persist_tool_result(
     command_marker = compact_command_output(content, workspace, PERSISTED_RESULT_PREVIEW_CHARS)
     if command_marker is not None:
         return command_marker
-    filename = f"{_safe_tool_call_id(tool_call_id)}.txt"
+    filename = _tool_result_filename(tool_call_id, content)
     _write_tool_result(_safe_tool_results_directory(workspace), filename, content)
     relative_path = f"{TOOL_RESULTS_DIR}/{filename}"
     return _persisted_placeholder(relative_path, content)
@@ -236,7 +255,7 @@ def apply_tool_result_budget(
             continue
 
         tool_call_id = result[index].get("tool_call_id", "")
-        filename = f"{_safe_tool_call_id(tool_call_id)}.txt"
+        filename = _tool_result_filename(tool_call_id, content)
 
         try:
             _write_tool_result(directory, filename, content)
@@ -417,7 +436,7 @@ def apply_micro_compact(
             continue
 
         tool_call_id = result[index].get("tool_call_id", "")
-        filename = f"{_safe_tool_call_id(tool_call_id)}.txt"
+        filename = _tool_result_filename(tool_call_id, content)
 
         if directory is None:
             directory = _safe_tool_results_directory(workspace)
@@ -491,7 +510,7 @@ def apply_fit_tool_results(
         else:
             preview_source = content
             tool_call_id = result[index].get("tool_call_id", "")
-            filename = f"{_safe_tool_call_id(tool_call_id)}.txt"
+            filename = _tool_result_filename(tool_call_id, content)
             relative_path = f"{TOOL_RESULTS_DIR}/{filename}"
 
         replacement = _fit_result_marker(relative_path, preview_source)
@@ -607,7 +626,7 @@ def _validate_capsule_structure(value: object) -> dict[str, object]:
             if not isinstance(item_id, str) or not item_id.startswith(prefix):
                 raise _CapsuleValidationError("invalid_id")
             suffix = item_id[len(prefix):]
-            if len(suffix) != 4 or not suffix.isdigit() or suffix == "0000":
+            if len(suffix) < 4 or not suffix.isdigit() or int(suffix) == 0:
                 raise _CapsuleValidationError("invalid_id")
             if item_id in seen_ids:
                 raise _CapsuleValidationError("duplicate_id")
@@ -640,19 +659,62 @@ def _validate_capsule_structure(value: object) -> dict[str, object]:
 
     entries = _capsule_entries(result)
     for item in entries.values():
+        visited = {str(item["id"])}
+        allowed_statuses = {"active", "superseded"}
+        if str(item["id"]).rsplit("-", 1)[0] in {"code", "work", "verification"}:
+            # Replacements retain their ordinary lifecycle after supersession.
+            allowed_statuses.update({"completed", "blocked"})
         replacement = item["superseded_by"]
-        if replacement is not None:
+        while replacement is not None:
             replacement_item = entries.get(str(replacement))
             if (
                 replacement_item is None
-                or replacement_item["status"] != "active"
+                or str(replacement) in visited
+                or replacement_item["status"] not in allowed_statuses
                 or str(replacement).rsplit("-", 1)[0]
                 != str(item["id"]).rsplit("-", 1)[0]
             ):
                 raise _CapsuleValidationError("invalid_supersession")
+            visited.add(str(replacement))
+            replacement = replacement_item["superseded_by"]
     goals = result["current_goal"]
     if not any(item["status"] == "active" for item in goals):  # type: ignore[union-attr]
         raise _CapsuleValidationError("missing_current_goal")
+    return result
+
+
+def _restore_historical_metadata(
+    value: object, prior: dict[str, object] | None, current_sources: dict[str, str],
+) -> object:
+    if prior is None or not isinstance(value, dict):
+        return value
+    result = copy.deepcopy(value)
+    old_entries = _capsule_entries(prior)
+    candidates = [item for section in _CAPSULE_SECTIONS
+                  if isinstance(result.get(section), list)
+                  for item in result[section]
+                  if isinstance(item, dict) and set(item) == _CAPSULE_ITEM_KEYS
+                  and isinstance(item.get("id"), str)]
+    new_entries = {item["id"]: item for item in candidates}
+    for item in candidates:
+        old = old_entries.get(item["id"])
+        if old is None:
+            continue
+        if old["status"] == "superseded" and item["status"] == "superseded" and item["text"] == old["text"]:
+            # The host owns historical links; do not let a model shortcut A→B→C.
+            item.update(copy.deepcopy(old))
+        elif old["status"] == "active" and item["status"] == "active" and item["text"] == old["text"]:
+            if item["id"].rsplit("-", 1)[0] in {"goal", "requirement", "constraint", "decision"}:
+                for key in ("reason", "source_ref"):
+                    item[key] = old[key]
+        elif old["status"] == "active" and item["status"] == "superseded":
+            replacement_id = item["superseded_by"]
+            replacement = new_entries.get(replacement_id) if isinstance(replacement_id, str) else None
+            if replacement is not None and replacement_id not in old_entries and replacement["status"] == "active":
+                source_ref = replacement["source_ref"]
+                if isinstance(source_ref, str) and current_sources.get(source_ref) == "user":
+                    for key in ("id", "text", "reason", "source_ref"):
+                        item[key] = old[key]
     return result
 
 
@@ -661,6 +723,7 @@ def _validate_capsule_transition(
     prior: dict[str, object] | None,
     current_sources: dict[str, str],
 ) -> dict[str, object]:
+    value = _restore_historical_metadata(value, prior, current_sources)
     capsule = _validate_capsule_structure(value)
     current_entries = _capsule_entries(capsule)
     prior_entries = _capsule_entries(prior) if prior is not None else {}
@@ -671,6 +734,8 @@ def _validate_capsule_transition(
         if prefix in prior_counters and suffix.isdigit():
             prior_counters[prefix] = max(prior_counters[prefix], int(suffix))
 
+    retired = (set(prior_entries) - set(_capsule_entries(_retire_completed(prior)))) if prior is not None else set()
+
     for item_id, item in current_entries.items():
         if item_id in prior_entries:
             continue
@@ -679,10 +744,14 @@ def _validate_capsule_transition(
             raise _CapsuleValidationError("non_monotonic_id")
         if item["source_ref"] not in current_sources:
             raise _CapsuleValidationError("invalid_source")
+        if prefix == "verification" and current_sources[item["source_ref"]] != "tool":
+            raise _CapsuleValidationError("invalid_verification_source")
 
     for item_id, old in prior_entries.items():
         new = current_entries.get(item_id)
         if new is None:
+            if item_id in retired:
+                continue
             raise _CapsuleValidationError("missing_active_id")
         if _canonical_json(new) == _canonical_json(old):
             continue
@@ -716,6 +785,41 @@ def _validate_capsule_transition(
     return capsule
 
 
+def _retirable_ids(capsule: dict[str, object]) -> set[str]:
+    entries = _capsule_entries(capsule)
+    # Retain ID/source high-water marks without introducing session schema fields.
+    pinned = set()
+    for section in _CAPSULE_SECTIONS:
+        items = capsule[section]
+        if items:
+            pinned.add(max(items, key=lambda item: int(item["id"].rsplit("-", 1)[1]))["id"])
+    if entries:
+        pinned.add(max(entries.values(), key=lambda item: int(str(item["source_ref"])[1:])
+                       if str(item["source_ref"])[1:].isdigit() else 0)["id"])
+    pinned.update(str(item["superseded_by"]) for item in entries.values()
+                  if item["superseded_by"] is not None)
+    return {
+        item_id for item_id, item in entries.items()
+        if item_id not in pinned and (
+            item["status"] == "superseded"
+            or (item["status"] == "completed"
+                and item_id.rsplit("-", 1)[0] in {"code", "work", "verification"})
+        )
+    }
+
+
+def _retire_completed(capsule: dict[str, object]) -> dict[str, object]:
+    result = copy.deepcopy(capsule)
+    # Keep headroom for the next update; archived transcripts retain exact evidence.
+    while len(_capsule_entries(result)) > CAPSULE_MAX_ITEMS // 2:
+        eligible = _retirable_ids(result)
+        if not eligible:
+            break
+        for section in _CAPSULE_SECTIONS:
+            result[section] = [item for item in result[section] if item["id"] not in eligible]
+    return result
+
+
 def _capsule_payload(
     prior: dict[str, object] | None,
     sources: list[dict[str, object]],
@@ -728,7 +832,7 @@ def _capsule_payload(
             counters[prefix] = max(counters[prefix], int(suffix) + 1)
     return {
         "task": "update_task_state_capsule",
-        "previous_capsule": prior,
+        "previous_capsule": _retire_completed(prior) if prior is not None else None,
         "next_ids": counters,
         "sources": sources,
         "validation_code": validation_code,
@@ -760,7 +864,8 @@ def _request_capsule(
             model=model,
             messages=request_messages,
             max_tokens=output_token_limit,
-            extra_body={"thinking": {"type": "enabled"}},
+            # The bounded summary budget is for JSON, not hidden reasoning.
+            **thinking_options(client, False),
         )
         if usage_callback is not None:
             usage_callback(response, local_prompt_tokens)
@@ -778,7 +883,7 @@ def _request_capsule(
             validation_code = error.code
         if validation_code is not None:
             if attempt >= MAX_SUMMARY_REPAIR_RETRIES:
-                raise RuntimeError("上下文胶囊校验失败，已保留原会话") from None
+                raise RuntimeError(f"上下文胶囊校验失败，已保留原会话（{validation_code}）") from None
     raise AssertionError("unreachable")
 
 
@@ -888,26 +993,32 @@ def _select_recent_batches(
     max_context_tokens: int,
 ) -> set[int]:
     required: set[int] = set()
-    latest_user: int | None = None
     for batch_index, (batch, complete) in enumerate(batches):
         if any(message.get("role") == "user" for message in batch):
-            latest_user = batch_index
+            required.add(batch_index)
         if not complete:
             required.add(batch_index)
-    if latest_user is not None:
-        required.add(latest_user)
 
     selected = set(required)
     target = max(1, int(max_context_tokens * RECENT_CONTEXT_RATIO))
     for batch_index in range(len(batches) - 1, -1, -1):
-        selected.add(batch_index)
+        if batch_index in required:
+            continue
+        candidate = selected | {batch_index}
         selected_messages = [
             message
             for i, (batch, _) in enumerate(batches)
-            if i in selected
+            if i in candidate
             for message in batch
         ]
-        if token_counter.count_request([system_message, *selected_messages], tools) >= target:
+        # Complete oversized batches belong in the capsule, not the protected tail.
+        # Keep calls and results together; incomplete batches remain required above.
+        size = token_counter.count_request([system_message, *selected_messages], tools)
+        # Reserve room for capsule/system constraints, while keeping a small newest
+        # batch even when the latest user alone exceeds the recent-history target.
+        if size < int(max_context_tokens * 0.8):
+            selected = candidate
+        if size >= target:
             break
     return selected
 
@@ -946,12 +1057,42 @@ def _next_source_number(prior: dict[str, object] | None) -> int:
     return highest + 1
 
 
+def _retired_state_path(messages: list[dict[str, object]]) -> str | None:
+    # Only the harness-recognized capsule may carry a continuation pointer.
+    prior, marker_index, _ = _extract_prior_capsule(messages)
+    if prior is None or marker_index is None:
+        return None
+    content = str(messages[marker_index].get("content", ""))
+    lines = [line for line in content.splitlines() if line.startswith(_RETIRED_STATE_LABEL)]
+    if not lines:
+        return None
+    path = lines[0][len(_RETIRED_STATE_LABEL):]
+    if len(lines) != 1 or re.fullmatch(
+        re.escape(TOOL_RESULTS_DIR) + r"/retired-state-[0-9a-f]{64}\.txt", path
+    ) is None:
+        raise RuntimeError("退休状态归档引用损坏，已保留原会话")
+    return path
+
+
+def _archive_retired_state(workspace: Path, capsule: dict[str, object], previous: str | None) -> str:
+    # Structured state only: never expose the human transcript's raw reasoning.
+    content = json.dumps({
+        "reference_only": True,
+        "previous_retired_state": previous,
+        "capsule": capsule,
+    }, ensure_ascii=False, indent=2)
+    filename = _tool_result_filename("retired-state", content)
+    _write_tool_result(_safe_tool_results_directory(workspace), filename, content)
+    return f"{TOOL_RESULTS_DIR}/{filename}"
+
+
 def _build_compacted_messages(
     messages: list[dict[str, object]],
     capsule: dict[str, object],
     transcript_path: str,
     recent: list[dict[str, object]],
     active_compaction_completed: bool = False,
+    retired_state_path: str | None = None,
 ) -> list[dict[str, object]]:
     base_system = _summary_system_content(messages)
     if _COMPACT_SYSTEM_CONSTRAINT not in base_system:
@@ -974,8 +1115,17 @@ def _build_compacted_messages(
         f"{transcript_path}"
     )
 
+    retired_state_path = retired_state_path or _retired_state_path(messages)
+    if retired_state_path is not None:
+        user_content += "\n" + _RETIRED_STATE_LABEL + retired_state_path
+
+    systems = copy.deepcopy([message for message in messages if message.get("role") == "system"])
+    if systems:
+        systems[0]["content"] = system_content
+    else:
+        systems = [{"role": "system", "content": system_content}]
     return [
-        {"role": "system", "content": system_content},
+        *systems,
         {"role": "user", "content": user_content},
         *copy.deepcopy(recent),
     ]
@@ -1002,7 +1152,10 @@ def compact_history(
     history = copy.deepcopy(messages)
     transcript_path = _write_transcript(workspace, history)
     prior, marker_index, legacy = _extract_prior_capsule(history)
-    system_message = {"role": "system", "content": _summary_system_content(history)}
+    retired_state_path = _retired_state_path(history)
+    system_message = {"role": "system", "content": "\n\n".join(
+        str(message.get("content", "")) for message in history if message.get("role") == "system"
+    )}
 
     working: list[dict[str, object]] = []
     for index, message in enumerate(history):
@@ -1019,19 +1172,11 @@ def compact_history(
     )
     older_batches = [batch for index, batch in enumerate(batches) if index not in selected]
     if not older_batches:
-        latest_user = max(
-            (
-                index
-                for index, (batch, _) in enumerate(batches)
-                if any(message.get("role") == "user" for message in batch)
-            ),
-            default=-1,
-        )
         candidate = next(
             (
                 index
                 for index, (_, complete) in enumerate(batches)
-                if complete and index != latest_user
+                if complete and not any(message.get("role") == "user" for message in batches[index][0])
             ),
             None,
         )
@@ -1074,6 +1219,7 @@ def compact_history(
             consumed += 1
         if consumed == 0:
             raise RuntimeError("单个完整上下文批次无法在摘要预算内处理")
+        previous_capsule = capsule
         capsule = _request_capsule(
             client,
             model,
@@ -1084,13 +1230,17 @@ def compact_history(
             usage_callback,
             before_request,
         )
+        if previous_capsule is not None and (
+            set(_capsule_entries(previous_capsule)) - set(_capsule_entries(capsule))
+        ):
+            retired_state_path = _archive_retired_state(workspace, previous_capsule, retired_state_path)
         del pending[:consumed]
         first_chunk = False
 
     if capsule is None:
         raise RuntimeError("上下文胶囊未生成")
     compacted = _build_compacted_messages(
-        history, capsule, transcript_path, recent, active_compaction_completed
+        history, capsule, transcript_path, recent, active_compaction_completed, retired_state_path
     )
     if token_counter.count_request(compacted, tools) >= max_context_tokens:
         raise RuntimeError("受保护的上下文批次超过当前预算")

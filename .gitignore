@@ -31,3 +31,12 @@ sessions/
 
 # Local manual-run scratchpad
 /test.txt
+
+# Desktop build and local data
+node_modules/
+dist/
+runtime/
+*.app/
+*.sqlite*
+*.jsonl
+.codegraph/

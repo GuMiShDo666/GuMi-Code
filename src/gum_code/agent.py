@@ -23,9 +23,12 @@ from gum_code.context import (
     reactive_compact,
 )
 from gum_code.events import AgentEventCallback
+from gum_code.local_command import LocalCommandConfig, is_test_command, INSTRUCTION as LOCAL_COMMAND_INSTRUCTION
 from gum_code.model_protocol import (
+    thinking_options,
     assistant_message_to_dict as _assistant_message_to_dict,
     is_context_length_error as _is_context_length_error,
+    truncated_tool_results,
 )
 from gum_code.hooks import HookEvent, HookRegistry
 from gum_code.session import IN_FLIGHT_MARKER_KEY, MAX_SESSION_FILE_BYTES
@@ -61,7 +64,7 @@ if TYPE_CHECKING:
     from gum_code.vision import VisionRuntime
 
 MAX_STEPS = 512
-MAX_REACTIVE_RETRIES = 1
+MAX_REACTIVE_RETRIES = 3
 MAX_COMPLETION_REMINDERS = 2
 TODO_REMINDER_INTERVAL = 3
 PAUSED_SELF_CHECK_INSTRUCTION = (
@@ -226,8 +229,11 @@ def build_agent_tool_schemas(
     allow_self_check: bool = False,
     allow_plans: bool = False,
     allow_project_runtime: bool = False,
+    allow_web: bool = False,
 ) -> list[dict[str, object]]:
     runtime_kwargs = {"allow_project_runtime": True} if allow_project_runtime else {}
+    if allow_web:
+        runtime_kwargs["allow_web"] = True
     schemas = [
         *get_tool_schemas(allow_run_command=allow_run_command, **runtime_kwargs),
         *AGENT_CONTROL_TOOL_SCHEMAS,
@@ -445,7 +451,7 @@ def _finish_answer(
     project_runtime: object | None = None,
 ) -> str:
     """Save a final message and trusted outcome before rendering the answer."""
-    if not messages or messages[-1] != {"role": "assistant", "content": answer}:
+    if not messages or messages[-1].get("role") != "assistant" or messages[-1].get("content") != answer:
         messages.append({"role": "assistant", "content": answer})
     _send_message_snapshot(message_snapshot_callback, messages)
     if background_observer is not None:
@@ -491,6 +497,27 @@ def _finish_answer(
     if event_callback is not None:
         event_callback("final_answer", {"step": step, "answer": answer})
     return answer
+
+
+def _compact_with_budget_recovery(
+    compactor, client, model, workspace, messages, user_query, *,
+    max_context_tokens, token_counter, **kwargs,
+):
+    """Retry rejected summaries transactionally under a smaller run-local limit."""
+    for attempt in range(MAX_REACTIVE_RETRIES):
+        try:
+            result = compactor(
+                client, model, workspace, messages, user_query,
+                max_context_tokens=max_context_tokens, token_counter=token_counter, **kwargs,
+            )
+            return result
+        except Exception as error:
+            if not _is_context_length_error(error) or attempt + 1 == MAX_REACTIVE_RETRIES:
+                raise
+            measured = token_counter.count_request(messages, kwargs.get("tools", []))
+            max_context_tokens = max(1, int(min(max_context_tokens, measured) * 0.5))
+            token_counter.recovered_limit = max_context_tokens
+    raise AssertionError("unreachable")
 
 
 def _prepare_request_context(
@@ -595,7 +622,8 @@ def _prepare_request_context(
 
         before_tokens = used_tokens
         token_budget.reset()
-        messages, summary_transcript = compact_history(
+        messages, summary_transcript = _compact_with_budget_recovery(
+            compact_history,
             client,
             model,
             workspace,
@@ -606,6 +634,7 @@ def _prepare_request_context(
             max_context_tokens=max_context_tokens,
             usage_callback=_summary_usage_callback(step, event_callback),
         )
+        max_context_tokens = min(max_context_tokens, getattr(token_budget, "recovered_limit", None) or max_context_tokens)
         after_tokens = token_budget.count_request(messages, agent_tool_schemas)
         _send_message_snapshot(message_snapshot_callback, messages)
         if event_callback is not None:
@@ -900,6 +929,7 @@ def _run_agent_loop(
     plan_runtime: PlanRuntime | None = None,
     project_runtime: object | None = None,
     background_observer: Callable[[], None] | None = None,
+    desktop_host=None,
 ) -> str:
     """Run a bounded model/tool loop with recoverable protocol snapshots.
 
@@ -994,6 +1024,18 @@ def _run_agent_loop(
         ]
     else:
         messages = copy.deepcopy(initial_messages)
+        # Older sessions stored host reminders as model answers. Keep real model
+        # reasoning intact; only migrate the exact legacy host message shapes.
+        for message in messages:
+            content = message.get("content")
+            if message.get("role") != "assistant" or not isinstance(content, str):
+                continue
+            if content.startswith("[Harness completion recovery] ") and not message.get("tool_calls") and "reasoning_content" not in message:
+                message["role"] = "user"
+            elif content == "[Harness review] 只读复核当前变更与验证范围。" and message.get("tool_calls") and all(
+                str(call.get("id", "")).startswith("host_review_") for call in message["tool_calls"]
+            ):
+                message.setdefault("reasoning_content", "")
         for message in messages:
             if message.get("role") == "system":
                 content = message.get("content")
@@ -1007,15 +1049,44 @@ def _run_agent_loop(
             }
         )
 
+    def refresh_project_rules():
+        from gum_code.project_rules import apply_project_rules, ProjectRulesError, START as RULES_START, END as RULES_END
+        had_named_rules = any(m.get("role") == "system" and m.get("name") == "gum_code_project_rules" for m in messages)
+        messages[:] = [m for m in messages if not (m.get("role") == "system" and m.get("name") == "gum_code_project_rules")]
+        for message in messages:
+            if message.get("role") == "system" and isinstance(message.get("content"), str):
+                try:
+                    had_rules = had_named_rules or RULES_START in message["content"]
+                    message["content"], loaded = apply_project_rules(message["content"], workspace)
+                except ProjectRulesError:
+                    if event_callback is not None:
+                        event_callback("project_rules", {"loaded": False, "failed": True})
+                    raise
+                if loaded:
+                    content = message["content"]
+                    start = content.index(RULES_START)
+                    end = content.index(RULES_END, start) + len(RULES_END)
+                    message["content"] = (content[:start].rstrip() + content[end:]).strip()
+                    position = len(messages) - 1 if messages[-1].get("role") == "user" else len(messages)
+                    messages.insert(position, {"role": "system", "name": "gum_code_project_rules", "content": content[start:end]})
+                if event_callback is not None and (loaded or had_rules):
+                    event_callback("project_rules", {"loaded": loaded})
+                break
+
+    refresh_project_rules()
+
     if skill_runtime is not None:
         for message in messages:
             if message.get("role") == "system" and isinstance(message.get("content"), str):
                 message["content"] = skill_runtime.apply_to_system(message["content"])
                 break
 
-    instruction = SELF_CHECK_INSTRUCTION if self_check_runtime is not None else PAUSED_SELF_CHECK_INSTRUCTION
+    local_verification = command_sandbox if isinstance(command_sandbox, LocalCommandConfig) else None
+    instruction = LOCAL_COMMAND_INSTRUCTION if local_verification is not None else (SELF_CHECK_INSTRUCTION if self_check_runtime is not None else PAUSED_SELF_CHECK_INSTRUCTION)
     for message in messages:
         if message.get("role") == "system" and isinstance(message.get("content"), str):
+            if local_verification is not None:
+                message["content"] = message["content"].replace(PAUSED_SELF_CHECK_INSTRUCTION, "")
             if instruction not in message["content"]:
                 message["content"] += "\n\n" + instruction
             break
@@ -1037,7 +1108,18 @@ def _run_agent_loop(
         allow_self_check=self_check_runtime is not None,
         allow_plans=plan_runtime is not None,
         allow_project_runtime=project_runtime is not None,
+        allow_web=desktop_host is not None,
     )
+
+    if desktop_host is not None and getattr(desktop_host, "memory", None) is not None:
+        from gum_code.desktop_memory import MEMORY_TOOLS
+        agent_tool_schemas.extend(MEMORY_TOOLS)
+
+    if local_verification is not None:
+        agent_tool_schemas = copy.deepcopy(agent_tool_schemas)
+        for schema in agent_tool_schemas:
+            if schema['function']['name'] == 'run_command':
+                schema['function']['description'] = LOCAL_COMMAND_INSTRUCTION
 
     allowed_tool_names = {
         schema["function"]["name"]
@@ -1102,6 +1184,8 @@ def _run_agent_loop(
         nonlocal work_generation, progress_epoch
         if not isinstance(change, FileChange):
             raise ValueError("文件变更需要宿主事实")
+        if local_verification is not None:
+            local_verification.on_file_change(change)
         if self_check_runtime is not None:
             self_check_runtime.on_file_change(change)
         work_generation += 1
@@ -1130,7 +1214,9 @@ def _run_agent_loop(
             return "completion_stalled"
         recovery_reminders += 1
         recovery_checkpoint = progress_epoch
-        if reason == "verification_missing":
+        if reason == "local_verification_missing":
+            detail = "当前版本缺少通过的测试执行证据。用 run_command 运行相关 unittest/pytest/node --test，读取失败并修复复测。零测试和全部跳过不算通过；审批被拒绝时不要绕过，说明未验证。"
+        elif reason == "verification_missing":
             detail = (
                 "本轮改动仍缺适用当前版本的验证证据。根据原始需求、实际差异及相关调用者选择最小检查，"
                 "用 self_check 提交明确目标；缺测试时补充并保留。先诊断失败再修复复测，不要重复完成结论。"
@@ -1138,7 +1224,7 @@ def _run_agent_loop(
             )
         else:
             detail = "输出被截断，请继续剩余正文或重新规划合法工具调用。" if reason == "response_length" else "当前 Todo 仍有未完成项，请推进工作并据实更新，不要只重复完成结论。"
-        messages.append({"role": "assistant", "content": "[Harness completion recovery] " + detail})
+        messages.append({"role": "user", "content": "[Harness completion recovery] " + detail})
         _send_message_snapshot(message_snapshot_callback, messages)
         return "continue"
 
@@ -1165,7 +1251,43 @@ def _run_agent_loop(
         observe_progress(("answer_fragment", normalized))
         return True
 
+    def receive_input():
+        nonlocal user_query, recovery_reminders, recovery_checkpoint, progress_epoch
+        additions = desktop_host.take_inputs() if desktop_host is not None else []
+        accepted = False
+        if additions:
+            refresh_project_rules()
+        for entry in additions:
+            try:
+                if skill_runtime is not None:
+                    skill_runtime.sticky_names = ()
+                    skill_runtime.start_task(entry["text"])
+            except ValueError:
+                desktop_host.emit("input_rejected", id=entry["id"], message="技能无法载入，请检查名称及每条最多 3 个的限制。")
+                continue
+            messages.append({"role": "user", "content": entry["text"], "name": "input_" + entry["id"].replace("-", "_")})
+            user_query += "\n\n" + entry["text"]
+            if skill_runtime is not None:
+                for message in messages:
+                    if message.get("role") == "system":
+                        message["content"] = skill_runtime.apply_to_system(message["content"])
+                        break
+            _send_message_snapshot(message_snapshot_callback, messages)
+            desktop_host.emit("input_received", id=entry["id"])
+            accepted = True
+        if accepted:
+            _send_message_snapshot(message_snapshot_callback, messages)
+            recovery_reminders = 0
+            recovery_checkpoint = None
+            progress_epoch += 1
+        return accepted
+
     for step in range(1, max_steps + 1):
+        receive_input()
+        memory_runtime = getattr(desktop_host, "memory", None) if desktop_host is not None else None
+        if memory_runtime is not None:
+            memory_runtime.local_verification = local_verification
+            memory_runtime.prepare(messages, user_query, token_budget, max_context_tokens)
         if background_observer is not None:
             background_observer()
         if plan_runtime is not None:
@@ -1194,7 +1316,7 @@ def _run_agent_loop(
             description = "独立复核当前需求、代码、测试及宿主执行事实；输入版本 " + context["input_version"]
             arguments = json.dumps({"description": description}, ensure_ascii=False)
             review_call = SimpleNamespace(id=call_id, function=SimpleNamespace(name="task", arguments=arguments))
-            messages.append({"role": "assistant", "content": "[Harness review] 只读复核当前变更与验证范围。",
+            messages.append({"role": "assistant", "content": "[Harness review] 只读复核当前变更与验证范围。", "reasoning_content": "",
                 "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "task", "arguments": arguments}}]})
             _send_message_snapshot(message_snapshot_callback, messages)
             delegations_started = _execute_task_batch(
@@ -1244,12 +1366,13 @@ def _run_agent_loop(
             messages=messages,
             agent_tool_schemas=agent_tool_schemas,
             token_budget=token_budget,
-            max_context_tokens=max_context_tokens,
+            max_context_tokens=max(1, max_context_tokens - (memory_runtime.limit if memory_runtime else 0)),
             step=step,
             event_callback=event_callback,
             message_snapshot_callback=message_snapshot_callback,
         )
 
+        max_context_tokens = min(max_context_tokens, token_budget.recovered_limit or max_context_tokens)
         reactive_retries = 0
 
         while True:
@@ -1270,12 +1393,13 @@ def _run_agent_loop(
                 background_observer()
 
             try:
-                response = client.chat.completions.create(
+                response = (desktop_host.complete if desktop_host is not None else client.chat.completions.create)(
+                    **({"client": client, "memory_context_limit": max_context_tokens} if desktop_host is not None else {}),
                     model=model,
                     messages=messages,
                     tools=agent_tool_schemas,
                     tool_choice="auto",
-                    extra_body={"thinking": {"type": "enabled"}},
+                    **thinking_options(client, True),
                 )
                 break
             except Exception as error:
@@ -1290,18 +1414,18 @@ def _run_agent_loop(
                 if event_callback is not None:
                     event_callback("context_summary", {"step": step})
 
+                # A rejected request is evidence that the configured estimate is
+                # too generous. Keep the smaller budget for the rest of this run.
+                max_context_tokens = max(1, int(min(max_context_tokens, used_tokens) * CONTEXT_TARGET_RATIO))
                 token_budget.reset()
-                messages, reactive_transcript = reactive_compact(
-                    client,
-                    model,
-                    workspace,
-                    messages,
-                    user_query,
+                messages, reactive_transcript = _compact_with_budget_recovery(
+                    reactive_compact, client, model, workspace, messages, user_query,
                     tools=agent_tool_schemas,
                     token_counter=token_budget,
                     max_context_tokens=max_context_tokens,
                     usage_callback=_summary_usage_callback(step, event_callback),
                 )
+                max_context_tokens = min(max_context_tokens, token_budget.recovered_limit or max_context_tokens)
                 after_tokens = token_budget.count_request(messages, agent_tool_schemas)
                 _send_message_snapshot(message_snapshot_callback, messages)
 
@@ -1346,11 +1470,28 @@ def _run_agent_loop(
         if tool_calls and finish_reason not in (None, "stop", "length", "tool_calls"):
             return finish_incomplete("invalid_model_response", step)
         messages.append(_assistant_message_to_dict(message))
+        # Publish the whole rejected batch together; no pending call can be resumed.
+        rejected_results = truncated_tool_results(message, finish_reason)
+        messages.extend(rejected_results)
         _send_message_snapshot(message_snapshot_callback, messages)
         if background_observer is not None:
             background_observer()
 
+        if rejected_results:
+            text_parts.clear()
+            if event_callback is not None:
+                for call, result in zip(tool_calls, rejected_results):
+                    payload = {"step": step, "tool_name": call.function.name, "tool_call_id": call.id}
+                    event_callback("tool_call", payload)
+                    event_callback("tool_result", {**payload, "result": result["content"]})
+            decision = recover("response_length", step)
+            if decision != "continue":
+                return finish_incomplete(decision, step)
+            continue
+
         if not tool_calls:
+            if receive_input():
+                continue
             continuation = None
             if hook_registry is not None:
                 with hook_lock:
@@ -1385,6 +1526,11 @@ def _run_agent_loop(
                     return finish_incomplete(decision, step)
                 continue
 
+            if local_verification is not None and local_verification.needs_check():
+                decision = recover("local_verification_missing", step)
+                if decision != "continue":
+                    return finish_incomplete(decision, step)
+                continue
             if self_check_runtime is not None:
                 if self_check_runtime.needs_review():
                     if step == max_steps:
@@ -1517,6 +1663,8 @@ def _run_agent_loop(
                         compact_requested = True
                     else:
                         result = "Error: compact requires an empty JSON object."
+                elif memory_runtime is not None and tool_name in {"memory_search", "memory_read", "memory_write"}:
+                    result = memory_runtime.execute(tool_name, tool_call.function.arguments)
                 elif tool_name == "todo_write":
                     result = _execute_todo_write(
                         todo_manager,
@@ -1551,6 +1699,8 @@ def _run_agent_loop(
                         )
                     else:
                         execution_kwargs: dict[str, object] = {}
+                        if desktop_host is not None:
+                            execution_kwargs["allow_web"] = True
                         if vision_runtime is not None:
                             execution_kwargs["vision_runtime"] = vision_runtime
                         if self_check_runtime is not None:
@@ -1560,6 +1710,14 @@ def _run_agent_loop(
                         if tool_name in {"write_file", "edit_file", "delete_file", "self_check"}:
                             execution_kwargs["file_change_callback"] = file_changed
                         command_results = []
+                        if tool_name == "run_command" and local_verification is not None:
+                            try:
+                                proposed = json.loads(tool_call.function.arguments).get("argv", [])
+                                if is_test_command(proposed):
+                                    local_verification.test_failed = True
+                                    local_verification.verified = None
+                            except (ValueError, TypeError, AttributeError):
+                                pass
                         if tool_name == "run_command":
                             execution_kwargs["command_result_callback"] = command_results.append
                         command_attempted = False
@@ -1608,6 +1766,7 @@ def _run_agent_loop(
                 payload = {
                     "step": step,
                     "tool_name": tool_call.function.name,
+                    "tool_call_id": tool_call.id,
                 }
                 if tool_name != "task":
                     payload["result"] = result
@@ -1688,7 +1847,8 @@ def _run_agent_loop(
 
             before_tokens = token_budget.count_request(messages, agent_tool_schemas)
             token_budget.reset()
-            messages, summary_transcript = compact_history(
+            messages, summary_transcript = _compact_with_budget_recovery(
+                compact_history,
                 client,
                 model,
                 workspace,
@@ -1700,6 +1860,7 @@ def _run_agent_loop(
                 active_compaction_completed=True,
                 usage_callback=_summary_usage_callback(step, event_callback),
             )
+            max_context_tokens = min(max_context_tokens, token_budget.recovered_limit or max_context_tokens)
             after_tokens = token_budget.count_request(messages, agent_tool_schemas)
             _send_message_snapshot(message_snapshot_callback, messages)
 
@@ -1742,6 +1903,7 @@ def run_agent(
     plan_runtime: PlanRuntime | None = None,
     initial_plan_state: dict[str, object] | None = None,
     project_runtime: object | None = None,
+    desktop_host=None,
 ) -> str:
     """Return answer text; host facts describe checks without a registration gate."""
     state_ready = False
@@ -1794,7 +1956,7 @@ def run_agent(
             vision_runtime=vision_runtime,
             on_vision_budget_exhausted=on_vision_budget_exhausted,
             plan_runtime=plan_runtime, project_runtime=project_runtime,
-            background_observer=background_observer,
+            background_observer=background_observer, desktop_host=desktop_host,
         )
     except BaseException as error:
         if self_check_runtime is not None:

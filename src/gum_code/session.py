@@ -36,7 +36,8 @@ MAX_SESSION_AUDIT_ENTRIES = 10_000
 MAX_SESSION_TITLE_CHARS = 30
 IN_FLIGHT_MARKER_KEY = "_gum_code_in_flight"
 LEGACY_IN_FLIGHT_MARKER_KEY = "_vibe_harness_in_flight"
-RECOVERABLE_TOOL_NAMES = READ_ONLY_TOOL_NAMES | {"task"}
+# Public GET interruption closes the protocol tail without replay or permission grants.
+RECOVERABLE_TOOL_NAMES = READ_ONLY_TOOL_NAMES | {"task", "web_search", "read_webpage"}
 TASK_INTERRUPTED_RESULT = json.dumps(
     {
         "status": "error",
@@ -1539,6 +1540,12 @@ def analyze_tool_batch_tail(
     tail = messages[batch_index + 1 :]
     for tail_index, message in enumerate(tail):
         if message.get("role") != "tool":
+            # A fully closed batch can precede a new user request or harness
+            # notice. It is no longer the active tail; never reopen/replay it.
+            if len(completed) == len(tool_call_ids) and in_flight_call_id is None:
+                if any(item.get("role") == "tool" for item in tail[tail_index + 1 :]):
+                    raise ValueError("tool call 批次后存在孤立 tool 消息")
+                return None
             raise ValueError("tool call 批次后存在非 tool 消息")
 
         result_id = message.get("tool_call_id")
@@ -1584,8 +1591,11 @@ def analyze_tool_batch_tail(
 
 def plan_tool_batch_recovery(
     messages: list[dict[str, object]],
+    *, allow_interrupted_commands: bool = False,
 ) -> ToolBatchRecoveryPlan | None:
     """Plan closure of an interrupted tail without executing any pending call."""
+    if type(allow_interrupted_commands) is not bool:
+        raise ValueError("Interrupted command recovery flag must be boolean")
     last_assistant_index: int | None = None
     for index in range(len(messages) - 1, -1, -1):
         if messages[index].get("role") == "assistant":
@@ -1630,7 +1640,7 @@ def plan_tool_batch_recovery(
     in_flight_call_id = state.in_flight_call_id
     if in_flight_call_id is not None:
         name, _ = tool_call_by_id[in_flight_call_id]
-        if name not in RECOVERABLE_TOOL_NAMES:
+        if name not in RECOVERABLE_TOOL_NAMES and not (allow_interrupted_commands and name == "run_command"):
             raise ValueError(
                 f"存在 in-flight 工具调用，无法自动恢复："
                 f"{in_flight_call_id}"
@@ -1661,9 +1671,10 @@ def plan_tool_batch_recovery(
 
 def build_tool_batch_recovery_messages(
     messages: list[dict[str, object]],
+    *, allow_interrupted_commands: bool = False,
 ) -> list[dict[str, object]]:
     """Close pending calls with synthetic Tool Results instead of replaying them."""
-    plan = plan_tool_batch_recovery(messages)
+    plan = plan_tool_batch_recovery(messages, allow_interrupted_commands=allow_interrupted_commands)
 
     result = [
         message
@@ -1677,6 +1688,12 @@ def build_tool_batch_recovery_messages(
     for tool_call in plan.pending_tool_calls:
         if tool_call.name == "task":
             content = TASK_INTERRUPTED_RESULT
+        elif tool_call.interrupted and tool_call.name == "run_command":
+            content = (
+                "上次命令执行被中断，退出状态与结果未确认；命令可能已修改文件。"
+                "宿主未重放该命令，不得将其作为成功验证。请先检查当前文件状态；"
+                "如需重新执行，必须发起新的命令调用并重新审批。"
+            )
         elif tool_call.interrupted:
             content = (
                 "该只读工具在上次进程中被中断，未保留可用结果，"

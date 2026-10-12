@@ -149,7 +149,59 @@ def parse_args(
     return args
 
 
-def _run_one_shot(args: argparse.Namespace) -> int:
+class OneShotHost:
+    """Host-owned interaction seam; orchestration and persistence remain shared."""
+
+    def settings(self):
+        return load_settings()
+
+    def recover_messages(self, messages):
+        return build_tool_batch_recovery_messages(messages)
+
+    def command_backend(self, args):
+        return load_docker_sandbox(args.sandbox_image) if args.allow_run_command else None
+
+    def context_window(self, settings, client):
+        return resolve_context_window(settings, client)
+
+    def vision_settings(self):
+        return load_vision_settings()
+
+    def session_messages(self, messages):
+        return messages
+
+    def renderer(self):
+        return RichEventRenderer(create_console(), persistent_callback=print_terminal_event)
+
+    @property
+    def approve(self):
+        return request_terminal_approval
+
+    def environment(self, summary, *, interactive):
+        return request_environment_preparation(summary, interactive=interactive)
+
+    def network(self, summary, *, interactive):
+        return interactive and self.approve(
+            "project_network", {}, "允许当前服务启动配置访问外网；这不同于依赖安装联网许可。")
+
+    def vision(self, runtime, *, interactive):
+        return request_extra_vision_calls(runtime, interactive=interactive)
+
+    def event(self, event_type, payload):
+        print_terminal_event(event_type, payload)
+
+    def notice(self, text):
+        print(text, flush=True)
+
+    def cleanup_failed(self):
+        print("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", file=sys.stderr)
+
+    def model_secret(self, value):
+        pass
+
+
+def _run_one_shot(args: argparse.Namespace, *, host: OneShotHost | None = None) -> int:
+    host = host or OneShotHost()
     lease: SessionLease | None = None
     vision_runtime: VisionRuntime | None = None
     self_check_runtime: SelfCheckRuntime | None = None
@@ -169,6 +221,8 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 allow_pending_user_tail=True,
             )
             if resumed.version != SESSION_VERSION:
+                if getattr(host, "require_current_session", False):
+                    raise ValueError("Desktop Session version mismatch")
                 destination = allocate_session_path()
                 destination_lease = SessionLease(destination).acquire()
                 try:
@@ -199,19 +253,21 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         if args.interactive_terminal:
             args.workspace = trust_workspace(args.workspace, create_console())
 
-        command_sandbox = None
-        if args.allow_run_command:
-            command_sandbox = load_docker_sandbox(args.sandbox_image)
+        command_sandbox = host.command_backend(args)
+        if args.allow_run_command and not getattr(host, "interactive_approvals", False):
             print(
                 "警告：run_command 已启用；命令将在断网 Docker Sandbox 中运行，"
                 "但仍可修改未遮蔽的 workspace 文件；普通命令仍需批准。"
             )
 
-        settings = load_settings()
-        if resumed is not None and resumed.model != settings.model:
+        settings = host.settings()
+        if resumed is not None and resumed.model != settings.model and not getattr(host, "shared_api", False):
             raise ValueError("Session model 与当前 provider 不匹配")
+        host.model_secret(settings.api_key)
         client = OpenAI(api_key=settings.api_key, base_url=settings.base_url)
-        context_window = resolve_context_window(settings, client)
+        if getattr(host, "shared_api", False):
+            client._gumcode_compatible_api = True
+        context_window = host.context_window(settings, client)
         max_context_tokens = resolve_context_budget(
             context_window, args.max_context_tokens
         )
@@ -222,9 +278,12 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         if resumed is not None:
             title = resumed.title
             sticky_skills = resumed.sticky_skills
-            if resumed.pending_user_message is not None:
+            if (resumed.pending_user_message is not None and getattr(host, "live_input", False)
+                    and str(resumed.messages[-1].get("name", "")).startswith("input_")):
+                initial_messages = resumed.messages
+            elif resumed.pending_user_message is not None:
                 initial_messages = resumed.messages[:-1]
-                print_terminal_event("pending_user_discarded", {})
+                host.event("pending_user_discarded", {})
                 assert session_file is not None
                 append_session_event(
                     session_file,
@@ -232,8 +291,8 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                     {"kind": "pending_user_discarded"},
                 )
             elif resumed.tool_batch_state is not None:
-                initial_messages = build_tool_batch_recovery_messages(resumed.messages)
-                print_terminal_event(
+                initial_messages = host.recover_messages(resumed.messages)
+                host.event(
                     "tool_batch_recovery",
                     {
                         "completed": len(resumed.tool_batch_state.completed_call_ids),
@@ -279,12 +338,13 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 pending_activations.pop(0)
 
         def record_activation(snapshot: SkillSnapshot) -> None:
+            host.event("skill_activated", {"name": snapshot.name})
             with session_write_lock:
                 pending_activations.append(snapshot)
                 flush_activations()
 
         skill_runtime = SkillRuntime(
-            sticky_names=sticky_skills,
+            sticky_names=sticky_skills if getattr(host, "persist_explicit_skills", True) else (),
             activation_callback=record_activation if session_file is not None else None,
         )
 
@@ -292,20 +352,16 @@ def _run_one_shot(args: argparse.Namespace) -> int:
         request_id = str(uuid.uuid4())
         if args.task_type is not None:
             print("提示：--task-type 已弃用。", flush=True)
-        renderer = RichEventRenderer(
-            create_console(), persistent_callback=print_terminal_event,
-        )
+        renderer = host.renderer()
         plan_runtime = PlanRuntime(resumed.plan_state if resumed is not None else None)
         project_runtime = ProjectRuntime(
             args.workspace, session_key=str(session_file) if session_file else request_id,
-            command_sandbox=command_sandbox,
-            environment_approval_callback=renderer.paused(lambda summary: request_environment_preparation(
+            command_sandbox=command_sandbox if not getattr(host, "interactive_approvals", False) else None,
+            environment_approval_callback=renderer.paused(lambda summary: host.environment(
                 summary, interactive=args.interactive_terminal,
             )),
-            network_approval_callback=renderer.paused(lambda summary: (
-                request_terminal_approval("project_network", {},
-                    "允许当前服务启动配置访问外网；这不同于依赖安装联网许可。")
-                if args.interactive_terminal else False
+            network_approval_callback=renderer.paused(lambda summary: host.network(
+                summary, interactive=args.interactive_terminal,
             )),
         )
         project_runtime.browser = ProjectBrowser(project_runtime.browser_scope,
@@ -320,14 +376,20 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             self_check_runtime = SelfCheckRuntime(
                 args.workspace, request_id=request_id, command_sandbox=command_sandbox,
                 approval_callback=project_runtime.environment_approval_callback
-                if args.interactive_terminal else None,
+                if args.interactive_terminal or getattr(host, "interactive_approvals", False) else None,
                 internal_paths=project_runtime.internal_paths,
             )
+        def vision_settings():
+            settings = host.vision_settings()
+            if settings is not None:
+                host.model_secret(settings.api_key)
+            return settings
+
         vision_runtime = VisionRuntime(
-            load_vision_settings(), request_id=request_id,
+            vision_settings(), request_id=request_id,
             persist_callback=(lambda state: append_event("vision.state", state))
             if session_file is not None else None,
-            settings_loader=lambda: load_vision_settings(),
+            settings_loader=vision_settings,
         )
         last_task_outcome: dict[str, object] | None = None
 
@@ -361,7 +423,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
                 source_event_seq = None
                 with session_write_lock:
                     save_session(
-                        session_file, workspace, model, messages, title, skill_runtime.sticky_names,
+                        session_file, workspace, model, host.session_messages(messages), title, skill_runtime.sticky_names,
                         **({"user_request_id": request_id} if first_snapshot else {}),
                     )
                     internal_paths = session_internal_paths(session_file)
@@ -396,7 +458,7 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             max_steps=args.max_steps,
             max_context_tokens=max_context_tokens,
             allow_run_command=args.allow_run_command,
-            approval_callback=renderer.paused(request_terminal_approval),
+            approval_callback=renderer.paused(host.approve),
             event_callback=event_callback,
             message_snapshot_callback=message_snapshot_callback,
             initial_messages=initial_messages,
@@ -406,37 +468,50 @@ def _run_one_shot(args: argparse.Namespace) -> int:
             project_runtime=project_runtime,
             self_check_runtime=self_check_runtime,
             vision_runtime=vision_runtime,
-            on_vision_budget_exhausted=renderer.paused(lambda runtime: request_extra_vision_calls(
+            on_vision_budget_exhausted=renderer.paused(lambda runtime: host.vision(
                 runtime, interactive=args.interactive_terminal,
             )),
+            **({"desktop_host": host} if getattr(host, "live_input", False) else {}),
             **kwargs,
         )
         if session_file is not None and session_history_usage(session_file)["warning_level"]:
-            print("会话历史占用较大；旧记录已保留，可由你决定是否清理。")
+            host.notice("会话历史占用较大；旧记录已保留，可由你决定是否清理。")
         if project_runtime is not None:
             browser_failures = project_runtime.browser.close()
             service_failures = project_runtime.close()
             if browser_failures or service_failures:
-                print("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", file=sys.stderr)
+                host.cleanup_failed()
                 return 1
             project_runtime = None
         if last_task_outcome is not None and last_task_outcome.get("status") == "completed":
             return 0
         return 1
     finally:
+        # Attempt every cleanup even when another resource fails; always release lease.
+        cleanup_error = False
+        actions = []
         if renderer is not None:
-            renderer.close()
+            actions.append(renderer.close)
         if project_runtime is not None:
-            browser_failures = project_runtime.browser.close()
-            service_failures = project_runtime.close()
-            if browser_failures or service_failures:
-                print("项目运行资源清理未完成，请检查 Docker；数据库数据未删除。", file=sys.stderr)
+            browser = getattr(project_runtime, "browser", None)
+            if browser is not None:
+                actions.append(browser.close)
+            actions.append(project_runtime.close)
         if vision_runtime is not None:
-            vision_runtime.cancel()
+            actions.append(vision_runtime.cancel)
         if self_check_runtime is not None:
-            self_check_runtime.cancel()
+            actions.append(self_check_runtime.cancel)
         if lease is not None:
-            lease.release()
+            actions.append(lease.release)
+        for action in actions:
+            try:
+                if action():
+                    cleanup_error = True
+            except BaseException:
+                cleanup_error = True
+        if cleanup_error:
+            host.cleanup_failed()
+
 
 
 def main(argv: list[str] | None = None) -> int:

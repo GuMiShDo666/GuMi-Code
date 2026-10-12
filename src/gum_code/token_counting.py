@@ -1,6 +1,7 @@
 """Estimate model-visible request size without model-specific tokenizers."""
 
 import json
+import math
 from typing import Protocol
 
 BYTES_PER_TOKEN = 4
@@ -58,6 +59,8 @@ class TokenBudgetTracker:
 
     def __init__(self, counter: RequestTokenCounter) -> None:
         self._counter = counter
+        self._scale = 1.0
+        self.recovered_limit: int | None = None
         self._anchor_local: int | None = None
         self._anchor_provider: int | None = None
 
@@ -67,11 +70,12 @@ class TokenBudgetTracker:
         tools: list[dict[str, object]],
     ) -> int:
         local = self._counter.count_request(messages, tools)
+        calibrated = math.ceil(local * self._scale)
         if self._anchor_local is None or self._anchor_provider is None:
-            return local
+            return calibrated
         if local < self._anchor_local:
             self.reset()
-            return local
+            return calibrated
         anchored = self._anchor_provider + max(0, local - self._anchor_local)
         return max(local, anchored)
 
@@ -93,8 +97,10 @@ class TokenBudgetTracker:
             return
         self._anchor_local = self._counter.count_request(messages, tools)
         self._anchor_provider = prompt_tokens
+        self._scale = max(self._scale, prompt_tokens / max(1, self._anchor_local))
 
     def reset(self) -> None:
+        """Discard the append-only anchor, retaining conservative model calibration."""
         self._anchor_local = None
         self._anchor_provider = None
 

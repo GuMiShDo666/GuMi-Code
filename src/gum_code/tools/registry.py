@@ -1,6 +1,7 @@
 """Register model tools and dispatch them through ordered safety gates."""
 
 import copy
+from gum_code.tools.web import WEB_SCHEMAS, web_search, read_webpage, validate_web
 import json
 from collections.abc import Callable
 from pathlib import Path
@@ -83,6 +84,8 @@ ALL_TOOL_RISKS: dict[str, ToolRisk] = {
     "self_check": ToolRisk.EXECUTE,
     "project_service": ToolRisk.EXECUTE,
     "project_browser": ToolRisk.EXECUTE,
+    "web_search": ToolRisk.EXECUTE,
+    "read_webpage": ToolRisk.EXECUTE,
 }
 
 READ_ONLY_TOOL_NAMES = frozenset(
@@ -687,12 +690,20 @@ ALL_TOOL_HANDLERS.update(project_service=_project_service, project_browser=_proj
 PREFLIGHTS.update(project_service=_validate_project_tool, project_browser=_validate_project_tool)
 
 
+ALL_TOOL_SCHEMAS.update(WEB_SCHEMAS)
+ALL_TOOL_HANDLERS.update(web_search=web_search, read_webpage=read_webpage)
+PREFLIGHTS.update(web_search=validate_web, read_webpage=validate_web)
+
+
 def get_tool_schemas(
     *,
     allow_run_command: bool = False,
     allow_project_runtime: bool = False,
+    allow_web: bool = False,
 ) -> list[dict]:
     visible_names = set(MODEL_VISIBLE_TOOL_NAMES)
+    if allow_web:
+        visible_names.update(WEB_SCHEMAS)
 
     if allow_run_command:
         visible_names.add("run_command")
@@ -743,11 +754,14 @@ def execute_tool(
     file_change_callback: Callable | None = None,
     artifact_workspace: Path | None = None,
     project_runtime=None,
+    allow_web: bool = False,
 ) -> str:
     """Dispatch one tool through policy, preflight, hook, and approval gates.
 
     The execution callback fires after all gates and before handler dispatch.
     """
+    if tool_name in WEB_SCHEMAS and not allow_web:
+        return "Error: Public web tools are available only in desktop sessions"
     handler = ALL_TOOL_HANDLERS.get(tool_name)
     if handler is None:
         return f"Error: Unknown tool: {tool_name}"
@@ -784,6 +798,11 @@ def execute_tool(
         "argv", "cwd", "timeout_seconds"
     }:
         return "Error: Invalid tool arguments"
+
+    if tool_name in WEB_SCHEMAS:
+        parameters = WEB_SCHEMAS[tool_name]["function"]["parameters"]
+        if set(arguments) - parameters["properties"].keys() or not set(parameters["required"]) <= arguments.keys():
+            return "Error: Invalid tool arguments"
 
     # Hard denials run before approval and cannot be overridden by it.
     if check_hard_deny(tool_name, arguments) is not None:
@@ -926,6 +945,8 @@ def execute_tool(
                 project_runtime.internal_paths = tuple(self_check_runtime._internal_paths)
             result = handler(workspace=workspace, runtime=project_runtime,
                              cancel_event=cancel_event, **arguments)
+        elif tool_name in WEB_SCHEMAS:
+            result = handler(workspace=workspace, cancel_event=cancel_event, **arguments)
         elif tool_name == "run_command":
             command_kwargs: dict[str, object] = {}
             if command_result_callback is not None:

@@ -17,6 +17,8 @@ REQUIRED_CONFIG_KEYS = ("LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL")
 CONFIG_KEYS = (*REQUIRED_CONFIG_KEYS, "LLM_CONTEXT_WINDOW")
 BUILTIN_CONTEXT_WINDOWS = {"deepseek-v4-flash": 1_000_000}
 CONTEXT_WINDOW_FIELDS = (
+    "max_input_tokens",
+    "max_input_context_length",
     "context_window",
     "context_length",
     "max_context_length",
