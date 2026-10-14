@@ -31,7 +31,6 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
   const history = useRef<HTMLDivElement>(null);
   const historyContent = useRef<HTMLDivElement>(null);
   const [reducedMotion, setReducedMotion] = useState(false);
-  const navigator = useRef<HTMLDivElement>(null);
   const nearBottom = useRef(true);
   const scrolledSession = useRef<string | null>(null);
   const api = window.gumi;
@@ -52,7 +51,7 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
   const draft = drafts[draftKey] || "";
   const files = attachments[draftKey] || [];
   const skillLimitExceeded = new Set(getSkillMentions(draft).map((mention) => mention.name)).size > 3;
-  const turnUserIndex = state.messages.map(message => message.role === "user" && !message.delivery).lastIndexOf(true);
+  const [titleEdit, setTitleEdit] = useState<{ sessionId: string; value: string } | null>(null);
   const previousInput = [...state.messages].reverse().find((message) => message.role === "user")?.content;
 
 
@@ -151,10 +150,6 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
     };
   }, [state.selectedId, visible, pageHidden, reducedMotion]);
 
-  useEffect(() => {
-    if (!visible) navigator.current?.hidePopover();
-  }, [visible]);
-
   async function run(operation: () => Promise<GumCodeState>) {
     if (inFlight.current) return;
     inFlight.current = true;
@@ -185,6 +180,13 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
     }
   }
 
+  async function saveTitle() {
+    if (!titleEdit || !api || pending || titleEdit.sessionId !== state.selectedId) return;
+    if (!titleEdit.value.trim()) { setTitleEdit(null); return; }
+    const next = await run(() => api.gumCodeRename({ sessionId: titleEdit.sessionId, title: titleEdit.value }));
+    if (next?.sessions.find(session => session.id === titleEdit.sessionId)?.title === titleEdit.value.trim()) setTitleEdit(null);
+  }
+
   async function attachFiles() {
     if (!api?.gumCodePickAttachments || !selected || locked || inFlight.current) return;
     const key = selected.id;
@@ -212,7 +214,6 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
     const next = await run(() => value === "__pick__"
       ? api.gumCodePickWorkspace({ providerId: selectedProvider })
       : api.gumCodeNew({ ...(value.startsWith("project:") ? { projectId: value.slice(8) } : { workspaceId: value }), providerId: selectedProvider }));
-    if (next && !next.error && next.selectedId !== state.selectedId) navigator.current?.hidePopover();
     if (carryDraft && draft && next?.selectedId && next.selectedId !== state.selectedId && !next.error) {
       const id = next.selectedId;
       setDrafts((current) => ({ ...current, [id]: current[id] || draft }));
@@ -223,26 +224,23 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
     <section className="gum-code" data-paused={pageHidden || !visible} hidden={!visible} aria-label={t('GuMi-Code 工作区', 'GuMi-Code workspace')}>
       <div className="gum-code-conversation">
         <header className="gum-code-header">
-          <button type="button" className="gum-code-nav-trigger" popoverTarget="gum-code-navigator" title={t('选择项目与对话', 'Select folder and conversation')}><Icon name="folder" size={17} /><span>{currentWorkspace?.name || selected?.workspace.split("/").filter(Boolean).pop() || t("选择文件夹", "Select folder")}</span><Icon name="arrow" size={12} /></button>
-          <div ref={navigator} id="gum-code-navigator" className="gum-code-navigator" popover="auto" role="dialog" aria-label={t('项目与对话', 'Folders and conversations')}>
-            <div className="gum-code-nav-toolbar"><span>{t('项目与对话', 'Folders and conversations')}</span><div>
+          <div id="gum-code-navigator" className="gum-code-navigator" role="navigation" aria-label={t('项目与对话', 'Folders and conversations')}>
+            <div className="gum-code-nav-toolbar"><span>{t('项目', 'Projects')}</span><div>
               <button type="button" disabled={locked} aria-label={t('新建会话', 'New conversation')} title={t('新建会话', 'New conversation')} onClick={() => void changeWorkspace(workspaceValue || "__pick__", false)}><Icon name="plus" size={17} /></button>
-              <button type="button" popoverTarget="gum-code-navigator" popoverTargetAction="hide" aria-label={t('关闭项目与对话', 'Close folders and conversations')}><Icon name="close" size={16} /></button>
             </div></div>
             <div className="gum-code-sessions">
               {groups.map((group) => <details className="gum-code-group" key={group.path} open>
                 <summary title={group.path}><Icon name="arrow" size={11} /><Icon name="folder" size={16} /><span>{group.name}</span></summary>
                 {group.sessions.map((session) => <button type="button" key={session.id} className="gum-code-session" title={session.title || t('新会话', 'New conversation')} aria-current={session.id === state.selectedId ? "true" : undefined} disabled={locked} onClick={async () => {
                   if (!api) return;
-                  const next = await run(() => api.gumCodeSelect({ sessionId: session.id }));
-                  if (next && !next.error) navigator.current?.hidePopover();
+                  await run(() => api.gumCodeSelect({ sessionId: session.id }));
                 }}><span>{session.title || t('新会话', 'New conversation')}</span></button>)}
               </details>)}
               {!groups.length && <p className="gum-code-nav-empty">{t('选择工作区域，开始新对话', 'Select a folder to start a conversation')}</p>}
             </div>
             <button type="button" className="gum-code-nav-folder" disabled={locked} onClick={() => void changeWorkspace("__pick__")}><Icon name="folder" size={15} />{t('选择项目文件夹…', 'Select project folder…')}</button>
           </div>
-          <div><h2>{selected?.title || t('新会话', 'New conversation')}</h2>{selected && <p title={selected.workspace}>{selected.workspace.split("/").filter(Boolean).pop() || selected.workspace}</p>}</div>
+          <div>{titleEdit?.sessionId === selected?.id && titleEdit ? <input className="gum-code-title-input" autoFocus aria-label={t('对话标题', 'Conversation title')} maxLength={100} value={titleEdit.value} disabled={pending} onChange={event => setTitleEdit({ ...titleEdit, value: event.target.value })} onBlur={() => void saveTitle()} onKeyDown={event => { if (event.nativeEvent.isComposing) return; if (event.key === 'Escape') { event.preventDefault(); setTitleEdit(null); } if (event.key === 'Enter') { event.preventDefault(); void saveTitle(); } }} /> : <h2 tabIndex={selected ? 0 : undefined} title={t('双击修改标题', 'Double-click to rename')} onDoubleClick={() => selected && setTitleEdit({ sessionId: selected.id, value: selected.title })} onKeyDown={event => { if (selected && event.key === 'Enter') setTitleEdit({ sessionId: selected.id, value: selected.title }); }}>{selected?.title || t('新会话', 'New conversation')}</h2>}</div>
           {(!available || !ready) && <span className="gum-code-status" role="status">{!available ? t('不可用', 'Unavailable') : t('载入中', 'Loading')}</span>}
         </header>
         {(!available || error || state.error) && <div className="gum-code-error" role="alert">{!available ? "GuMi-Code 需要在已接入引擎的桌面工作台中使用。" : error || state.error}</div>}
@@ -255,7 +253,6 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
               {message.role === "assistant" ? <GumCodeMarkdown streaming={Boolean(message.streaming) && visible && !pageHidden && !reducedMotion}>{message.content}</GumCodeMarkdown> : <div className="gum-code-user-text">{message.content}</div>}
               {(message.delivery || message.interrupted) && <small className="gum-code-delivery">{message.interrupted ? t('输出已中断', 'Output interrupted') : message.delivery === "received" ? t('已接收', 'Received') : active ? t('待接收', 'Pending') : t('未接收', 'Not received')}</small>}
             </article>
-            {index === turnUserIndex && <GumCodeProgress state={state} visible={visible && !pageHidden} />}
           </Fragment>)}
           </div>
         </div>
@@ -264,6 +261,7 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
           <div><button disabled={pending || state.status !== "waiting"} onClick={() => api && state.approval && void run(() => api.gumCodeApprove({ requestId: state.approval!.requestId, approved: false }))}>{t('拒绝', 'Deny')}</button><button className="gum-code-primary" disabled={pending || state.status !== "waiting"} onClick={() => api && state.approval && void run(() => api.gumCodeApprove({ requestId: state.approval!.requestId, approved: true }))}>{t('允许本次操作', 'Allow this operation')}</button></div>
         </section>}
         {!active && selected?.pendingInputs?.map(input => <div className="gum-code-pending-input" key={input.id}><span>{t("未接收", "Not received")}: {input.text}</span><button type="button" disabled={locked} onClick={() => api && void run(() => api.gumCodeSend({ sessionId: selected.id, text: input.text, pendingInputId: input.id }))}>{t('重新发送', 'Send again')}</button></div>)}
+        <div className="gum-code-run-status"><GumCodeProgress state={state} visible={visible && !pageHidden} /></div>
         <form className="gum-code-composer" onSubmit={(event) => { event.preventDefault(); void send(); }}>
           <label className="sr-only" htmlFor="gum-code-input">{t('任务描述', 'Task description')}</label>{!active && previousInput && (error || state.error || (state.statusText && state.statusText !== "本轮已结束")) && <div className="gum-code-composer-label"><button type="button" disabled={Boolean(draft) || pending} title={draft ? t('先清空当前草稿，再取回上一条输入', 'Clear the draft before recovering the previous input') : t('取回后可编辑，不会自动发送', 'Recover for editing without sending')} onClick={() => setDrafts((current) => current[draftKey] ? current : { ...current, [draftKey]: previousInput })}>{t('取回上一条输入', 'Recover previous input')}</button></div>}
           <GumCodeInput key={draftKey} value={draft} disabled={!selected || !ready || !available}

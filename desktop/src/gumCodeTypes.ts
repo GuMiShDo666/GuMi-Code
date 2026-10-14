@@ -29,6 +29,7 @@ export type GumCodeBridge = {
   gumCodeNew: (request: { projectId?: string; workspaceId?: string; providerId?: string }) => Promise<GumCodeState>;
   gumCodePickWorkspace: (request?: { providerId?: string }) => Promise<GumCodeState>;
   gumCodeModels: () => Promise<{ models: ModelProfile[]; error?: string }>;
+  gumCodeRename: (request: { sessionId: string; title: string }) => Promise<GumCodeState>;
   gumCodeSelect: (request: { sessionId: string }) => Promise<GumCodeState>;
   gumCodeSend: (request: { sessionId: string; text: string; attachmentIds?: string[]; pendingInputId?: string }) => Promise<GumCodeState>;
   gumCodeApprove: (request: { requestId: string; approved: boolean }) => Promise<GumCodeState>;

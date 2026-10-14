@@ -117,6 +117,33 @@ KNOWN_COMMANDS = {
 _SESSION_CANCELLED = object()
 
 
+_STARTUP_BIRD = """
+                   ⢦⣀
+                   ⠈⣿⣷⣄
+                    ⠘⣿⣿⣷⣄
+    ⠐⠶⣶⣶⣶⣤⣤⣤⣤⣀⣀⣀     ⠘⣿⣿⣿⣷⡄
+       ⠉⠛⠿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣄ ⠸⣿⣿⣿⡇
+           ⠙⠻⣿⣿⣿⣿⣿⣿⣿⣿⣷⣄⢹⣿⣿⠁⣀⣠⣄⣀
+              ⠹⣿⣿⣿⣿⣿⣿⣿⣿⣷⣿⣿⣿⣿⣿⣿⡟⠃
+               ⠘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠏
+               ⣀⣘⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠃
+          ⢀⣠⣴⣾⣿⣿⠏⠈⣿⣿⣿⣿⣿⣿⣿⣿⠏
+       ⣀⣤⠾⠟⠛⠋⠉⣽⠏⣠⣾⣿⣿⣿⠿⠟⠛⠉
+             ⣼⣣⣾⡿⠟⠋⠉
+            ⣸⠿⠋⠁
+""".strip("\n")
+_SMALL_STARTUP_BIRD = """
+          ⠰⣄⡀
+           ⠹⣿⣦⡀
+  ⠈⠉⠛⢿⣿⣷⣶⣶⣤⣀⢹⣿⡇
+      ⠈⠙⣿⣿⣿⣿⣷⣿⣧⣶⣶⠄
+        ⠈⣿⣿⣿⣿⣿⣿⡿⠃
+     ⣠⣴⠾⡿⢋⣿⣿⣿⡿⠟
+    ⠉⠁ ⣼⡵⠟⠋⠉
+       ⠉
+""".strip("\n")
+
+
 def _safe_terminal_text(value: object) -> str:
     return re.sub(r"[\x00-\x1f\x7f]", "?", str(value))
 
@@ -1316,6 +1343,9 @@ class InteractiveRuntime:
             percent = 0
         table.add_row("上下文占用", f"{percent}%")
         if show_title:
+            self.console.print()
+            bird = _SMALL_STARTUP_BIRD if self.console.width < 60 else _STARTUP_BIRD
+            self.console.print(Text(bird, style="bold bright_blue", no_wrap=True))
             self.console.print()
             self.console.print(Text.assemble(
                 ("GuMi-Code", "bold blue"), ("  /  终端编程助手", "dim"),

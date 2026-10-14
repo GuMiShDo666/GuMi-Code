@@ -26,6 +26,8 @@ def test_startup_and_status_preserve_information_at_terminal_width(width):
     interactive.InteractiveRuntime.show_status(runtime, show_title=True)
     startup = stream.getvalue()
     assert 'GuMi-Code' in startup and 'demo-model' in startup
+    bird = interactive._SMALL_STARTUP_BIRD if width < 60 else interactive._STARTUP_BIRD
+    assert bird in startup
     assert '/help' in startup and '/status' in startup
     assert '上下文' in startup and '0%' in startup
     assert '命令关闭' in startup
@@ -34,6 +36,7 @@ def test_startup_and_status_preserve_information_at_terminal_width(width):
     stream.seek(0); stream.truncate()
     interactive.InteractiveRuntime.show_status(runtime)
     assert 'Session' in stream.getvalue() and 'Sandbox' in stream.getvalue()
+    assert bird not in stream.getvalue()
 
 
 def test_repl_prompt_brand_and_command_dispatch(monkeypatch):

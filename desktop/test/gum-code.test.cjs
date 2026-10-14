@@ -451,6 +451,8 @@ test('semantic titles summarize once, preserve history and ignore failed or late
   assert.equal(state.sessions[0].title, '开发部门工作规划助手');
   assert.equal(state.messages[0].content, input);
   assert.equal(calls.length, 1);
+  assert.ok(calls[0].source.includes(input));
+  assert.ok(calls[0].source.includes('Original answer.'));
   await f.api.send({ sessionId: id, text: '继续完善' }); await f.api.settled();
   assert.equal(calls.length, 1);
   const restored = createGumCode(f.options);
@@ -461,4 +463,40 @@ test('semantic titles summarize once, preserve history and ignore failed or late
   failure.api = createGumCode(failure.options); await begin(failure); await failure.api.settled();
   assert.equal((await failure.api.state()).error, null);
   assert.equal((await failure.api.state()).sessions[0].title, '新会话');
+});
+
+test('manual titles persist, validate before writing and survive a late summary', async t => {
+  const f = setup(t, { start({ emit, close }) { emit({ type: 'answer', text: 'Original answer.' }); emit({ type: 'finished', status: 'completed' }); close(0); } });
+  let finishTitle;
+  f.options.summarizeTitle = () => new Promise(resolve => { finishTitle = resolve; });
+  f.api = createGumCode(f.options);
+  const id = await begin(f);
+  await f.api.rename({ sessionId: id, title: '  用户指定标题  ' });
+  finishTitle('迟到的自动标题');
+  await f.api.settled();
+  assert.equal((await f.api.state()).sessions[0].title, '用户指定标题');
+  const file = path.join(f.options.dataDir, 'catalog.json');
+  const before = fs.readFileSync(file, 'utf8');
+  for (const title of ['', ' ', 'x'.repeat(101), 'hello\nworld', 'hello\u001bworld']) await assert.rejects(f.api.rename({ sessionId: id, title }));
+  await assert.rejects(f.api.rename({ sessionId: randomUUID(), title: 'Wrong session' }));
+  assert.equal(fs.readFileSync(file, 'utf8'), before);
+  const restored = await createGumCode(f.options).state();
+  assert.equal(restored.sessions[0].title, '用户指定标题');
+  assert.equal((await f.api.state()).messages.find(m => m.role === 'assistant').content, 'Original answer.');
+});
+
+test('initial title waits for the first completed question and answer', async t => {
+  let wire;
+  const f = setup(t, { start(value) { wire = value; } });
+  const sources = [];
+  f.options.summarizeTitle = async source => { sources.push(source); return '首轮问答标题'; };
+  f.api = createGumCode(f.options);
+  await begin(f, 'First question');
+  assert.deepEqual(sources, []);
+  assert.equal((await f.api.state()).sessions[0].title, '新会话');
+  wire.emit({ type: 'answer', text: 'First answer' });
+  wire.emit({ type: 'finished', status: 'completed' }); wire.close(0);
+  await f.api.settled();
+  assert.equal(sources.length, 1);
+  assert.match(sources[0], /First question/); assert.match(sources[0], /First answer/);
 });
