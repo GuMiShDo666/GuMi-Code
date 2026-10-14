@@ -1,12 +1,39 @@
-# GuMi-Code
+<p align="center">
+  <img src="docs/assets/gum-code-logo.png" width="100" alt="GuMi-Code logo" />
+</p>
 
-GuMi-Code is an AI coding assistant for local projects, available as a desktop app and a CLI. Describe a task to read and explain code, edit files, or run commands while developing features, fixing problems, and writing documentation.
+<h1 align="center">GuMi-Code</h1>
 
-You need an OpenAI-compatible model service supporting Chat Completions and tool calls.
+<p align="center">
+  <strong>Your local project. Your coding assistant.</strong><br />
+  Read code, make changes, and follow up — from the desktop or your terminal.
+</p>
 
-[中文](README.md) · **English**
+<p align="center">
+  <img src="https://img.shields.io/badge/Desktop-macOS_Apple_Silicon-262626?style=flat-square" alt="Desktop: macOS Apple Silicon" />
+  <img src="https://img.shields.io/badge/CLI-Python_3.11%2B-7759D6?style=flat-square" alt="CLI: Python 3.11+" />
+  <img src="https://img.shields.io/badge/API-OpenAI_compatible-262626?style=flat-square" alt="OpenAI-compatible API" />
+</p>
 
-## Desktop app
+<p align="center">
+  <a href="#desktop">Desktop</a> · <a href="#cli">CLI</a> · <a href="README.md">中文</a> · <strong>English</strong>
+</p>
+
+![GuMi-Code reading project files and streaming a response](docs/assets/readme/desktop-working.jpg)
+
+<p align="center"><sub>Desktop in action · Sample project with a local simulated model; file tools run through the actual app.</sub></p>
+
+## What you can do
+
+GuMi-Code is an AI coding assistant for local projects. Describe your task to explore a codebase, edit files, investigate bugs, or write documentation.
+
+| Understand a project | Work on a task | Keep the conversation going |
+| --- | --- | --- |
+| Read files and explain code | Edit code and request command execution | Add attachments and resume previous sessions |
+
+> **Before you start:** bring an OpenAI-compatible model service that supports Chat Completions and tool calls.
+
+## Desktop
 
 Currently supports macOS on Apple Silicon. If you already have `GuMi-Code.app`, open it to get started.
 
@@ -25,7 +52,7 @@ npm start
 
 The first runtime preparation downloads Python and dependencies. You do not need to install Python separately.
 
-### Configure and use
+### Your first task
 
 1. Open Settings → GuMi-Code settings, enter the API base URL, model name, and API key, then save. Use the connection test to check that the endpoint is reachable.
 2. Return to the conversation page, select a project folder, and confirm that you trust it.
@@ -34,17 +61,15 @@ The first runtime preparation downloads Python and dependencies. You do not need
 
 You can add attachments, manage the selected workspace's memory and `AGENTS.md` in settings, and change the interface language.
 
-Configure the API:
+<details>
+<summary>View API settings</summary>
 
 ![Desktop API settings](docs/assets/readme/desktop-settings.jpg)
 
-Select a project and enter a task:
+</details>
 
-![Select a project and enter a task](docs/assets/readme/desktop-task.jpg)
-
-The screenshots use a sample project and configuration. The task has not been sent.
-
-### Package the app
+<details>
+<summary>Package a macOS app</summary>
 
 After preparing and building in the `desktop` directory:
 
@@ -55,7 +80,7 @@ open release/GuMi-Code.app
 
 The app is created at `desktop/release/GuMi-Code.app`. Move an existing app out of that path before packaging again.
 
-See [desktop/README.md](desktop/README.md) for the desktop usage guide in Chinese.
+</details>
 
 ## CLI
 
@@ -73,7 +98,8 @@ python3 -m venv .venv
 
 Make sure `python3` selects Python 3.11 or newer.
 
-### Install and start on Windows PowerShell
+<details>
+<summary>Windows PowerShell installation</summary>
 
 ```powershell
 git clone https://github.com/GuMiShDo666/GuMi-Code.git
@@ -85,9 +111,14 @@ py -3 -m venv .venv
 
 The interpreter selected by `py -3` must be Python 3.11 or newer. Windows usage has not been verified on a real machine.
 
+</details>
+
 ### First-time configuration
 
 Follow the prompts to select and trust an existing project folder, then enter the API key, base URL, and model name. If the model's context window cannot be detected, enter its context limit when prompted.
+
+<details>
+<summary>Configure with an environment file</summary>
 
 Alternatively, copy the configuration template from the repository root and edit its example values:
 
@@ -96,6 +127,8 @@ cp .env.example .env
 ```
 
 On Windows PowerShell, use `Copy-Item .env.example .env`. The fields are `LLM_API_KEY`, `LLM_BASE_URL`, and `LLM_MODEL`. Set `LLM_CONTEXT_WINDOW` when a manual context limit is needed. Do not commit a real API key.
+
+</details>
 
 ### Everyday use
 
@@ -129,7 +162,8 @@ Windows PowerShell:
 
 The workspace must be an existing directory. Non-interactive terminals require both the workspace and task text.
 
-### Optional: run commands
+<details>
+<summary>Enable command execution with Docker</summary>
 
 Start Docker and prepare a trusted local image before enabling ordinary CLI command execution:
 
@@ -141,3 +175,5 @@ Start Docker and prepare a trusted local image before enabling ordinary CLI comm
 ```
 
 Replace the image name with an existing local image; the CLI does not pull it automatically. Each command requires approval. On Windows, replace the executable with `.\.venv\Scripts\gum-code.exe`.
+
+</details>

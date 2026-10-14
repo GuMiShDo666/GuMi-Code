@@ -1,10 +1,37 @@
-# GuMi-Code
+<p align="center">
+  <img src="docs/assets/gum-code-logo.png" width="100" alt="GuMi-Code logo" />
+</p>
 
-GuMi-Code 是面向本地项目的 AI 编程助手，提供桌面端和 CLI。输入需求后，它可以阅读项目、解释代码、修改文件，并按需执行命令，帮助你开发功能、排查问题和整理文档。
+<h1 align="center">GuMi-Code</h1>
 
-使用前需准备支持 OpenAI 兼容 Chat Completions 和工具调用的模型服务。
+<p align="center">
+  <strong>在你的项目里，把想法写成代码。</strong><br />
+  阅读代码 · 修改文件 · 排查问题 · 整理文档
+</p>
 
-**中文** · [English](README_en.md)
+<p align="center">
+  <img src="https://img.shields.io/badge/Desktop-macOS_Apple_Silicon-262626?style=flat-square" alt="Desktop: macOS Apple Silicon" />
+  <img src="https://img.shields.io/badge/CLI-Python_3.11%2B-7759D6?style=flat-square" alt="CLI: Python 3.11+" />
+  <img src="https://img.shields.io/badge/API-OpenAI_compatible-262626?style=flat-square" alt="OpenAI-compatible API" />
+</p>
+
+<p align="center">
+  <a href="#桌面端">桌面端上手</a> · <a href="#cli">CLI 上手</a> · <strong>中文</strong> · <a href="README_en.md">English</a>
+</p>
+
+![GuMi-Code 阅读项目文件并流式输出分析](docs/assets/readme/desktop-working.jpg)
+
+<p align="center"><sub>桌面端工作画面 · 示例项目与本地模拟模型，文件工具由真实应用执行。</sub></p>
+
+## 可以用它做什么
+
+GuMi-Code 是面向本地项目的 AI 编程助手，提供桌面端和 CLI。用自然语言说明需求，让它帮助你理解项目、开发功能、定位问题和完善文档。
+
+| 理解项目 | 推进开发 | 持续协作 |
+| --- | --- | --- |
+| 阅读文件、梳理结构、解释代码 | 修改代码、排查问题、按需执行命令 | 添加附件、补充需求、继续历史会话 |
+
+> **使用前准备：** 支持 OpenAI 兼容 Chat Completions 和工具调用的模型服务。
 
 ## 桌面端
 
@@ -25,7 +52,7 @@ npm start
 
 首次准备运行环境需要联网下载 Python 和依赖，无需另外安装 Python。
 
-### 配置与使用
+### 开始第一个任务
 
 1. 打开「设置 → GuMi-Code 设置」，填写 API 地址、模型名称和 API Key，保存配置；可用连接测试确认接口可访问。
 2. 返回对话页，选择项目文件夹并确认信任该目录。
@@ -34,17 +61,15 @@ npm start
 
 可以添加附件，也可以在设置中管理所选工作区的记忆、编辑 `AGENTS.md`，或切换界面语言。
 
-配置 API：
+<details>
+<summary>查看 API 配置界面</summary>
 
 ![桌面端 API 配置](docs/assets/readme/desktop-settings.jpg)
 
-选择项目并输入任务：
+</details>
 
-![桌面端选择项目并输入任务](docs/assets/readme/desktop-task.jpg)
-
-截图使用示例项目和配置，任务尚未发送。
-
-### 打包应用
+<details>
+<summary>打包为 macOS 应用</summary>
 
 在 `desktop` 目录完成上述准备和构建后执行：
 
@@ -55,7 +80,7 @@ open release/GuMi-Code.app
 
 应用生成在 `desktop/release/GuMi-Code.app`。如果该路径已存在，先移走旧应用再打包。
 
-更多桌面端使用说明见 [desktop/README.md](desktop/README.md)。
+</details>
 
 ## CLI
 
@@ -73,7 +98,8 @@ python3 -m venv .venv
 
 `python3` 必须指向 Python 3.11 或更高版本。
 
-### Windows PowerShell 安装与启动
+<details>
+<summary>Windows PowerShell 安装</summary>
 
 ```powershell
 git clone https://github.com/GuMiShDo666/GuMi-Code.git
@@ -85,9 +111,14 @@ py -3 -m venv .venv
 
 `py -3` 选中的 Python 必须是 3.11 或更高版本。Windows 用法尚未经过实机验证。
 
+</details>
+
 ### 首次配置
 
 启动后，按提示选择并信任已有项目目录，再填写 API Key、API 地址和模型名称。如果无法自动识别模型的上下文窗口，按提示填写模型的上下文上限。
+
+<details>
+<summary>使用配置文件（可选）</summary>
 
 也可以从仓库根目录复制配置模板，再编辑其中的示例值：
 
@@ -96,6 +127,8 @@ cp .env.example .env
 ```
 
 Windows PowerShell 使用 `Copy-Item .env.example .env`。配置字段为 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`；需要手动指定上下文上限时填写 `LLM_CONTEXT_WINDOW`。不要提交真实 API Key。
+
+</details>
 
 ### 日常使用
 
@@ -129,7 +162,8 @@ Windows PowerShell：
 
 工作区必须是已存在的目录；非交互终端必须同时提供工作区和任务文本。
 
-### 可选：执行命令
+<details>
+<summary>启用命令执行（需要 Docker）</summary>
 
 CLI 的普通命令执行需要启动 Docker，并准备可信的本地镜像：
 
@@ -141,3 +175,5 @@ CLI 的普通命令执行需要启动 Docker，并准备可信的本地镜像：
 ```
 
 将镜像名替换为已准备的本地镜像，程序不会自动拉取它。命令逐次审批。Windows 使用 `.\.venv\Scripts\gum-code.exe` 替换可执行文件。
+
+</details>

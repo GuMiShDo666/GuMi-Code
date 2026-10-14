@@ -29,11 +29,11 @@ npm start
 
 ![桌面端 API 配置](../docs/assets/readme/desktop-settings.jpg)
 
-选择项目并输入任务：
+阅读项目并输出分析：
 
-![桌面端选择项目并输入任务](../docs/assets/readme/desktop-task.jpg)
+![桌面端工作画面](../docs/assets/readme/desktop-working.jpg)
 
-截图使用示例项目和配置，任务尚未发送。
+截图使用示例项目与本地模拟模型，文件工具由真实应用执行。
 
 ## 打包应用
 
