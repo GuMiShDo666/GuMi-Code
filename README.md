@@ -84,6 +84,10 @@ open release/GuMi-Code.app
 
 ## CLI
 
+![GuMi-Code CLI 执行只读代码分析任务](docs/assets/readme/cli-task.png)
+
+<p align="center"><sub>CLI 实际任务 · 在独立练习项目中调用模型分析代码，展示任务输入与分析结果。</sub></p>
+
 需要 Git、Python 3.11 或更高版本，以及支持 Chat Completions 和工具调用的 OpenAI 兼容模型服务。
 
 ### macOS / Linux 安装与启动

@@ -190,7 +190,7 @@ def load_settings(
                 effective[key] = legacy_values[key].strip()
     for key in REQUIRED_CONFIG_KEYS:
         if key not in effective:
-            raise RuntimeError(f"{key} 未设置，请配置 Gum Code provider")
+            raise RuntimeError(f"{key} 未设置，请配置 GuMi-Code provider")
 
     context_window = None
     if "LLM_CONTEXT_WINDOW" in effective:

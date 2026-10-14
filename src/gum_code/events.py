@@ -298,9 +298,9 @@ class RichEventRenderer:
             if not self._terminal:
                 return
             # Group keeps Spinner from assembling Text into a wrapping text line.
-            text = Group(Text(message, no_wrap=True, overflow="crop"))
+            text = Group(Text(message, style="blue", no_wrap=True, overflow="crop"))
             if self._status is None:
-                self._status = self.console.status(text, spinner="dots")
+                self._status = self.console.status(text, spinner="dots", spinner_style="blue")
             else:
                 self._status.update(text)  # type: ignore[attr-defined]
             if not self._pause_depth and not self._running:
@@ -447,6 +447,8 @@ class RichEventRenderer:
 
     def render_answer(self, answer: str) -> None:
         self.close()
+        self.console.print()
+        self.console.print(Text("GuMi", style="bold blue"))
         with self.console.use_theme(_ANSWER_THEME):
             self.console.print(Markdown(_safe_multiline(answer)))
 

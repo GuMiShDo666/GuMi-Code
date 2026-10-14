@@ -15,6 +15,8 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.shortcuts import choice, prompt
+from prompt_toolkit.styles import Style
+from prompt_toolkit.output import ColorDepth
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -1314,8 +1316,25 @@ class InteractiveRuntime:
             percent = 0
         table.add_row("上下文占用", f"{percent}%")
         if show_title:
-            self.console.print(Text("Gum Code", style="bold cyan"))
-        self.console.print(Panel(table, border_style="cyan"))
+            self.console.print()
+            self.console.print(Text.assemble(
+                ("GuMi-Code", "bold blue"), ("  /  终端编程助手", "dim"),
+            ))
+            self.console.print(Text(
+                display_path(self.workspace), style="dim", no_wrap=True, overflow="ellipsis",
+            ))
+            self.console.print(Text.assemble(
+                ("模型  ", "dim"), (_safe_terminal_text(self.settings.model), "bold"),
+                (f"    上下文 {percent}%", "dim"),
+            ))
+            self.console.print(Text.assemble(
+                ("命令逐次审批" if self.args.allow_run_command else "命令关闭", "blue"),
+                ("  ·  ", "dim"),
+                ("子代理开启" if self.args.allow_subagent else "子代理关闭", "dim"),
+            ))
+            self.console.print(Text("/help 帮助  ·  /status 状态  ·  /sessions 会话", style="dim"))
+            return
+        self.console.print(Panel(table, title="状态", title_align="left", border_style="blue"))
 
 
 def _manage_sessions(runtime: InteractiveRuntime) -> None:
@@ -1582,10 +1601,16 @@ def run_repl(runtime: InteractiveRuntime) -> int:
         history=InMemoryHistory(),
         multiline=True,
         key_bindings=repl_key_bindings(),
+        prompt_continuation="    · ",
+        bottom_toolbar=[("class:hint", " Enter 发送 · Alt+Enter 换行 · /help 帮助 · /exit 退出")],
+        style=Style.from_dict({"prompt": "bold ansiblue", "hint": "ansibrightblack", "bottom-toolbar": "noreverse"}),
+        color_depth=ColorDepth.DEPTH_1_BIT if runtime.console.no_color else None,
     )
     while True:
+        runtime.console.print()
+        runtime.console.rule(style="dim")
         try:
-            value = prompt_session.prompt("gu> ")
+            value = prompt_session.prompt([("class:prompt", "GuMi> ")])
         except KeyboardInterrupt:
             runtime.console.print(Text("已取消当前输入。"))
             continue

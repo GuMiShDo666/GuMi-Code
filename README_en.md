@@ -84,6 +84,10 @@ The app is created at `desktop/release/GuMi-Code.app`. Move an existing app out 
 
 ## CLI
 
+![GuMi-Code CLI running a read-only code analysis task](docs/assets/readme/cli-task.png)
+
+<p align="center"><sub>CLI in use · A real model analyzes code in an isolated practice project, showing the task and its results.</sub></p>
+
 Requires Git, Python 3.11 or newer, and an OpenAI-compatible model service supporting Chat Completions and tool calls.
 
 ### Install and start on macOS / Linux

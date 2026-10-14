@@ -76,7 +76,7 @@ def parse_args(
     *,
     interactive: bool | None = None,
 ) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="gum-code")
+    parser = argparse.ArgumentParser(prog="GuMi-Code")
     parser.add_argument("--workspace", help="工作区目录路径")
     parser.add_argument(
         "--task-type", choices=("development", "read-only"),
