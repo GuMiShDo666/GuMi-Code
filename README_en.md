@@ -19,7 +19,7 @@
   <a href="#desktop">Desktop</a> · <a href="#cli">CLI</a> · <a href="README.md">中文</a> · <strong>English</strong>
 </p>
 
-![GuMi-Code reading project files and streaming a response](docs/assets/readme/desktop-working.jpg)
+![GuMi-Code desktop project conversations and code analysis](docs/assets/readme/desktop-working.jpg)
 
 <p align="center"><sub>Desktop in action · Sample project with a local simulated model; file tools run through the actual app.</sub></p>
 
@@ -55,9 +55,11 @@ The first runtime preparation downloads Python and dependencies. You do not need
 ### Your first task
 
 1. Open Settings → GuMi-Code settings, enter the API base URL, model name, and API key, then save. Use the connection test to check that the endpoint is reachable.
-2. Return to the conversation page, select a project folder, and confirm that you trust it.
+2. Return to the conversation page, select a project folder from the left sidebar, and confirm that you trust it.
 3. Send a request, such as “Explain this project's main features” or “Fix this error and run the relevant tests.”
 4. Approve or deny command requests after reviewing the displayed operation. You can stop a running task or continue a previous conversation from history.
+
+The sidebar groups conversations by project. A title is generated after the first question and answer; double-click the header title to rename it. Elapsed time and execution progress appear above the input box.
 
 You can add attachments, manage the selected workspace's memory and `AGENTS.md` in settings, and change the interface language.
 

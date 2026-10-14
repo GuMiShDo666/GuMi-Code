@@ -403,6 +403,9 @@ function createGumCode({ dataDir, projects, allowed, pickDirectory, grantDirecto
       } else if (action === 'turn') {
         if (success) {
           state.statusText = '本轮已结束';
+          const currentSession = catalog.sessions.find(s => s.id === session.id);
+          const answer = state.messages.findLast(m => m.role === 'assistant')?.content;
+          if (currentSession && answer) summarize(currentSession, `用户：${query.slice(0, 1800)}\n助手：${answer.slice(0, 1800)}`, provider);
           try {
             save({ ...catalog, sessions: catalog.sessions.map(s => { if (s.id !== session.id) return s; const { pendingText, ...saved } = s; return saved; }) });
           } catch { state.error = '本轮结果已保存，但输入恢复标记未清除，请在重新打开后核对。'; }
@@ -444,7 +447,8 @@ function createGumCode({ dataDir, projects, allowed, pickDirectory, grantDirecto
     }
     hydrated = true;
     const first = state.messages.find(m => m.role === 'user')?.content;
-    if (first && (session.title === '新会话' || session.title === first.trim().slice(0, 60))) summarize(session, first);
+    const firstAnswer = state.messages.find(m => m.role === 'assistant')?.content;
+    if (first && firstAnswer && (session.title === '新会话' || session.title === first.trim().slice(0, 60))) summarize(session, `用户：${first.slice(0, 1800)}\n助手：${firstAnswer.slice(0, 1800)}`);
   }
   async function settled() {
     while (busy || active) {
@@ -497,6 +501,16 @@ function createGumCode({ dataDir, projects, allowed, pickDirectory, grantDirecto
         if (workspaces.length > 200) fail('当前最多保留 200 个工作区域。');
         return await addSession(request, { projectId: project.id, workspace }, workspaces);
       } finally { releaseBusy(); }
+    },
+    async rename(request) {
+      if (initError || closing || busy) fail('当前无法修改标题，请稍后重试。');
+      const session = selected(request?.sessionId);
+      if (state.selectedId !== session.id) fail('请先打开此会话。');
+      const title = request?.title;
+      if (!text(title, 100) || !title.trim() || /[\p{Cc}\u2028\u2029]/u.test(title) || sensitive(title)) fail('标题无效，请输入 1–100 个字符。');
+      save({ ...catalog, sessions: catalog.sessions.map(s => s.id === session.id ? { ...s, title: title.trim(), titleSummarized: true } : s) });
+      notify();
+      return snapshot();
     },
     async select(request) {
       idle();
@@ -563,7 +577,6 @@ function createGumCode({ dataDir, projects, allowed, pickDirectory, grantDirecto
         if (request.pendingInputId) state.messages = state.messages.filter(m => m.inputId !== request.pendingInputId);
         state.messages.push({ role: 'user', content: prepared.text });
         run('turn', session, prepared.text, provider);
-        if (session.title === '新会话') summarize(session, request.text.trim() || '查看上传的文件', provider);
         hydrated = true; notify();
         return snapshot();
       } finally { releaseBusy(); }

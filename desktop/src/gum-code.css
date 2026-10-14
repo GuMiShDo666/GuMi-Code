@@ -8,10 +8,7 @@
 .gum-code .gum-code-primary { background: #171717; color: #fff; }
 .gum-code .gum-code-primary:not(:disabled):hover { background: #333; }
 .gum-code label { font-weight: 600; font-size: 12px; }
-.gum-code .gum-code-nav-trigger { anchor-name: --gum-code-nav; display: flex; align-items: center; gap: 8px; flex-shrink: 0; background: #f5f6f9; color: #555f76; font-size: 13px; padding: 8px 12px; }
-.gum-code-nav-trigger > svg:last-child { transform: rotate(90deg); }
-.gum-code-navigator { position: fixed; position-anchor: --gum-code-nav; inset: auto; top: anchor(bottom); left: anchor(left); margin: 8px 0 0; width: min(280px, calc(100vw - 100px)); max-height: min(420px, calc(100dvh - 140px)); padding: 8px; border: 1px solid #e5e7edcc; border-radius: 14px; background: rgb(255 255 255 / 50%); backdrop-filter: blur(18px); color: #343a46; box-shadow: 0 12px 36px #24324b14, 0 2px 6px #24324b08; }
-.gum-code-navigator:popover-open { display: flex; flex-direction: column; animation: gum-code-enter 140ms ease-out; }
+.gum-code-navigator { position:fixed; left:0; top:200px; bottom:82px; width:190px; padding:0 12px; display:flex; flex-direction:column; font-family:inherit; }
 .gum-code-nav-toolbar { display: flex; align-items: center; justify-content: space-between; padding-left: 10px; flex-shrink: 0; }
 .gum-code-nav-toolbar > span { font-size: 11px; color: var(--muted); }
 .gum-code-nav-toolbar > div { display: flex; }
@@ -80,9 +77,9 @@
   .gum-code-composer { margin: 12px 18px 18px; }
 }
 @media (max-width: 760px) {
-  .gum-code { grid-template-columns: minmax(0, 1fr); height: auto; min-height: calc(100vh - 44px); }
-  .gum-code-conversation { min-height: 520px; }
-  .gum-code-history { max-height: 55vh; }
+  .gum-code { grid-template-columns: minmax(0, 1fr); }
+
+  .gum-code-history { min-height:0; }
   .gum-code-empty { margin: 25px auto; }
 }
 
@@ -249,10 +246,24 @@ dialog:has(.gum-memory-panel) .modal-head { margin-bottom: 16px; gap: 16px; }
 .gum-memory-history > summary { min-height: 44px; padding: 14px 0; cursor: pointer; }
 .gum-memory-history p { padding-bottom: 10px; line-height: 1.6; overflow-wrap: anywhere; }
 
-.gum-code-nav-trigger span { max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gum-code-attach-button { display: grid; place-items: center; width: 36px; height: 36px; border: 0; background: transparent; border-radius: 8px; color: var(--ink); }
 .gum-code-attach-button:hover:not(:disabled) { background: var(--hover, #f2f2f2); }
 .gum-code-attachments { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 0 8px; }
 .gum-code-attachments > span { display: inline-flex; align-items: center; gap: 5px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 7px; font-size: 12px; max-width: 220px; }
 .gum-code-attachments > span > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gum-code-attachments button { display: grid; place-items: center; border: 0; padding: 3px; background: transparent; }
+
+.gum-code-title-input { width:100%; max-width:600px; font-size:16px; font-weight:600; padding:5px 8px; }
+.gum-code-header h2 { cursor:text; }
+.gum-code-run-status { margin:0 26px; flex-shrink:0; }
+.gum-code-run-status .gum-code-progress { margin:0; border:0; }
+.gum-code-run-status .gum-code-progress-body { max-height:180px; }
+.gum-code .gum-code-composer-actions .gum-code-attach-button { min-width:44px; width:44px; height:44px; padding:0; background:transparent; color:#171717; }
+.gum-code .gum-code-attach-button:hover:not(:disabled) { background:transparent; }
+.gum-code-attach-button svg { stroke-width:2.6; }
+@media(max-width:1000px){.gum-code-run-status{margin:0 18px}}
+
+.gum-code-sessions{flex:1}.gum-code-nav-toolbar>span{font-size:12px}.gum-code-group summary,.gum-code-session span{font-size:13px;line-height:1.5}.gum-code .gum-code-session[aria-current]{background:#f2f2f2;color:#242424}
+@media(max-width:800px){.gum-code-navigator{width:170px;top:184px}}
+
+.gum-code .gum-code-progress-toggle{border:0}
