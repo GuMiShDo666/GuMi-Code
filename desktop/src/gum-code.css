@@ -8,20 +8,20 @@
 .gum-code .gum-code-primary { background: #171717; color: #fff; }
 .gum-code .gum-code-primary:not(:disabled):hover { background: #333; }
 .gum-code label { font-weight: 600; font-size: 12px; }
-.gum-code-navigator { position:fixed; left:0; top:200px; bottom:82px; width:190px; padding:0 12px; display:flex; flex-direction:column; font-family:inherit; }
+.gum-code-navigator { position:fixed; left:0; top:200px; bottom:82px; width:var(--sidebar-width); padding:0 12px; display:flex; flex-direction:column; font-family:inherit; }
 .gum-code-nav-toolbar { display: flex; align-items: center; justify-content: space-between; padding-left: 10px; flex-shrink: 0; }
 .gum-code-nav-toolbar > span { font-size: 11px; color: var(--muted); }
 .gum-code-nav-toolbar > div { display: flex; }
 .gum-code .gum-code-nav-toolbar button { display: grid; place-items: center; padding: 0; width: 32px; min-height: 32px; background: transparent; color: #737b8c; }
 .gum-code-sessions { overflow-y: auto; min-height: 0; padding: 4px 0; scrollbar-width: thin; }
-.gum-code-group { margin: 0 0 6px; min-width: 0; }
-.gum-code-group summary { list-style: none; display: flex; align-items: center; gap: 7px; padding: 8px 6px; cursor: pointer; border-radius: 6px; font-size: 12px; }
+.gum-code-group { margin: 0 0 10px; min-width: 0; }
+.gum-code-group summary { list-style:none; display:flex; align-items:center; gap:10px; padding:7px 8px; min-height:34px; cursor:pointer; border-radius:8px; font-size:13px; color:#454545; }
 .gum-code-group summary::-webkit-details-marker { display: none; }
 .gum-code-group summary:hover { background: #f7f8fa; }
 .gum-code-group summary svg { flex-shrink: 0; color: #737b8c; }
-.gum-code-group[open] summary > svg:first-child { transform: rotate(90deg); }
+
 .gum-code-group summary span, .gum-code-session span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.gum-code .gum-code-session { display: block; width: calc(100% - 24px); margin: 2px 0 2px 24px; min-height: 32px; padding: 7px 10px; text-align: left; background: transparent; border-radius: 7px; }
+.gum-code .gum-code-session { display:block; width:100%; margin:2px 0; min-height:32px; padding:6px 12px 6px 34px; border:0; text-align:left; background:transparent; border-radius:11px; color:#454545; }
 .gum-code-session span { display: block; font-size: 12px; font-weight: 400; }
 .gum-code .gum-code-session[aria-current] { background: #eef1fc; color: #4f5fa4; box-shadow: none; }
 .gum-code .gum-code-nav-folder { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 34px; margin-top: 4px; padding: 8px 10px; background: transparent; color: #737b8c; font-size: 12px; border-top: 1px solid #f0f1f4; border-radius: 0 0 8px 8px; flex-shrink: 0; }
@@ -30,14 +30,14 @@
 @media (pointer: coarse) { .gum-code .gum-code-navigator button, .gum-code-group summary { min-height: 44px; } }
 .gum-code-hint { color: var(--muted); font-size: 12px; line-height: 1.7; }
 .gum-code-conversation { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-.gum-code-header { display: flex; align-items: center; gap: 16px; padding: 16px 26px; border-bottom: 1px solid var(--line); }
+.gum-code-header { display: flex; align-items: center; gap: 16px; padding: 13px 28px; border-bottom: 1px solid var(--line); }
 .gum-code-header > div:not(.gum-code-navigator) { min-width: 0; flex: 1; }
-.gum-code-header h2 { font-size: 16px; overflow-wrap: anywhere; }
+.gum-code-header h2 { font-size: 14px; overflow-wrap: anywhere; }
 .gum-code-header p { font-size: 12px; color: var(--muted); margin-top: 7px; overflow-wrap: anywhere; }
 .gum-code-status { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; font-size: 11px; border-radius: 20px; padding: 5px 9px; background: #f1f3f8; color: var(--muted); }
 .gum-code-status.is-running, .gum-code-status.is-waiting { background: #edf0fb; color: #5260a9; }
-.gum-code-history { overflow-y: auto; flex: 1; min-height: 160px; padding: 28px 36px; overflow-anchor: none; overscroll-behavior: contain; scrollbar-gutter: stable; }
-.gum-code-history-content { max-width: 860px; margin: 0 auto; display: flow-root; }
+.gum-code-history { overflow-y: auto; flex: 1; min-height: 160px; padding: 24px 44px; overflow-anchor: none; overscroll-behavior: contain; scrollbar-gutter: stable; }
+.gum-code-history-content { max-width: 900px; margin: 0 auto; display: flow-root; }
 .gum-code-empty { max-width: 410px; margin: 50px auto; text-align: center; color: var(--muted); }
 .gum-code-empty svg { color: var(--accent); }
 .gum-code-empty h3 { color: #262626; font-size: 19px; margin: 16px 0 12px; }
@@ -46,7 +46,7 @@
 .gum-code-message.is-user { display: flex; flex-direction: column; align-items: flex-end; margin: 12px 0 28px; }
 .gum-code-message.is-assistant { color: #242424; }
 
-.gum-code-message > div { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; font-size: 15px; }
+.gum-code-message > div { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; font-size: 14px; }
 .gum-code-message.is-user > .gum-code-user-text { max-width: 82%; width: fit-content; padding: 12px 20px; border-radius: 22px; background: #171717; color: #fff; text-align: left; }
 .gum-code-error { padding: 12px 26px; background: #fff3f2; color: #a54343; font-size: 13px; overflow-wrap: anywhere; }
 .gum-code-activity { display: flex; align-items: center; gap: 8px; padding: 10px 26px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; max-height: 100px; overflow-y: auto; }
@@ -100,9 +100,9 @@
 .gum-code-markdown > :last-child { margin-bottom: 0; }
 .gum-code-markdown p, .gum-code-markdown ul, .gum-code-markdown ol, .gum-code-markdown blockquote, .gum-code-markdown pre, .gum-code-table { margin: 12px 0; }
 .gum-code-markdown h1, .gum-code-markdown h2, .gum-code-markdown h3, .gum-code-markdown h4, .gum-code-markdown h5, .gum-code-markdown h6 { color: #262626; font-weight: 650; line-height: 1.5; margin: 20px 0 10px; }
-.gum-code-markdown h1 { font-size: 23px; }
-.gum-code-markdown h2 { font-size: 20px; }
-.gum-code-markdown h3 { font-size: 17px; }
+.gum-code-markdown h1 { font-size: 18px; }
+.gum-code-markdown h2 { font-size: 18px; }
+.gum-code-markdown h3 { font-size: 16px; }
 .gum-code-markdown h4, .gum-code-markdown h5, .gum-code-markdown h6 { font-size: 14px; }
 .gum-code-markdown ul, .gum-code-markdown ol { padding-left: 24px; }
 .gum-code-markdown ul { list-style: disc; }
@@ -161,7 +161,7 @@
 .gum-code-skill-list > button > span:nth-child(2) { display: grid; gap: 3px; flex: 1; min-width: 0; }
 .gum-code-skill-list strong { color: #262626; font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gum-code-skill-list small { color: #737373; font-size: 12px; line-height: 1.5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.gum-code-skill-mark { display: grid; place-items: center; flex: 0 0 29px; height: 29px; background: #fafafa; border: 1px solid #00000012; border-radius: 7px; color: #525252; font-size: 15px; }
+.gum-code-skill-mark { display: grid; place-items: center; flex: 0 0 29px; height: 29px; background: #fafafa; border: 1px solid #00000012; border-radius: 7px; color: #525252; font-size: 14px; }
 .gum-code-skill-list code { font-size: 11px; color: #737373; max-width: 120px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gum-code-skill-empty { padding: 15px 10px; color: #737373; font-size: 13px; display: flex; align-items: center; justify-content: space-between; }
 .gum-code-skill-empty > button { min-height: 32px; padding: 4px 10px; font-size: 12px; }
@@ -253,7 +253,7 @@ dialog:has(.gum-memory-panel) .modal-head { margin-bottom: 16px; gap: 16px; }
 .gum-code-attachments > span > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gum-code-attachments button { display: grid; place-items: center; border: 0; padding: 3px; background: transparent; }
 
-.gum-code-title-input { width:100%; max-width:600px; font-size:16px; font-weight:600; padding:5px 8px; }
+.gum-code-title-input { width:100%; max-width:600px; font-size:14px; font-weight:600; padding:5px 8px; }
 .gum-code-header h2 { cursor:text; }
 .gum-code-run-status { margin:0 26px; flex-shrink:0; }
 .gum-code-run-status .gum-code-progress { margin:0; border:0; }
@@ -263,7 +263,19 @@ dialog:has(.gum-memory-panel) .modal-head { margin-bottom: 16px; gap: 16px; }
 .gum-code-attach-button svg { stroke-width:2.6; }
 @media(max-width:1000px){.gum-code-run-status{margin:0 18px}}
 
-.gum-code-sessions{flex:1}.gum-code-nav-toolbar>span{font-size:12px}.gum-code-group summary,.gum-code-session span{font-size:13px;line-height:1.5}.gum-code .gum-code-session[aria-current]{background:#f2f2f2;color:#242424}
-@media(max-width:800px){.gum-code-navigator{width:170px;top:184px}}
+.gum-code-sessions{flex:1}.gum-code-nav-toolbar>span{font-size:12px}.gum-code-group summary,.gum-code-session span{font-size:13px;line-height:1.5}.gum-code .gum-code-session[aria-current]{background:#eeeeef;color:#454545}
+@media(max-width:760px){.gum-code-navigator{top:176px}}
 
 .gum-code .gum-code-progress-toggle{border:0}
+
+.gum-code-composer{width:calc(100% - 88px);max-width:900px;align-self:center;margin:10px auto 18px;padding:10px 12px;border-radius:18px}
+.gum-code-composer textarea{font-size:14px;min-height:62px;max-height:160px}.gum-code-input-backdrop{font-size:14px}
+.gum-code-run-status{width:calc(100% - 88px);max-width:900px;align-self:center;margin:0 auto}.gum-code .gum-code-progress-toggle{font-size:12px;min-height:32px}.gum-code-progress-time{font-size:12px}
+.gum-code-message{margin-bottom:28px}.gum-code-message.is-user>.gum-code-user-text{padding:9px 14px;border-radius:18px}.gum-code-message>.gum-code-markdown{line-height:1.75}
+@media(max-width:1000px){.gum-code-history{padding:20px 24px}.gum-code-composer,.gum-code-run-status{width:calc(100% - 48px)}}
+@media(max-width:760px){.gum-code-history{padding:16px}.gum-code-composer,.gum-code-run-status{width:calc(100% - 32px)}.gum-code-send-controls select{max-width:140px}}
+
+.gum-code-message,.gum-code-markdown,.gum-code-user-text,.gum-code-composer textarea,.gum-code-input-backdrop{font-weight:400}
+.gum-code-markdown strong{font-weight:600}
+.gum-code-markdown h1,.gum-code-markdown h2,.gum-code-markdown h3{font-weight:600}
+.gum-code-markdown h4,.gum-code-markdown h5,.gum-code-markdown h6,.gum-code-tool-list strong{font-weight:400}

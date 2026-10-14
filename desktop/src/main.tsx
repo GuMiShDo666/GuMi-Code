@@ -18,7 +18,7 @@ function Shell({state,commit,error}:{state:State;commit:(change:(next:State)=>vo
  const {t}=useI18n(); const [settings,setSettings]=useState(false),[section,setSection]=useState<'code'|'language'>('code'),[generation,setGeneration]=useState(0);
  return <div className={`app ${settings?'settings-route':''}`}>
   <div className="titlebar">GuMi-Code</div>
-  {!settings&&<aside className="navigation"><div className="brand"><img src="./app-icon.png" alt="GuMi"/></div><button className="settings-link" aria-label={t('设置')} onClick={()=>setSettings(true)}><Icon name="settings" size={24}/><span>{t('设置')}</span></button></aside>}
+  {!settings&&<aside className="navigation"><div className="brand"><img src="./brand-bird.png" alt="GuMi"/></div><button className="settings-link" aria-label={t('设置')} onClick={()=>setSettings(true)}><Icon name="settings" size={24}/><span>{t('设置')}</span></button></aside>}
   <main className="content">
    {error&&<p role="alert">{error}</p>}
    <div hidden={settings}><GumCode key={generation} projects={[]} visible={!settings}/></div>

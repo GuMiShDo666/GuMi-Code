@@ -14,7 +14,7 @@ else app.whenReady().then(()=>{
  const entryFile=path.resolve(__dirname,'../dist/index.html'),dataDir=path.join(app.getPath('userData'),'gum-code');
  const preferences=createPreferences(app.getPath('userData'));
  const runtime=getGumCodeRuntime({packaged:app.isPackaged&&path.resolve(app.getAppPath())===path.resolve(__dirname,'..')});
- const window=new BrowserWindow({width:1180,height:820,minWidth:650,minHeight:550,title:'GuMi-Code',backgroundColor:'#ffffff',titleBarStyle:'hiddenInset',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,sandbox:true,nodeIntegration:false}});
+ const window=new BrowserWindow({width:1440,height:900,minWidth:650,minHeight:550,title:'GuMi-Code',backgroundColor:'#ffffff',titleBarStyle:'hiddenInset',webPreferences:{preload:path.join(__dirname,'preload.cjs'),contextIsolation:true,sandbox:true,nodeIntegration:false}});
  let operations=0,providers,gumCode,migrating=false,closed=false,closing=false;
  const emit=(name,value)=>{if(!window.isDestroyed())window.webContents.send(`gumi:${name}`,value);};
  function initialize(){

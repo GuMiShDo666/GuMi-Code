@@ -230,7 +230,7 @@ export function GumCode({ projects, visible }: { projects: Project[]; visible: b
             </div></div>
             <div className="gum-code-sessions">
               {groups.map((group) => <details className="gum-code-group" key={group.path} open>
-                <summary title={group.path}><Icon name="arrow" size={11} /><Icon name="folder" size={16} /><span>{group.name}</span></summary>
+                <summary title={group.path}><Icon name="folder" size={16} /><span>{group.name}</span></summary>
                 {group.sessions.map((session) => <button type="button" key={session.id} className="gum-code-session" title={session.title || t('新会话', 'New conversation')} aria-current={session.id === state.selectedId ? "true" : undefined} disabled={locked} onClick={async () => {
                   if (!api) return;
                   await run(() => api.gumCodeSelect({ sessionId: session.id }));
