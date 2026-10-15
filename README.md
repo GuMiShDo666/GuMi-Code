@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="desktop/public/app-icon.png" width="100" alt="GuMi-Code logo" />
+  <img src="desktop/public/brand-bird.png" width="100" alt="GuMi-Code logo" />
 </p>
 
 <h1 align="center">GuMi-Code</h1>
