@@ -19,11 +19,11 @@
   <a href="#桌面端">桌面端上手</a> · <a href="#cli">CLI 上手</a> · <strong>中文</strong> · <a href="README_en.md">English</a>
 </p>
 
-![GuMi-Code 桌面端开发任务运行画面](docs/assets/readme/desktop-working.png)
+![GuMi-Code 桌面端执行命令](docs/assets/readme/desktop-executing.png)
 
 <p align="center"><sub>桌面端实际运行 · 开发项目与任务进度。</sub></p>
 
-![GuMi-Code 桌面端执行命令](docs/assets/readme/desktop-executing.png)
+![GuMi-Code 桌面端开发任务运行画面](docs/assets/readme/desktop-working.png)
 
 ## 可以用它做什么
 
