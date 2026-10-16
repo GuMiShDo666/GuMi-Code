@@ -19,9 +19,11 @@
   <a href="#桌面端">桌面端上手</a> · <a href="#cli">CLI 上手</a> · <strong>中文</strong> · <a href="README_en.md">English</a>
 </p>
 
-![GuMi-Code 桌面端项目对话与代码分析](docs/assets/readme/desktop-working.jpg)
+![GuMi-Code 桌面端开发任务运行画面](docs/assets/readme/desktop-working.png)
 
-<p align="center"><sub>桌面端任务画面 · 示例项目与本地模拟模型，文件工具由真实应用执行。</sub></p>
+<p align="center"><sub>桌面端实际运行 · 开发项目与任务进度。</sub></p>
+
+![GuMi-Code 桌面端执行命令](docs/assets/readme/desktop-executing.png)
 
 ## 可以用它做什么
 

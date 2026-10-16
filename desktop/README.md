@@ -31,11 +31,13 @@ npm start
 
 ![桌面端 API 配置](../docs/assets/readme/desktop-settings.jpg)
 
-阅读项目并输出分析：
+开发项目与任务进度：
 
-![桌面端工作画面](../docs/assets/readme/desktop-working.jpg)
+![桌面端工作画面](../docs/assets/readme/desktop-working.png)
 
-截图使用示例项目与本地模拟模型，文件工具由真实应用执行。
+执行命令：
+
+![桌面端执行命令](../docs/assets/readme/desktop-executing.png)
 
 ## 打包应用
 

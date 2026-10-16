@@ -19,9 +19,11 @@
   <a href="#desktop">Desktop</a> · <a href="#cli">CLI</a> · <a href="README.md">中文</a> · <strong>English</strong>
 </p>
 
-![GuMi-Code desktop project conversations and code analysis](docs/assets/readme/desktop-working.jpg)
+![GuMi-Code desktop development task in progress](docs/assets/readme/desktop-working.png)
 
-<p align="center"><sub>Desktop in action · Sample project with a local simulated model; file tools run through the actual app.</sub></p>
+<p align="center"><sub>Desktop in action · Project development and task progress.</sub></p>
+
+![GuMi-Code desktop executing commands](docs/assets/readme/desktop-executing.png)
 
 ## What you can do
 
