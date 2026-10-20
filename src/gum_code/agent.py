@@ -311,6 +311,7 @@ def _completion_failure(reason: str, todos: TodoManager, parts: list[str]) -> st
     else:
         detail = {
             "completion_stalled": "连续两次提醒后仍未推进，已停止本轮恢复。",
+            "local_verification_stalled": "已达到本轮测试验证提醒上限，停止自动恢复；当前版本仍未验证。",
             "invalid_model_response": "模型响应格式或结束状态无效；已有工作保留，本次响应未执行新操作。",
             "completion_output_limit": "续写正文达到本轮保留上限。",
         }[reason]
@@ -1165,6 +1166,7 @@ def _run_agent_loop(
     candidate_answer = ""
     candidate_finish_reason: object = None
     recovery_reminders = 0
+    local_verification_reminders = 0
     recovery_checkpoint = 0
     progress_epoch = 0
     work_generation = 0
@@ -1201,36 +1203,44 @@ def _run_agent_loop(
             observe_progress(("self_check", result["input_version"], result.get("checks")))
 
     def recover(reason: str, step: int) -> str:
-        nonlocal recovery_reminders, recovery_checkpoint
+        nonlocal recovery_reminders, recovery_checkpoint, local_verification_reminders
         if plan_runtime is not None:
             plan_runtime.lock_switching()
         if reason == "invalid_model_response":
             return reason
         if step == max_steps:
             return "step_budget"
-        if progress_epoch != recovery_checkpoint:
-            recovery_reminders = 0
-        if recovery_reminders >= MAX_COMPLETION_REMINDERS:
-            return "completion_stalled"
-        recovery_reminders += 1
-        recovery_checkpoint = progress_epoch
         if reason == "local_verification_missing":
-            detail = "当前版本缺少通过的测试执行证据。用 run_command 运行相关 unittest/pytest/node --test，读取失败并修复复测。零测试和全部跳过不算通过；审批被拒绝时不要绕过，说明未验证。"
-        elif reason == "verification_missing":
+            # This is a per-run limit, independent of reads, edits, or answer churn.
+            if local_verification_reminders >= MAX_COMPLETION_REMINDERS:
+                return "local_verification_stalled"
+            local_verification_reminders += 1
+            detail = local_verification.recovery_detail()
+        else:
+            if progress_epoch != recovery_checkpoint:
+                recovery_reminders = 0
+            if recovery_reminders >= MAX_COMPLETION_REMINDERS:
+                return "completion_stalled"
+            recovery_reminders += 1
+            recovery_checkpoint = progress_epoch
+        if reason == "verification_missing":
             detail = (
                 "本轮改动仍缺适用当前版本的验证证据。根据原始需求、实际差异及相关调用者选择最小检查，"
                 "用 self_check 提交明确目标；缺测试时补充并保留。先诊断失败再修复复测，不要重复完成结论。"
                 + (self_check_runtime.outcome(step=step)["summary"] if self_check_runtime is not None else "")
             )
-        else:
+        elif reason != "local_verification_missing":
             detail = "输出被截断，请继续剩余正文或重新规划合法工具调用。" if reason == "response_length" else "当前 Todo 仍有未完成项，请推进工作并据实更新，不要只重复完成结论。"
         messages.append({"role": "user", "content": "[Harness completion recovery] " + detail})
         _send_message_snapshot(message_snapshot_callback, messages)
         return "continue"
 
     def finish_incomplete(reason: str, step: int) -> str:
+        answer = _completion_failure(reason, todo_manager, text_parts)
+        if local_verification is not None and local_verification.needs_check():
+            answer += "\n" + local_verification.recovery_detail()
         return _finish_answer(
-            messages, _completion_failure(reason, todo_manager, text_parts),
+            messages, answer,
             status="incomplete", reason=reason, step=step,
             event_callback=event_callback, message_snapshot_callback=message_snapshot_callback,
             self_check_runtime=self_check_runtime,
@@ -1710,12 +1720,11 @@ def _run_agent_loop(
                         if tool_name in {"write_file", "edit_file", "delete_file", "self_check"}:
                             execution_kwargs["file_change_callback"] = file_changed
                         command_results = []
+                        proposed = []
                         if tool_name == "run_command" and local_verification is not None:
                             try:
                                 proposed = json.loads(tool_call.function.arguments).get("argv", [])
-                                if is_test_command(proposed):
-                                    local_verification.test_failed = True
-                                    local_verification.verified = None
+                                local_verification.begin_attempt(proposed)
                             except (ValueError, TypeError, AttributeError):
                                 pass
                         if tool_name == "run_command":
@@ -1754,6 +1763,8 @@ def _run_agent_loop(
                                                   command_result.exit_code, command_result.reason))
                         if isinstance(result, ToolExecutionDenied):
                             denied_tool_calls.add(fingerprint)
+                            if tool_name == "run_command" and local_verification is not None and is_test_command(proposed):
+                                local_verification.rejection = "denied"
 
             if (
                 reminder is not None

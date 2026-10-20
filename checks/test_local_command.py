@@ -204,11 +204,17 @@ def test_agent_denied_verification_ends_incomplete(tmp_path):
     class Counter:
         def count_request(self,*args):return 100
     events=[]
-    run_agent(client=NS(chat=NS(completions=NS(create=lambda **kwargs:next(responses)))),model='synthetic',workspace=tmp_path,
+    requests = []
+    def create(**kwargs):
+        requests.append(str(kwargs['messages']))
+        return next(responses)
+    answer = run_agent(client=NS(chat=NS(completions=NS(create=create))),model='synthetic',workspace=tmp_path,
               user_query='Test',max_steps=8,max_context_tokens=800000,
               allow_run_command=True,command_sandbox=LocalCommandConfig(tmp_path),allow_subagent=False,
               approval_callback=lambda *args:False,token_counter=Counter(),event_callback=lambda kind,value:events.append((kind,value)))
     assert [payload['status'] for kind,payload in events if kind=='task_outcome']==['incomplete']
+    assert '[denied]' in requests[2] and '[denied]' in answer
+    assert '审批' in answer
 
 
 def test_finder_minimal_path_uses_installed_nvm_node(tmp_path, monkeypatch):
@@ -226,3 +232,85 @@ def test_finder_minimal_path_uses_installed_nvm_node(tmp_path, monkeypatch):
     config=LocalCommandConfig(workspace);config.changed=True
     output=run_command(workspace,['node','--test','test.mjs'],sandbox=config)
     assert '"exit_code": 0' in output and not config.needs_check()
+
+
+@pytest.mark.parametrize('argv,output,exit_code,reason,expected', [
+    (['npm', 'test'], '12 passed', 0, 'exited', 'unsupported_runner'),
+    (['python3', '-m', 'unittest'], 'Ran 0 tests in 0s\nOK\n', 0, 'exited', 'no_tests'),
+    (['python3', '-m', 'unittest'], 'Ran 2 tests in 0s\nOK (skipped=2)\n', 0, 'exited', 'all_skipped'),
+    (['python3', '-m', 'pytest'], '2 skipped in 0.1s', 0, 'exited', 'all_skipped'),
+    (['node', '--test'], '# tests 0\n# pass 0\n# fail 0\n', 0, 'exited', 'no_tests'),
+    (['python3', '-m', 'pytest'], 'private-unrecognized-output', 0, 'exited', 'unrecognized_output'),
+    (['python3', '-m', 'pytest'], '1 failed', 1, 'exited', 'execution_failed'),
+    (['python3', '-m', 'pytest'], '', None, 'timeout', 'timeout'),
+    (['python3', '-m', 'pytest'], '', None, 'output_limit', 'output_limit'),
+])
+def test_verification_rejection_explains_specific_cause(tmp_path, argv, output, exit_code, reason, expected):
+    from gum_code.tools.command import CommandExecutionResult
+    config = LocalCommandConfig(tmp_path)
+    config.changed = True
+    config.observe(argv, CommandExecutionResult(True, exit_code, reason, output), config.snapshot())
+    assert config.needs_check()
+    detail = config.recovery_detail()
+    assert expected in detail
+    assert 'private-unrecognized-output' not in detail
+    assert '下一步' in detail
+
+
+def test_verification_distinguishes_changes_and_snapshot_failure(tmp_path, monkeypatch):
+    from gum_code.tools.command import CommandExecutionResult
+    config = LocalCommandConfig(tmp_path)
+    config.changed = True
+    argv = ['python3', '-m', 'unittest']
+    result = CommandExecutionResult(True, 0, 'exited', 'Ran 1 test in 0s\nOK\n')
+    before = config.snapshot()
+    (tmp_path / 'app.py').write_text('value = 1')
+    config.observe(argv, result, before)
+    assert 'changed_during_test' in config.recovery_detail()
+    config.observe(argv, result, config.snapshot())
+    assert not config.needs_check()
+    (tmp_path / 'app.py').write_text('value = 2')
+    assert 'changed_since_success' in config.recovery_detail()
+    monkeypatch.setattr(config, 'snapshot', lambda: None)
+    assert 'snapshot_unavailable' in config.recovery_detail()
+
+
+@pytest.mark.parametrize('send_live_input', [False, True])
+def test_local_verification_reminders_have_run_cap_despite_read_progress(tmp_path, send_live_input):
+    import json
+    from types import SimpleNamespace as NS
+    from gum_code.agent import run_agent
+    config = LocalCommandConfig(tmp_path)
+    config.changed = True
+    requests, events = [], []
+    for index in range(4):
+        (tmp_path / f'read{index}.txt').write_text(f'distinct progress {index}')
+    def create(**kwargs):
+        requests.append(str(kwargs['messages']))
+        index = len(requests)
+        if index % 2 == 0:
+            call = NS(id=f'read{index}', type='function', function=NS(name='read_file', arguments=json.dumps({'path':f'read{index // 2}.txt'})))
+            message = NS(content='', tool_calls=[call])
+        else:
+            message = NS(content='Tests passed in earlier messages.', tool_calls=None)
+        return NS(choices=[NS(finish_reason='tool_calls' if message.tool_calls else 'stop', message=message)], usage=None)
+    class Counter:
+        def count_request(self, *args): return 100
+    delivered = False
+    def take_inputs():
+        nonlocal delivered
+        if len(requests) == 2 and not delivered:
+            delivered = True
+            return [{'id': 'follow-up', 'text': 'Continue checking the same task.'}]
+        return []
+    host = NS(take_inputs=take_inputs, complete=create, emit=lambda *args, **kwargs: None) if send_live_input else None
+    answer = run_agent(client=NS(chat=NS(completions=NS(create=create))), model='synthetic', workspace=tmp_path,
+                      user_query='Test', max_steps=12, allow_run_command=True, command_sandbox=config,
+                      allow_subagent=False, approval_callback=lambda *args: True, token_counter=Counter(),
+                      desktop_host=host,
+                      event_callback=lambda kind, value: events.append((kind, value)))
+    assert len(requests) == 5
+    assert 'local_verification_stalled' == [p['reason'] for k,p in events if k == 'task_outcome'][0]
+    assert 'missing_execution' in answer
+    assert '历史' in requests[1]
+    assert delivered == send_live_input
