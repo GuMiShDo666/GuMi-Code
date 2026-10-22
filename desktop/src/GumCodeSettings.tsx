@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react';
-import { ApiSettings } from './ApiSettings';
 import { GumCodeMemory } from './GumCodeMemory';
 import type { GumCodeState } from './gumCodeTypes';
 import { useI18n } from './i18n';
@@ -26,11 +25,9 @@ export function GumCodeSettings({ visible }: { visible: boolean }) {
   const sessions = state?.sessions.filter((session, index, all) => all.findIndex(other => other.workspace === session.workspace) === index) || [];
   const selected = state?.sessions.find(session => session.id === sessionId);
   return <div className="gum-code-settings">
-    <h2>{t('GuMi-Code 设置', 'GuMi-Code settings')}</h2>
-    <ApiSettings />
+    <h2>{t('项目', 'Project')}</h2>
     <section className="settings-card">
-      <h3>{t('工作区', 'Workspace')}</h3>
-      <label className="settings-row">{t('选择文件夹', 'Select folder')}
+      <label className="settings-row">{t('当前项目', 'Current project')}
         <select aria-label={t('设置工作区', 'Settings workspace')} value={selected?.workspace || ''} disabled={!sessions.length} onChange={event => {
           if ((memoryDirty || instructionsDirty) && !window.confirm(t('切换工作区会放弃未保存的编辑，是否继续？', 'Switch workspace and discard unsaved edits?'))) return;
           setMemoryDirty(false); setInstructionsDirty(false);
@@ -42,7 +39,7 @@ export function GumCodeSettings({ visible }: { visible: boolean }) {
       </label>
       {selected && <p className="settings-path">{selected.workspace}</p>}
       {error && <p role="alert">{error}</p>}
-      {!sessions.length && !error && <p>{t('先在 GuMi-Code 中选择项目文件夹，再设置记忆和 AGENTS.md。', 'Select a project folder in GuMi-Code to manage memory and AGENTS.md.')}</p>}
+      {!sessions.length && !error && <p>{t('先选择项目文件夹，再管理记忆和指令。', 'Select a project folder to manage memory and instructions.')}</p>}
     </section>
     {selected && <>
       <section className="settings-card"><h3>{t('记忆', 'Memory')}</h3><GumCodeMemory key={sessionId} sessionId={sessionId} visible={visible} inline onDirtyChange={setMemoryDirty} /></section>
@@ -80,17 +77,16 @@ function InstructionsEditor({ sessionId, visible, onDirtyChange }: { sessionId: 
       const result = await window.gumi!.gumCodeSaveInstructions({ sessionId, content, revision: saved.revision });
       if (!mounted.current) return;
       if ('error' in result && result.error) { setError(result.error); return; }
-      if ('content' in result) { setSaved(result); setContent(result.content); setNotice(t('已保存，下次 GuMi-Code 请求生效。', 'Saved. Applies to the next GuMi-Code request.')); }
+      if ('content' in result) { setSaved(result); setContent(result.content); setNotice(t('已保存', 'Saved')); }
     } catch { if (mounted.current) setError(t('保存未完成，编辑内容已保留。', 'Save failed. Your edits have been kept.')); }
     finally { writing.current = false; if (mounted.current) setBusy(false); }
   }
   return <section className="settings-card">
-    <h3>AGENTS.md</h3>
-    <p>{t('当前工作区的代理指令。', 'Agent instructions for this workspace.')}</p>
+    <h3>{t('项目指令', 'Project instructions')} <span className="settings-caption">AGENTS.md</span></h3>
     {saved && <p className="settings-path">{saved.path}</p>}
     <form onSubmit={event => { event.preventDefault(); void save(); }}>
-      <textarea aria-label={t('编辑 AGENTS.md', 'Edit AGENTS.md')} className="settings-instructions" value={content} disabled={!saved || busy} maxLength={65536} rows={10} spellCheck={false} onChange={event => { setContent(event.target.value); setNotice(''); }} />
-      <div className="action-row"><button className="primary" type="submit" disabled={!saved || busy || !dirty}>{busy ? t('保存中…', 'Saving…') : t('保存 AGENTS.md', 'Save AGENTS.md')}</button>
+      <textarea aria-label={t('编辑 AGENTS.md', 'Edit AGENTS.md')} className="settings-instructions" value={content} disabled={!saved || busy} maxLength={65536} rows={6} spellCheck={false} onChange={event => { setContent(event.target.value); setNotice(''); }} />
+      <div className="action-row"><button className="primary" type="submit" disabled={!saved || busy || !dirty}>{busy ? t('保存中…', 'Saving…') : t('保存', 'Save')}</button>
         {error && <button type="button" className="quiet-button" disabled={busy} onClick={() => {
           if (dirty && !window.confirm(t('重新载入会放弃未保存的编辑，是否继续？', 'Reload and discard unsaved edits?'))) return;
           setSaved(undefined); setError(''); setReload(value => value + 1);

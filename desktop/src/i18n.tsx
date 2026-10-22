@@ -48,9 +48,9 @@ export function LanguageSettings({ state, commit }: { state: State; commit: Comm
     finally { pending.current = false; setBusy(false); }
   }
   return <section className="language-settings">
-    <h2>{t('语言设置')}</h2>
-    <div className="settings-card"><div className="settings-row">{t('应用界面语言', 'Application language')}
-      <span className="language-options" role="group" aria-label={t('应用界面语言', 'Application language')}>
+    <h2>{t('语言')}</h2>
+    <div className="settings-card"><div className="settings-row">{t('界面语言', 'Interface language')}
+      <span className="language-options" role="group" aria-label={t('界面语言', 'Interface language')}>
         <button type="button" aria-pressed={(state.settings.language || 'zh') === 'zh'} disabled={busy} onClick={() => void change('zh')}>中文</button>
         <button type="button" aria-pressed={state.settings.language === 'en'} disabled={busy} onClick={() => void change('en')}>English</button>
       </span>

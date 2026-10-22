@@ -86,9 +86,7 @@ export function GumCodeMemory({ sessionId, visible, inline = false, onDirtyChang
   const panel = <section className="gum-memory-panel" aria-label={t('记忆管理', 'Memory management')}>
         <div className="gum-memory-toolbar">
           <label><input type="checkbox" role="switch" checked={state?.enabled || false} disabled={!state || busy} onChange={event => void act({ action: "enable", enabled: event.target.checked, revision: state?.revision })} />{t('启用记忆', 'Enable memory')}</label>
-          <span>{t('仅本机 · 从启用后的新消息积累', 'On this device · Learns from new messages')}</span>
         </div>
-        <p className="gum-memory-hint">{t('提取与召回复用当前模型。关闭后停止学习与召回，已有记忆保留。', 'Uses the current model to learn and recall. Turning off keeps existing memories.')}</p>
         {loadError && <div className="gum-memory-error" role="alert">{loadError} <button type="button" disabled={busy} onClick={() => setReload(value => value + 1)}>{t('重新读取', 'Reload')}</button></div>}
         {error && <p className="gum-memory-error" role="alert">{error}</p>}
         {notice && <p className="gum-memory-notice" role="status">{notice}</p>}

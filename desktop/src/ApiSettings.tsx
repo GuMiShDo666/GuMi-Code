@@ -34,11 +34,11 @@ export function ApiSettings() {
         const result = await bridge().apiSettingsSave(request);
         if ('error' in result) { setError(result.error); return; }
         setSaved(result.settings); setBaseUrl(result.settings.baseUrl); setModel(result.settings.model); setApiKey('');
-        setMessage(t("已保存，下次 AI 请求生效。", "Saved. Applies to the next AI request."));
+        setMessage(t("已保存", "Saved"));
       } else {
         const result = await bridge().apiSettingsTest(request);
         if ('error' in result) { setError(result.error); return; }
-        setMessage(t("连接成功。GuMi-Code 还需模型支持工具调用。", "Connected. GuMi-Code also requires a model that supports tool calls."));
+        setMessage(t("连接成功", "Connected"));
       }
     } catch { setError(t("API 配置操作未完成，请重试。", "The API operation failed. Please try again.")); }
     finally { inFlight.current = false; setBusy(false); }
@@ -47,8 +47,6 @@ export function ApiSettings() {
     event.preventDefault();
     void submit((event.nativeEvent as SubmitEvent).submitter?.getAttribute('value') === 'test' ? 'test' : 'save');
   }}>
-    <h2>{t("API 配置", "API configuration")}</h2>
-    <p>{t("支持 OpenAI 兼容接口。", "Supports OpenAI-compatible endpoints.")}</p>
     <fieldset disabled={busy || !saved}>
       <label className="field-label">{t("接口地址", "API endpoint")}<input type="url" required maxLength={2048} placeholder="https://api.example.com/v1" autoComplete="off" spellCheck={false} value={baseUrl} onChange={event => { setBaseUrl(event.target.value); changed(); }} />
       </label>
@@ -57,9 +55,8 @@ export function ApiSettings() {
       <label className="field-label">API Key
         <input type="password" required={keyRequired} maxLength={4096} autoComplete="new-password" spellCheck={false} placeholder={saved?.hasKey ? (keyRequired ? t("地址已变更，请输入此接口的 Key", "Endpoint changed. Enter the key for this endpoint") : t("已设置，留空保留", "Already set. Leave empty to keep")) : t("输入 API Key", "Enter API key")} value={apiKey} onChange={event => { setApiKey(event.target.value); changed(); }} />
       </label>
-      <small>{t("密钥保存在本机钥匙串。测试连接仅发送固定测试文本。", "Keys are stored in the local keychain. Connection tests send fixed test text only.")}</small>
       <div className="action-row">
-        <button className="primary" type="submit" value="save">{t("保存 API 配置", "Save API settings")}</button>
+        <button className="primary" type="submit" value="save">{t("保存", "Save")}</button>
         <button className="quiet-button" type="submit" value="test">{t("测试连接", "Test connection")}</button>
         {busy && <span role="status">{t("处理中…", "Processing…")}</span>}
       </div>
