@@ -23,7 +23,7 @@
 .settings-detail .action-row { flex-wrap: wrap; }
 .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .settings-row select { max-width: 65%; }
-.settings-path { overflow-wrap: anywhere; font-size: 12px; }
+.settings-project-name { margin: -12px 0 24px; color: var(--muted); overflow-wrap: anywhere; }
 .settings-caption { font-size: 12px; font-weight: 400; color: var(--muted); margin-left: 8px; }
 .settings-instructions { width: 100%; resize: vertical; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 8px 0 0; }
 .settings-detail .gum-memory-panel { padding: 0; }
@@ -44,10 +44,12 @@
   .settings-layout.settings-panel { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .settings-sidebar { border-right: 0; border-bottom: 1px solid var(--line); padding: 8px 12px; }
   .settings-sidebar h1 { display: none; }
-  .settings-sidebar nav { flex-direction: row; }
+  .settings-sidebar nav { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .settings-sidebar nav button { justify-content: center; }
   .settings-layout > .settings-detail { padding: 24px 16px; }
   .settings-row { align-items: flex-start; flex-direction: column; gap: 10px; }
   .settings-row select { max-width: 100%; width: 100%; }
   .settings-detail .gum-memory-filters > div { flex-wrap: wrap; }
 }
+
+.api-settings + .settings-migration { margin-top: 32px; }

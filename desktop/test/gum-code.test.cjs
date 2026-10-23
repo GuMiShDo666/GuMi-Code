@@ -345,7 +345,7 @@ test('retrying preserved input replaces its pending bubble and is saved as recov
   await f.api.stop();
 });
 
-test('memory RPC save is source-bound and independent of tool approval', async t => {
+test('memory RPC auto-enables reliable facts without a remember command or approval', async t => {
   const replies=[];
   const f=setup(t,{start({request,emit,close}){
     if(request.action!=='turn'){emit({type:request.action,proposals:[]});emit({type:'finished',status:'completed'});close(0);return;}
@@ -354,7 +354,7 @@ test('memory RPC save is source-bound and independent of tool approval', async t
   const state=await f.api.newSession({projectId:'p'});
   const m=f.api.memoryState({sessionId:state.selectedId});
   await f.api.memoryAction({sessionId:state.selectedId,action:'enable',enabled:true,revision:m.revision});
-  await f.api.send({sessionId:state.selectedId,text:'记住：项目数据库采用 SQLite'});
+  await f.api.send({sessionId:state.selectedId,text:'项目数据库采用 SQLite'});
   await f.api.settled();
   assert.equal(replies[0].result.saved[0].status,'enabled');
   assert.equal(f.api.memoryState({sessionId:state.selectedId}).items.length,1);

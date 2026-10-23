@@ -16,7 +16,7 @@ function App() {
  return <LanguageProvider language={state.settings.language}><Shell state={state} commit={commit} error={error}/></LanguageProvider>;
 }
 function Shell({state,commit,error}:{state:State;commit:(change:(next:State)=>void)=>Promise<void>;error:string}) {
- const {t}=useI18n(); const [settings,setSettings]=useState(false),[section,setSection]=useState<'model'|'project'|'language'>('model'),[generation,setGeneration]=useState(0);
+ const {t}=useI18n(); const [settings,setSettings]=useState(false),[section,setSection]=useState<'model'|'memory'|'personalization'|'language'>('model'),[generation,setGeneration]=useState(0);
  return <div className={`app ${settings?'settings-route':''}`}>
   <div className="titlebar">GuMi-Code</div>
   {!settings&&<aside className="navigation"><div className="brand"><img src="./brand-bird.png" alt="GuMi"/></div><button className="settings-link" aria-label={t('设置')} onClick={()=>setSettings(true)}><Icon name="settings" size={24}/><span>{t('设置')}</span></button></aside>}
@@ -29,13 +29,14 @@ function Shell({state,commit,error}:{state:State;commit:(change:(next:State)=>vo
      <h1>{t('设置')}</h1>
      <nav aria-label={t('设置导航','Settings navigation')}>
       <button aria-current={section==='model'?'page':undefined} onClick={()=>setSection('model')}><Icon name="connection"/>{t('模型','Model')}</button>
-      <button aria-current={section==='project'?'page':undefined} onClick={()=>setSection('project')}><Icon name="folder"/>{t('项目','Project')}</button>
+      <button aria-current={section==='memory'?'page':undefined} onClick={()=>setSection('memory')}><Icon name="memory"/>{t('记忆','Memory')}</button>
+      <button aria-current={section==='personalization'?'page':undefined} onClick={()=>setSection('personalization')}><Icon name="person"/>{t('个性化','Personalization')}</button>
       <button aria-current={section==='language'?'page':undefined} onClick={()=>setSection('language')}><Icon name="globe"/>{t('语言')}</button>
      </nav>
     </aside>
     <div className="settings-detail">
-     <div hidden={section!=='model'}><h2>{t('模型','Model')}</h2><ApiSettings key={generation}/></div>
-     <div hidden={section!=='project'}><GumCodeSettings key={generation} visible={settings&&section==='project'}/><Migration onImported={()=>setGeneration(value=>value+1)}/></div>
+     <div hidden={section!=='model'}><h2>{t('模型','Model')}</h2><ApiSettings key={generation}/><Migration onImported={()=>setGeneration(value=>value+1)}/></div>
+     <div hidden={section!=='memory'&&section!=='personalization'}><GumCodeSettings key={generation} visible={settings&&(section==='memory'||section==='personalization')} section={section==='memory'?'memory':'personalization'}/></div>
      <div hidden={section!=='language'}><LanguageSettings state={state} commit={commit}/></div>
     </div>
    </section>
