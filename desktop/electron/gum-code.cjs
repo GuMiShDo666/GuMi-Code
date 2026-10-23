@@ -285,7 +285,7 @@ function createGumCode({ dataDir, projects, allowed, pickDirectory, grantDirecto
             else if(r.action==='refresh')result={enabled:!!memory.settings().enabled,enableEpoch:memory.settings().epoch,revision:memory.settings().revision,items:(Array.isArray(r.ids)?r.ids.slice(0,30):[]).flatMap(id=>{try{const x=memory.item(scope,id);return x.status==='enabled'?[x]:[];}catch{return [];}})};
             else if(r.action==='invalidate_skills'){if(!Array.isArray(r.ids)||!r.ids.every(id=>UUID.test(id)))throw Error();memory.invalidateSkills(scope,r.ids);result={ok:true};}
             else if(r.action==='write'){
-              if(r.proposal?.kind==='experience'){child.stdin.write(JSON.stringify({v:1,type:'memory_response',requestId:msg.requestId,result:{deferred:true,message:'经验会在本轮结束后结合工具证据生成候选，请在 Memory 面板审核。'}})+'\n');return;}
+              if(r.proposal?.kind==='experience'){child.stdin.write(JSON.stringify({v:1,type:'memory_response',requestId:msg.requestId,result:{deferred:true,message:'经验将在本轮结束后校验工具证据，通过后自动启用。'}})+'\n');return;}
               const sourceId=current.memorySources.find(id=>{const textValue=sourceTexts.get(id);return typeof r.evidence==='string'&&textValue?.includes(r.evidence);});
               if(!sourceId)throw Error();
               result={saved:memory.apply(scope,sourceId,sourceTexts.get(sourceId),[r.proposal],Array.isArray(r.skillNames)?r.skillNames.filter(x=>text(x,128)):[],null,{partial:true})};

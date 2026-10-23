@@ -3,52 +3,40 @@ import { GumCodeMemory } from './GumCodeMemory';
 import type { GumCodeState } from './gumCodeTypes';
 import { useI18n } from './i18n';
 
-export function GumCodeSettings({ visible }: { visible: boolean }) {
+export function GumCodeSettings({ visible, section }: { visible: boolean; section: 'memory' | 'personalization' }) {
   const { t } = useI18n();
   const [state, setState] = useState<GumCodeState>();
-  const [sessionId, setSessionId] = useState('');
   const [error, setError] = useState('');
-  const [memoryDirty, setMemoryDirty] = useState(false);
-  const [instructionsDirty, setInstructionsDirty] = useState(false);
   useEffect(() => {
     if (!visible || !window.gumi?.gumCodeState) return;
     let disposed = false, changed = false;
     const update = (next: GumCodeState) => {
       if (disposed) return;
       setState(next); setError('');
-      setSessionId(current => current || next.selectedId || next.sessions[0]?.id || '');
     };
     const off = window.gumi.onGumCode(next => { changed = true; update(next); });
-    void window.gumi.gumCodeState().then(next => { if (!changed) update(next); }).catch(() => { if (!disposed) setError(t('无法读取工作区，请重新打开设置。', 'Could not load workspaces. Reopen Settings.')); });
+    void window.gumi.gumCodeState().then(next => { if (!changed) update(next); }).catch(() => { if (!disposed) setError(t('无法读取当前项目，请重新打开设置。', 'Could not load the current project. Reopen Settings.')); });
     return () => { disposed = true; off(); };
   }, [visible, t]);
-  const sessions = state?.sessions.filter((session, index, all) => all.findIndex(other => other.workspace === session.workspace) === index) || [];
-  const selected = state?.sessions.find(session => session.id === sessionId);
+  const selected = state?.sessions.find(session => session.id === state.selectedId);
   return <div className="gum-code-settings">
-    <h2>{t('项目', 'Project')}</h2>
-    <section className="settings-card">
-      <label className="settings-row">{t('当前项目', 'Current project')}
-        <select aria-label={t('设置工作区', 'Settings workspace')} value={selected?.workspace || ''} disabled={!sessions.length} onChange={event => {
-          if ((memoryDirty || instructionsDirty) && !window.confirm(t('切换工作区会放弃未保存的编辑，是否继续？', 'Switch workspace and discard unsaved edits?'))) return;
-          setMemoryDirty(false); setInstructionsDirty(false);
-          setSessionId(sessions.find(session => session.workspace === event.target.value)?.id || '');
-        }}>
-          {!sessions.length && <option value="">{t('尚未选择工作区', 'No workspace selected')}</option>}
-          {sessions.map(session => <option key={session.id} value={session.workspace}>{session.workspace.split(/[\\/]/).filter(Boolean).pop()}</option>)}
-        </select>
-      </label>
-      {selected && <p className="settings-path">{selected.workspace}</p>}
-      {error && <p role="alert">{error}</p>}
-      {!sessions.length && !error && <p>{t('先选择项目文件夹，再管理记忆和指令。', 'Select a project folder to manage memory and instructions.')}</p>}
-    </section>
-    {selected && <>
-      <section className="settings-card"><h3>{t('记忆', 'Memory')}</h3><GumCodeMemory key={sessionId} sessionId={sessionId} visible={visible} inline onDirtyChange={setMemoryDirty} /></section>
-      <InstructionsEditor key={`instructions:${sessionId}`} sessionId={sessionId} visible={visible} onDirtyChange={setInstructionsDirty} />
-    </>}
+    <div hidden={section !== 'memory'}>
+      <h2>{t('记忆', 'Memory')}</h2>
+      <GumCodeMemory key={selected?.id || 'none'} sessionId={selected?.id || ''} visible={visible && section === 'memory'} />
+    </div>
+    <div hidden={section !== 'personalization'}>
+      <h2>{t('个性化', 'Personalization')}</h2>
+      {selected && <p className="settings-project-name">{selected.workspace.split(/[\\/]/).filter(Boolean).pop()}</p>}
+      {!selected && <p role="status">{t('请先打开项目会话', 'Open a project conversation first')}</p>}
+      {state?.sessions.map(session => <div key={session.id} hidden={session.id !== selected?.id}>
+        <InstructionsEditor sessionId={session.id} visible={visible && section === 'personalization' && session.id === selected?.id} />
+      </div>)}
+    </div>
+    {error && <p role="alert">{error}</p>}
   </div>;
 }
 
-function InstructionsEditor({ sessionId, visible, onDirtyChange }: { sessionId: string; visible: boolean; onDirtyChange: (dirty: boolean) => void }) {
+function InstructionsEditor({ sessionId, visible }: { sessionId: string; visible: boolean }) {
   const { t } = useI18n();
   const [saved, setSaved] = useState<{ content: string; revision: string; path: string }>();
   const [content, setContent] = useState('');
@@ -59,7 +47,6 @@ function InstructionsEditor({ sessionId, visible, onDirtyChange }: { sessionId: 
   const mounted = useRef(true), writing = useRef(false);
   const dirty = Boolean(saved && content !== saved.content);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  useEffect(() => { onDirtyChange(dirty); }, [dirty, onDirtyChange]);
   useEffect(() => {
     if (!visible || saved || !window.gumi?.gumCodeInstructions) return;
     let disposed = false;
@@ -83,7 +70,6 @@ function InstructionsEditor({ sessionId, visible, onDirtyChange }: { sessionId: 
   }
   return <section className="settings-card">
     <h3>{t('项目指令', 'Project instructions')} <span className="settings-caption">AGENTS.md</span></h3>
-    {saved && <p className="settings-path">{saved.path}</p>}
     <form onSubmit={event => { event.preventDefault(); void save(); }}>
       <textarea aria-label={t('编辑 AGENTS.md', 'Edit AGENTS.md')} className="settings-instructions" value={content} disabled={!saved || busy} maxLength={65536} rows={6} spellCheck={false} onChange={event => { setContent(event.target.value); setNotice(''); }} />
       <div className="action-row"><button className="primary" type="submit" disabled={!saved || busy || !dirty}>{busy ? t('保存中…', 'Saving…') : t('保存', 'Save')}</button>

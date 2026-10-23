@@ -77,15 +77,15 @@ function createMemoryStore(dataDir) {
         const reliable=p.reliable===true && p.body===p.evidence.trim() && !/[“”"「」]|(?:如果|假如|假设|引用|据说|例如|比如|测试一下|临时|if\b|suppose|hypothetic|quote|for example|temporar)/i.test(text);
         const canUpdate=old && old.status==='enabled' && old.kind==='fact' && p.kind==='fact' && p.targetId===old.id && Number.isSafeInteger(p.baseRevision) && p.baseRevision>=1 && p.baseRevision<=old.revision && old.factKey===factKey && reliable;
         const skillRef=p.kind==='skill' && skillNames.includes(p.skillRef)?p.skillRef:null;
-        if (p.kind==='skill' && !skillRef) continue;
-        const status=p.kind==='experience'?'candidate':explicit?'enabled':'candidate';
-        const verified=p.kind==='experience' && proof?.verified===true && Array.isArray(proof.toolIds) && proof.toolIds.length>0;
+        if (p.kind==='skill' && (!skillRef || !/^[a-f0-9]{64}$/.test(p.skillDigest||''))) continue;
+        const verified=p.kind==='experience' && proof?.verified===true && Array.isArray(proof.toolIds) && proof.toolIds.length>0 && typeof proof.observation==='string' && (()=>{try{return JSON.parse(proof.observation).some(x=>proof.toolIds.includes(x.id)&&typeof x.result==='string'&&x.result.includes(p.evidence));}catch{return proof.observation.includes(p.evidence);}})();
+        const status=(p.kind==='experience'?verified:reliable) && (canUpdate || !db.prepare("SELECT 1 FROM memories WHERE scope=? AND factKey=? AND status='enabled'").get(scopeWanted,factKey))?'enabled':'candidate';
         if (canUpdate) {
           db.prepare('UPDATE memories SET body=?,revision=revision+1,sourceId=?,sourceOrder=?,reason=? WHERE id=?').run(p.body,src.id,src.seq,'已按较新的用户事实自动更新',old.id); saved.push({id:old.id,status:'enabled',updated:true});
         } else {
-          if(db.prepare('SELECT COUNT(*) n FROM memories').get().n>=1000)fail('记忆容量已满（1000 条），请先在面板删除不需要的记忆。');
+          if(db.prepare('SELECT COUNT(*) n FROM memories').get().n>=1000)fail('记忆容量已满（1000 条），本次未保存新记忆。');
           const id=randomUUID();
-          db.prepare('INSERT INTO memories(id,scope,kind,factKey,body,status,revision,sourceId,sourceOrder,reason,skillRef,verified) VALUES(?,?,?,?,?,?,1,?,?,?,?,?)').run(id,scopeWanted,p.kind,factKey,p.body,status,src.id,src.seq,p.kind==='experience'?(verified?'当前回合有工具复测证据；根因仍需人工审核':'经验推断，尚未经工具复测验证'):status==='enabled'?'用户明确要求记住':'待审核的新记忆',skillRef,+verified);
+          db.prepare('INSERT INTO memories(id,scope,kind,factKey,body,status,revision,sourceId,sourceOrder,reason,skillRef,verified) VALUES(?,?,?,?,?,?,1,?,?,?,?,?)').run(id,scopeWanted,p.kind,factKey,p.body,status,src.id,src.seq,status==='enabled'?(p.kind==='experience'?'工具证据校验通过，已自动启用':'用户原文校验通过，已自动启用'):'未通过自动启用校验',skillRef,+verified);
           if(verified)db.prepare('UPDATE memories SET proof=? WHERE id=?').run(JSON.stringify({toolIds:proof.toolIds,observationDigest:hash(proof.observation),observations:(()=>{try{return JSON.parse(proof.observation).map(x=>({id:x.id,tool:x.tool,digest:hash(x.result)}));}catch{return [];}})()}),id);
           if(skillRef&&/^[a-f0-9]{64}$/.test(p.skillDigest||''))db.prepare('UPDATE memories SET skillDigest=? WHERE id=?').run(p.skillDigest,id);
           saved.push({id,status});
